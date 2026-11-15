@@ -196,6 +196,8 @@ plugin data directory.
 
 ### 9.1 How the plugin publishes the open project
 
+The panel resolves the open project's `.kicad_pro` (`board.GetProject().GetProjectFilePath()` when available, otherwise an upward search from the board path). It never derives a project path from a sibling file stem, so projects whose board/sheet stem differs from the project stem publish the correct root.
+
 `ServerManager` starts the server with `KCAA_PROJECT_STATE_FILE` pointing at
 `<kcaa data dir>/active_project.json`. The panel atomically writes that file
 (temp file + `os.replace`) whenever it knows the active project:
@@ -218,3 +220,14 @@ then falls back to the KiCad directory roots. Server-generated temp files are
 written to a private `0o700` directory under the kcaa data directory — never
 into the project or a KiCad library directory — so they keep working with no
 project at all.
+
+### 9.3 Pre-edit project snapshot
+
+Before an auto-snapshot mutation the plugin resolves the owning `.kicad_pro`
+with the same upward search used for the context block and calls
+`save_project_version` with that project file plus
+`include_files=[<file being edited>]`. The snapshot therefore targets the
+resolved project — never a fabricated sibling — and always contains the
+nested sheet or board about to be modified. If no `.kicad_pro` exists anywhere
+above the file, the tool call fails before the document is touched; the
+snapshot is not skipped silently.

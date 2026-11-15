@@ -3079,17 +3079,35 @@ class TestNextReferenceCrossFile:
             result = _find_project_dir(str(sch))
             assert result == proj_dir
 
-    def test_find_project_dir_not_found(self):
+    def test_find_project_dir_not_found(self, tmp_path, isolated_project_search):
         """_find_project_dir returns None when no .kicad_pro exists."""
-        import tempfile
-
         from kcaa.tools.symbol_edit_tools import _find_project_dir
 
-        with tempfile.TemporaryDirectory() as td:
-            sch = Path(td) / "orphan.kicad_sch"
-            sch.write_text("(kicad_sch)\n")
-            result = _find_project_dir(str(sch))
-            assert result is None
+        sch = tmp_path / "orphan.kicad_sch"
+        sch.write_text("(kicad_sch)\n")
+        result = _find_project_dir(str(sch))
+        assert result is None
+
+    def test_locators_resolve_nested_sheet_to_project_root(self, tmp_path):
+        """Nested sheet with a different stem maps to the owning project."""
+        from kcaa.tools.symbol_edit_tools import (
+            _find_project_dir,
+            _find_project_name,
+            _find_root_schematic,
+        )
+
+        pro = tmp_path / "aria.kicad_pro"
+        pro.write_text("{}")
+        root_sch = tmp_path / "aria.kicad_sch"
+        root_sch.write_text("(kicad_sch)\n")
+        hardware = tmp_path / "hardware"
+        hardware.mkdir()
+        nested = hardware / "main_bus.kicad_sch"
+        nested.write_text("(kicad_sch)\n")
+
+        assert _find_project_dir(str(nested)) == tmp_path
+        assert _find_project_name(str(nested)) == "aria"
+        assert _find_root_schematic(str(nested)) == str(root_sch)
 
     def test_collect_project_references(self, project_dir):
         """_collect_hierarchy_references gathers refs from the sheet hierarchy."""
@@ -3404,8 +3422,9 @@ class TestCheckReferenceConflicts:
         assert result["schematics_scanned"] == 2
         assert result["conflicts"] == []
 
-    def test_no_project_found(self, tools, tmp_sch):
+    def test_no_project_found(self, tools, tmp_sch, monkeypatch):
         """When no .kicad_pro is found, return empty with a message."""
+        monkeypatch.setattr("kcaa.tools.symbol_edit_tools.find_project_file", lambda path: None)
         result = asyncio.run(
             tools["check_reference_conflicts"](
                 schematic_path=tmp_sch,

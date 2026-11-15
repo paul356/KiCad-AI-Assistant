@@ -26,6 +26,7 @@ import threading
 import time
 from typing import Any
 
+from .context_bridge import find_project_for_path
 from .tool_registry import TOOL_POLICIES, get_missing_tool_policies, get_tool_policy
 
 # Notice colour for wait progress; single source of truth is ui/colors.py
@@ -35,21 +36,26 @@ from .ui.colors import WARN_HEX as _STATUS_EVENT_COLOR_HEX
 log = logging.getLogger(__name__)
 
 
-def _project_path_for(file_path: str) -> str:
-    """Return the .kicad_pro path of the project containing *file_path*.
+def _project_path_for(file_path: str) -> str | None:
+    """Return the .kicad_pro path of the project owning *file_path*, or None.
 
-    Accepts a schematic, PCB or project file; the project path shares the
-    directory and the stem up to the ``.kicad_*`` suffix.
+    Searches the file's directory and its ancestors for the real project
+    file; the project stem may differ from the edited file's stem and the
+    file may live in a subdirectory.  Never fabricates a sibling path.
     """
-    d = os.path.dirname(os.path.abspath(file_path))
-    name = os.path.basename(file_path)
-    for suffix in (".kicad_pro", ".kicad_sch", ".kicad_pcb"):
-        if name.endswith(suffix):
-            stem = name[: -len(suffix)]
-            break
-    else:
-        stem = os.path.splitext(name)[0]
-    return os.path.join(d, f"{stem}.kicad_pro")
+    return find_project_for_path(file_path)
+
+
+def _searched_directories(file_path: str) -> list[str]:
+    """Return the directories searched for a project, nearest first."""
+    directory = os.path.dirname(os.path.abspath(file_path))
+    searched: list[str] = []
+    while True:
+        searched.append(directory)
+        parent = os.path.dirname(directory)
+        if parent == directory:
+            return searched
+        directory = parent
 
 
 def _normalize_tool_arguments(value: Any) -> str:
@@ -2548,7 +2554,8 @@ class LLMClient:
         target = os.path.abspath(project_file)
         for key in ("file_path", "schematic_path", "pcb_path", "project_path"):
             value = args.get(key)
-            if value and os.path.abspath(_project_path_for(value)) == target:
+            resolved = _project_path_for(value) if value else None
+            if resolved is not None and resolved == target:
                 return True
         return False
 
@@ -3038,6 +3045,14 @@ class LLMClient:
                     ),
                 }
             project_path = _project_path_for(path)
+            if project_path is None:
+                searched = ", ".join(_searched_directories(path))
+                return {
+                    "success": False,
+                    "error": (
+                        f"No .kicad_pro project file found for {path!r}; searched: {searched}"
+                    ),
+                }
             if project_path not in state.snapshotted_paths:
                 # Save the document in KiCad first to sync in-memory changes
                 # (e.g. from IPC operations) to disk before taking a snapshot.
@@ -3061,7 +3076,10 @@ class LLMClient:
                         save_result.get("error", "unknown error"),
                     )
 
-                snapshot_args = {"project_file": project_path}
+                snapshot_args = {
+                    "project_file": project_path,
+                    "include_files": [path],
+                }
                 snapshot_result = self._call_mcp_tool_guarded(
                     "save_project_version", snapshot_args, cancel_event
                 )
@@ -3106,7 +3124,9 @@ class LLMClient:
             return result
 
         if policy.track_snapshot and path:
-            state.snapshotted_paths.add(_project_path_for(path))
+            resolved_project = _project_path_for(path)
+            if resolved_project is not None:
+                state.snapshotted_paths.add(resolved_project)
         if policy.clear_dirty_paths_arg:
             reload_paths = args.get(policy.clear_dirty_paths_arg, [])
             if isinstance(reload_paths, list):

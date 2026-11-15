@@ -30,13 +30,38 @@ def _file_hash(path: str) -> str:
     return h.hexdigest()
 
 
-def project_file_set(project_file: str) -> dict[str, str]:
-    """Return the default project file set as ``{relative_path: absolute_path}``.
+def project_relative_path(project_file: str, path: str) -> str:
+    """Return *path* relative to the project directory, using ``/`` separators.
 
-    Follows the standard KiCad convention: the ``.kicad_pro``, the same-stem
-    root ``.kicad_sch`` and the same-stem ``.kicad_pcb`` live side by side.
-    Only files that currently exist are included, so a schematic-only
-    project archives just the sch + pro pair.
+    Both paths are resolved with :func:`os.path.realpath` before the
+    containment check, so ``..`` traversal and symlinks that point outside
+    the project are rejected.  The entry must be an existing file.
+
+    :raises ValueError: If *path* is not a file or resolves outside the
+        project directory; the message names the offending path.
+    """
+    project_root = os.path.realpath(os.path.dirname(os.path.abspath(project_file)))
+    target = os.path.realpath(os.path.abspath(path))
+    if not os.path.isfile(target):
+        raise ValueError(f"include_files entry is not an existing file: {path}")
+    rel = os.path.relpath(target, project_root)
+    if rel == os.pardir or rel.startswith(os.pardir + os.sep) or os.path.isabs(rel):
+        raise ValueError(f"include_files entry is outside the project directory: {path}")
+    return rel.replace(os.sep, "/")
+
+
+def project_file_set(project_file: str, include_files: list[str] | None = None) -> dict[str, str]:
+    """Return the project file set as ``{relative_path: absolute_path}``.
+
+    The default set follows the standard KiCad convention: the
+    ``.kicad_pro``, the same-stem root ``.kicad_sch`` and the same-stem
+    ``.kicad_pcb`` live side by side.  Only files that currently exist are
+    included, so a schematic-only project archives just the sch + pro pair.
+
+    *include_files* adds explicit files (for example a nested sheet being
+    edited).  Each must resolve inside the project directory (see
+    :func:`project_relative_path`) and is archived under its project-relative
+    path; entries already in the default set are skipped.
     """
     pro = os.path.abspath(project_file)
     d = os.path.dirname(pro)
@@ -46,6 +71,10 @@ def project_file_set(project_file: str) -> dict[str, str]:
         path = os.path.join(d, rel)
         if os.path.isfile(path):
             files[rel] = path
+    for path in include_files or ():
+        rel = project_relative_path(pro, path)
+        if rel not in files:
+            files[rel] = os.path.realpath(os.path.abspath(path))
     return files
 
 
@@ -88,9 +117,8 @@ def _read_project_manifest(archive_path: str) -> dict[str, Any] | None:
         return None
 
 
-def _write_project_archive(project_file: str, timestamp: str) -> str:
-    """Pack the project file set into a ``.tar.gz`` archive and return its path."""
-    files = project_file_set(project_file)
+def _write_project_archive(project_file: str, timestamp: str, files: dict[str, str]) -> str:
+    """Pack *files* into a ``.tar.gz`` archive and return its path."""
     manifest = {
         "version": 1,
         "created_at": timestamp,
@@ -119,7 +147,11 @@ def project_version_id(archive_path: str, project_file: str) -> str:
     return name[len(prefix) : -len(".tar.gz")]
 
 
-def save_project_version(project_file: str, keep: int | None = None) -> str:
+def save_project_version(
+    project_file: str,
+    keep: int | None = None,
+    include_files: list[str] | None = None,
+) -> str:
     """Save a version archive bundling the project's schematic + PCB + .kicad_pro.
 
     The bundle is a single ``.tar.gz`` under ``<project_dir>/.versions/
@@ -132,20 +164,22 @@ def save_project_version(project_file: str, keep: int | None = None) -> str:
 
     :param project_file: Absolute path to the project file (.kicad_pro).
     :param keep: Number of archives to retain, or None for the default.
+    :param include_files: Extra files to archive, such as the nested sheet
+        being edited.  Each must resolve inside the project directory.
     :returns: Path of the (new or existing) archive.
     :raises FileNotFoundError: If *project_file* or the whole file set is missing.
+    :raises ValueError: If an *include_files* entry is outside the project.
     :raises OSError: If the archive directory cannot be created or the write fails.
     """
     project_file = os.path.abspath(project_file)
     if not os.path.isfile(project_file):
         raise FileNotFoundError(f"File not found: {project_file}")
-    if not project_file_set(project_file):
+    files = project_file_set(project_file, include_files=include_files)
+    if not files:
         raise FileNotFoundError(f"No project files found for: {project_file}")
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-    current_hashes = {
-        rel: _file_hash(path) for rel, path in sorted(project_file_set(project_file).items())
-    }
+    current_hashes = {rel: _file_hash(path) for rel, path in sorted(files.items())}
 
     existing = _list_project_archive_paths(project_file)
     if existing:
@@ -153,7 +187,7 @@ def save_project_version(project_file: str, keep: int | None = None) -> str:
         if latest_manifest and latest_manifest.get("files") == current_hashes:
             return existing[-1]
 
-    archive_path = _write_project_archive(project_file, timestamp)
+    archive_path = _write_project_archive(project_file, timestamp, files)
 
     limit = MAX_PROJECT_VERSIONS if keep is None else keep
     if limit > 0:
@@ -238,6 +272,7 @@ def restore_project_version(project_file: str, version_id: str) -> dict[str, Any
             if fh is None:
                 continue
             target = os.path.join(project_dir, member.name)
+            os.makedirs(os.path.dirname(target), exist_ok=True)
             with open(target, "wb") as out:
                 shutil.copyfileobj(fh, out)
             restored.append(member.name)

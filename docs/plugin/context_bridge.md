@@ -22,8 +22,8 @@ Every LLM request includes the following context in the system prompt:
 
 | Field | Type | Source | Notes |
 |-------|------|--------|-------|
-| `active_project` | `string \| null` | `pcbnew.GetBoard().GetFileName()` or scripting API | Absolute path to `.kicad_pro` |
-| `active_schematic` | `string \| null` | Eeschema scripting API or derived from project path | Absolute path to `.kicad_sch` |
+| `active_project` | `string \| null` | `board.GetProject().GetProjectFilePath()`, else upward search from the board path | Absolute path to the owning `.kicad_pro` |
+| `active_schematic` | `string \| null` | Root schematic of the resolved project | Absolute path to the project's root `.kicad_sch`, if it exists |
 | `active_editor` | `"schematic" \| "pcb" \| "unknown"` | Plugin detects which KiCad editor is focused | Determines which tools the LLM should use |
 | `selected_refs` | `string[]` | Scripting API selection query | Component references currently selected in the editor; may be empty |
 | `active_sheet` | `string \| null` | Sheet path in hierarchical schematics | `null` for flat schematics; `"/"` for root; `"/Sheet1"` for subsheets |
@@ -33,18 +33,17 @@ Every LLM request includes the following context in the system prompt:
 ## 3. How Context Is Collected
 
 ### 3.1 Project path
-KiCad's scripting API exposes the active project. From Python inside KiCad:
+The plugin starts from the open board (`pcbnew.GetBoard().GetFileName()`) and resolves the project that owns it:
 
-```python
-import pcbnew
-board = pcbnew.GetBoard()
-project_path = board.GetFileName()  # .kicad_pcb path; derive .kicad_pro from directory
-```
+1. `board.GetProject().GetProjectFilePath()` when the scripting API exposes it — this is authoritative.
+2. otherwise an upward search from the board file's directory to the filesystem root for `*.kicad_pro`.
 
-For the schematic editor, the plugin registers as an `EeschemaPlugin` and uses the scripting console to query the active frame.
+The old sibling-stem derivation (`<board stem>.kicad_pro` next to the board) is gone. Board and project stems may differ, and the board or a sheet may live in a subdirectory; only the directory walk finds the real project. When several `.kicad_pro` files share a directory, the resolver prefers the one whose stem has a matching `.kicad_sch`/`.kicad_pcb`, then the queried file's stem, then the lexicographically smallest filename.
+
+For the schematic editor, the plugin registers as an `EeschemaPlugin` and uses the scripting console to query the active frame; editor titles naming a `.kicad_sch`/`.kicad_pcb` are resolved with the same upward search.
 
 ### 3.2 Active schematic path
-Derived from the project directory: `<project_dir>/<project_name>.kicad_sch`. For multi-sheet schematics, this is always the top-level (root) schematic file. Hierarchical sheets are discovered by the MCP server via `skip` after the root path is supplied.
+The project's root schematic is `<project_dir>/<project_stem>.kicad_sch`. It is reported only when that file exists. Nested sheets are a normal project layout: `active_schematic` is always the project's root sheet, not the sheet currently being edited. Hierarchical sheets are discovered by the MCP server via `skip` after the root path is supplied.
 
 ### 3.3 Selected components
 The KiCad scripting API allows querying the current selection. On each request, the plugin calls:

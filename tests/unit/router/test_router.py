@@ -65,10 +65,36 @@ def test_project_file_for_returns_pro_sibling(tmp_path: Path) -> None:
     assert _project_file_for(str(pcb)) == str(pro)
 
 
-def test_project_file_for_missing_returns_none(tmp_path: Path) -> None:
+def test_project_file_for_missing_returns_none(tmp_path: Path, isolated_project_search) -> None:
     pcb = tmp_path / "board.kicad_pcb"
     pcb.write_text("(kicad_pcb)\n")
     assert _project_file_for(str(pcb)) is None
+
+
+def test_project_file_for_nested_board_resolves_root(tmp_path: Path) -> None:
+    """A board in a subdirectory with a different stem resolves the real project."""
+    pro = tmp_path / "aria.kicad_pro"
+    pro.write_text("{}\n")
+    hardware = tmp_path / "hardware"
+    hardware.mkdir()
+    pcb = hardware / "main_bus.kicad_pcb"
+    pcb.write_text("(kicad_pcb)\n")
+
+    assert _project_file_for(str(pcb)) == str(pro)
+
+
+def test_via_check_find_project_file_resolves_nested_board(tmp_path: Path) -> None:
+    """via_check's locator uses the same canonical upward search."""
+    from kcaa.router.via_check import find_project_file
+
+    pro = tmp_path / "aria.kicad_pro"
+    pro.write_text("{}\n")
+    hardware = tmp_path / "hardware"
+    hardware.mkdir()
+    pcb = hardware / "main_bus.kicad_pcb"
+    pcb.write_text("(kicad_pcb)\n")
+
+    assert find_project_file(str(pcb)) == str(pro)
 
 
 # ---------------------------------------------------------------------------
@@ -180,7 +206,9 @@ def test_default_track_width_falls_back_to_default_class(tmp_path: Path) -> None
     assert _default_track_width(str(pcb), "MysteryNet") == 0.25
 
 
-def test_default_track_width_raises_when_pro_missing(tmp_path: Path) -> None:
+def test_default_track_width_raises_when_pro_missing(
+    tmp_path: Path, isolated_project_search
+) -> None:
     pcb = tmp_path / "board.kicad_pcb"
     pcb.write_text("(kicad_pcb)\n")
     with pytest.raises(ProFileMissing):
@@ -285,7 +313,9 @@ def _fixture_pcb() -> str:
     )
 
 
-def test_auto_route_pair_translates_pro_missing_into_route_failure(tmp_path: Path) -> None:
+def test_auto_route_pair_translates_pro_missing_into_route_failure(
+    tmp_path: Path, isolated_project_search
+) -> None:
     """If the .kicad_pro is missing and no width/clearance is given,
     auto_route_pair should raise RouteFailure, not silently pick a number."""
     # Make a temporary copy of the fixture so we don't depend on a sibling
@@ -310,7 +340,9 @@ def test_auto_route_pair_translates_pro_missing_into_route_failure(tmp_path: Pat
     assert "width=" in msg  # the hint to pass width= explicitly
 
 
-def test_auto_route_pair_explicit_width_still_needs_pro_for_clearance(tmp_path: Path) -> None:
+def test_auto_route_pair_explicit_width_still_needs_pro_for_clearance(
+    tmp_path: Path, isolated_project_search
+) -> None:
     """Clearance is no longer a request knob: even with width= passed
     explicitly, a missing .kicad_pro blocks routing because clearance
     always comes from the design rules."""

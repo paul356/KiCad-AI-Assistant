@@ -48,17 +48,79 @@ class TestCollectContextWithPcbnew:
 
         assert ctx["active_pcb"] == os.path.abspath(pcb)
 
-    def test_active_schematic_derived_from_pcb(self, tmp_path):
+    def test_active_schematic_is_project_root_schematic(self, tmp_path):
         pcb = str(tmp_path / "board.kicad_pcb")
         sch = str(tmp_path / "board.kicad_sch")
+        pro = str(tmp_path / "board.kicad_pro")
         open(pcb, "w").close()
         open(sch, "w").close()
+        open(pro, "w").close()
         mock_pcbnew = self._make_mock_pcbnew(pcb_path=pcb)
 
         with patch("kicad_plugin.context_bridge._try_import_pcbnew", return_value=mock_pcbnew):
             ctx = collect_context()
 
+        assert ctx["active_project"] == os.path.abspath(pro)
         assert ctx["active_schematic"] == os.path.abspath(sch)
+
+    def test_nested_sheet_layout_resolves_upward(self, tmp_path):
+        """Board/sheet stems differ from the project stem and live in a subdirectory."""
+        pro = tmp_path / "aria.kicad_pro"
+        root_sch = tmp_path / "aria.kicad_sch"
+        hardware = tmp_path / "hardware"
+        hardware.mkdir()
+        pcb = hardware / "main_bus.kicad_pcb"
+        nested_sch = hardware / "main_bus.kicad_sch"
+        for path in (pro, root_sch, pcb, nested_sch):
+            path.write_text("(kicad)\n")
+        mock_pcbnew = self._make_mock_pcbnew(pcb_path=str(pcb))
+
+        with patch("kicad_plugin.context_bridge._try_import_pcbnew", return_value=mock_pcbnew):
+            ctx = collect_context()
+
+        assert ctx["active_pcb"] == str(pcb)
+        assert ctx["active_project"] == str(pro)
+        assert ctx["active_schematic"] == str(root_sch)
+
+    def test_board_project_api_takes_precedence(self, tmp_path):
+        """The pcbnew project API wins over the upward search when available."""
+        # The upward search would find this project...
+        (tmp_path / "aria.kicad_pro").write_text("(kicad)\n")
+        (tmp_path / "aria.kicad_sch").write_text("(kicad)\n")
+        # ...but the API names a different one, which must win.
+        api_dir = tmp_path / "api"
+        api_dir.mkdir()
+        api_pro = api_dir / "api_project.kicad_pro"
+        api_sch = api_dir / "api_project.kicad_sch"
+        api_pro.write_text("(kicad)\n")
+        api_sch.write_text("(kicad)\n")
+        hardware = tmp_path / "hardware"
+        hardware.mkdir()
+        pcb = hardware / "main_bus.kicad_pcb"
+        pcb.write_text("(kicad)\n")
+
+        class _Project:
+            @staticmethod
+            def GetProjectFilePath():
+                return str(api_pro)
+
+        class _Board:
+            @staticmethod
+            def GetFileName():
+                return str(pcb)
+
+            @staticmethod
+            def GetProject():
+                return _Project()
+
+        mock_pcbnew = MagicMock()
+        mock_pcbnew.GetBoard.return_value = _Board()
+
+        with patch("kicad_plugin.context_bridge._try_import_pcbnew", return_value=mock_pcbnew):
+            ctx = collect_context()
+
+        assert ctx["active_project"] == str(api_pro)
+        assert ctx["active_schematic"] == str(api_sch)
 
     def test_active_pcb_not_set_when_filename_empty(self):
         mock_pcbnew = self._make_mock_pcbnew(pcb_path="")
@@ -194,10 +256,20 @@ class TestProjectPathFromTitle:
         pro.write_text("(kicad_project)")
         assert project_path_from_title(f"KiCad - {pro}") == os.path.abspath(str(pro))
 
-    def test_derived_project_missing_returns_none(self, tmp_path):
+    def test_nested_sheet_title_resolves_root_project(self, tmp_path):
+        pro = tmp_path / "aria.kicad_pro"
+        pro.write_text("(kicad_project)")
+        sheet = tmp_path / "hardware" / "main_bus.kicad_sch"
+        sheet.parent.mkdir()
+        sheet.write_text("(kicad_sch)")
+        assert project_path_from_title(f"Schematic Editor: {sheet}") == os.path.abspath(str(pro))
+
+    def test_missing_project_returns_none(self, tmp_path, monkeypatch):
         pcb = tmp_path / "board.kicad_pcb"
         pcb.write_text("(kicad_pcb)")
-        # No sibling .kicad_pro — derivation fails and returns None.
+        # There is no owning project; the environment's unrelated temp
+        # projects must not leak into the result.
+        monkeypatch.setattr("kicad_plugin.context_bridge.find_project_for_path", lambda path: None)
         assert project_path_from_title(f"PCB Editor: {pcb}") is None
 
     def test_unrelated_title_returns_none(self):

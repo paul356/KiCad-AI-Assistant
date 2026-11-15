@@ -44,28 +44,22 @@ from collections.abc import Iterable
 from dataclasses import dataclass, field
 import fnmatch
 import json
-import os
-import re
 from typing import Any
 
 from shapely.geometry import Point
 
 from kcaa.router.world_model import Obstacle, WorldModel, build_world_model
-
-# Match the project's .kicad_pro next to a .kicad_pcb.
-_PROJECT_FILE_RE = re.compile(r".+\.kicad_pro$")
+from kcaa.utils import project_resolution
 
 
 def find_project_file(pcb_path: str) -> str | None:
-    """Return the absolute path of the project's ``.kicad_pro``, or ``None``."""
-    base = os.path.splitext(os.path.basename(pcb_path))[0]
-    d = os.path.dirname(pcb_path)
-    if not base or not d or not os.path.isdir(d):
-        return None
-    for entry in os.listdir(d):
-        if entry.startswith(base + ".") and _PROJECT_FILE_RE.match(entry):
-            return os.path.join(d, entry)
-    return None
+    """Return the absolute path of the project's ``.kicad_pro``, or ``None``.
+
+    Delegates to the canonical upward search in
+    :mod:`kcaa.utils.project_resolution`, so a board in a subdirectory is
+    resolved against the project at the root instead of a same-stem guess.
+    """
+    return project_resolution.find_project_file(pcb_path)
 
 
 @dataclass(frozen=True)

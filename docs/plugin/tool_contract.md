@@ -590,6 +590,25 @@ Routing is orthogonal (horizontal-vertical). If an endpoint lies on the interior
 
 ---
 
+### 3.6 Version Tools
+
+#### `save_project_version(project_file, keep=None, include_files=None)`
+
+**Purpose:** Saves one project version archive so the whole file set can be restored together.
+
+**Key parameters:**
+- `project_file` (`str`) — absolute path to the owning `.kicad_pro`.
+- `keep` (`int | None`) — number of archives to retain (default 10); oldest are pruned first.
+- `include_files` (`list[str] | None`) — extra files to archive, typically the nested sheet or board being edited.
+
+**Containment rule:** every `include_files` entry must be an existing file whose `realpath` (symlinks resolved) is inside the project directory — the directory containing `project_file`. An entry containing `..` that escapes the root, an absolute path outside the root, a symlink pointing outside, or a missing file rejects the whole call with an error naming that entry. Entries already in the default set (`.kicad_pro`, same-stem root `.kicad_sch`, same-stem `.kicad_pcb`) are skipped.
+
+**Archive layout:** a single `.tar.gz` at `<project_dir>/.versions/project/<project_stem>.project.<timestamp>.tar.gz`. Members are stored under their project-relative paths (`hardware/main_bus.kicad_sch`), plus `.manifest.json` with each member's SHA-256. Restore extracts every member over the project tree, and the `files` result lists the archived relative paths.
+
+**Success response:** `{"success": true, "version_id": "...", "archive_path": "...", "created": true, "files": [...]}`
+
+---
+
 ## 4. Deferred Capabilities
 
 | Capability | Reason deferred | Target milestone |

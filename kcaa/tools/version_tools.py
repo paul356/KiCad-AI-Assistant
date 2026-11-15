@@ -24,6 +24,7 @@ def register_version_tools(mcp: FastMCP) -> None:
     async def save_project_version(
         project_file: str,
         keep: int | None = None,
+        include_files: list[str] | None = None,
         ctx: Context | None = None,
     ) -> dict[str, Any]:
         """Save a version archive that bundles the project's schematic, PCB
@@ -33,14 +34,20 @@ def register_version_tools(mcp: FastMCP) -> None:
         The archive is written to ``<project_dir>/.versions/project/`` and
         packs the same-stem root ``.kicad_sch`` and ``.kicad_pcb`` files
         next to *project_file*; only files that currently exist are
-        archived.  If the current file set is identical to the latest
-        archive, no new archive is created and the existing one is returned
-        instead.  At most *keep* archives are retained (default 10); oldest
-        are pruned first.
+        archived.  *include_files* adds extra files, such as a nested sheet
+        that is being edited: each must resolve inside the project
+        directory and is archived under its project-relative path (an entry
+        already in the default set is skipped).  If the current file set is
+        identical to the latest archive, no new archive is created and the
+        existing one is returned instead.  At most *keep* archives are
+        retained (default 10); oldest are pruned first.
 
         Args:
             project_file: Absolute path to the project file (.kicad_pro).
             keep: Number of archives to retain, default 10.
+            include_files: Extra files to archive.  Each path must be an
+                existing file whose realpath is inside the project
+                directory; otherwise the call fails and names the offender.
 
         Returns:
             A dict with keys:
@@ -53,15 +60,19 @@ def register_version_tools(mcp: FastMCP) -> None:
         """
         try:
             existing_ids = {v["id"] for v in _vm.list_project_versions(project_file)}
-            archive_path = _vm.save_project_version(project_file, keep=keep)
+            archive_path = _vm.save_project_version(
+                project_file, keep=keep, include_files=include_files
+            )
         except FileNotFoundError as exc:
+            return {"error": str(exc)}
+        except ValueError as exc:
             return {"error": str(exc)}
         except OSError as exc:
             return {"error": f"Failed to save project version: {exc}"}
 
         version_id = _vm.project_version_id(archive_path, project_file)
         created = version_id not in existing_ids
-        files = sorted(_vm.project_file_set(project_file))
+        files = sorted(_vm.project_file_set(project_file, include_files=include_files))
 
         log.info("save_project_version: %s (created=%s)", archive_path, created)
         return {

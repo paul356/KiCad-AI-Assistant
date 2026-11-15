@@ -280,3 +280,68 @@ class TestRestoreProjectVersion:
         result = _run(self.fn(pro, "20260908_000000_000000", ctx=None))
         assert "error" in result
         assert "Failed to restore project version" in result["error"]
+
+
+# ---------------------------------------------------------------------------
+# save_project_version(include_files=...)
+# ---------------------------------------------------------------------------
+
+
+class TestSaveProjectVersionIncludeFiles:
+    def setup_method(self):
+        self.tools = _get_tools()
+        self.fn = self.tools["save_project_version"]
+
+    @staticmethod
+    def _nested_project(tmp_path):
+        project_dir = tmp_path / "proj"
+        project_dir.mkdir()
+        pro = project_dir / "aria.kicad_pro"
+        pro.write_text("{}")
+        (project_dir / "aria.kicad_sch").write_text("root\n")
+        hardware = project_dir / "hardware"
+        hardware.mkdir()
+        sheet = hardware / "main_bus.kicad_sch"
+        sheet.write_text("nested\n")
+        return pro, sheet
+
+    def test_nested_sheet_archived_under_relative_path(self, tmp_path):
+        pro, sheet = self._nested_project(tmp_path)
+
+        result = _run(self.fn(str(pro), include_files=[str(sheet)], ctx=None))
+
+        assert result["success"] is True
+        assert "hardware/main_bus.kicad_sch" in result["files"]
+        with tarfile.open(result["archive_path"], "r:gz") as tar:
+            assert "hardware/main_bus.kicad_sch" in tar.getnames()
+
+    def test_outside_entry_rejected_and_named(self, tmp_path):
+        pro, _ = self._nested_project(tmp_path)
+        outside = tmp_path / "outside.kicad_sch"
+        outside.write_text("outside\n")
+
+        result = _run(self.fn(str(pro), include_files=[str(outside)], ctx=None))
+
+        assert "error" in result
+        assert str(outside) in result["error"]
+        assert not os.path.isdir(_archive_dir(str(pro)))
+
+    def test_parent_traversal_entry_rejected(self, tmp_path):
+        pro, _ = self._nested_project(tmp_path)
+        outside = tmp_path / "outside.kicad_sch"
+        outside.write_text("outside\n")
+        traversal = os.path.join(str(pro.parent), "..", "outside.kicad_sch")
+
+        result = _run(self.fn(str(pro), include_files=[traversal], ctx=None))
+
+        assert "error" in result
+        assert traversal in result["error"]
+
+    def test_default_set_duplicate_is_skipped(self, tmp_path):
+        pro, _ = self._nested_project(tmp_path)
+        root_sch = pro.parent / "aria.kicad_sch"
+
+        result = _run(self.fn(str(pro), include_files=[str(root_sch)], ctx=None))
+
+        assert result["success"] is True
+        assert result["files"].count("aria.kicad_sch") == 1

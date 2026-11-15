@@ -4442,16 +4442,14 @@ def _default_clearance(pcb_path: str, net: str | None = None) -> float:
 
 
 def _project_file_for(pcb_path: str) -> str | None:
-    import re
+    """Return the owning ``.kicad_pro`` for *pcb_path*, or ``None``.
 
-    base = os.path.splitext(os.path.basename(pcb_path))[0]
-    d = os.path.dirname(pcb_path)
-    if not base:
-        return None
-    for f in os.listdir(d):
-        if f.startswith(base + ".") and re.match(r".+\.kicad_pro$", f):
-            return os.path.join(d, f)
-    return None
+    Uses the canonical upward search so boards nested below the project
+    root resolve to the real project instead of a sibling-stem guess.
+    """
+    from kcaa.utils.project_resolution import find_project_file
+
+    return find_project_file(pcb_path)
 
 
 def _netclass_track_widths(data: dict) -> dict[str, float]:
