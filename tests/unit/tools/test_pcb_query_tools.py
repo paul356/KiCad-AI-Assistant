@@ -191,12 +191,14 @@ class TestGetBoardInfo:
             assert layer["type"] == "signal"
 
     # Reproduces #294: `jumper` is a copper layer type per the board format.
+    # KiCad has no "Jumper" layer: it maps that pseudo-layer onto B.Cu, so the
+    # observable regression is the type, not the name.
     def test_jumper_layer_counts_as_copper(self, tools):
         result = _run(tools["get_board_info"](pcb_path=BOARD_JUMPER_LAYER_FIXTURE, ctx=None))
-        assert result["copper_layer_count"] == 3
-        jumper_layers = [layer for layer in result["all_layers"] if layer["name"] == "Jumper"]
+        assert result["copper_layer_count"] == 2
+        jumper_layers = [layer for layer in result["all_layers"] if layer["type"] == "jumper"]
         assert len(jumper_layers) == 1
-        assert jumper_layers[0]["type"] == "jumper"
+        assert jumper_layers[0]["name"] == "B.Cu"
 
     def test_raises_on_missing_file(self, tools):
         with pytest.raises((FileNotFoundError, ValueError, Exception)):
@@ -401,9 +403,9 @@ class TestGetRatsnest:
         )
         assert "connected_pads" in result
         assert "connected_count" in result
-        # The segments exist but may not start at a pad centre
-        # (R1/1 centre is at world (9.5,20), segment starts at (10,20))
-        # Just verify the key is populated as a list.
+        # The base GND segment and one appended VCC segment share the
+        # (10,20) start, not R1/1's centre (9.5,20); the VCC chain then
+        # continues from (20,20).  Just verify the key is populated as a list.
         assert isinstance(result["connected_pads"], list)
 
 
@@ -455,10 +457,11 @@ class TestListTracks:
             assert isinstance(trace["pads"], list)
 
     def test_arcs_counted_as_segments(self, tools, board_with_arcs):
-        """board_with_arcs = 1 base segment + 2 arcs + 1 added segment."""
+        """board_with_arcs = 1 base GND segment + 2 arcs + 1 added segment."""
         result = _run(tools["list_tracks"](pcb_path=board_with_arcs, ctx=None))
         assert result["segment_count"] == 4
-        assert result["trace_count"] == 2  # VCC chain + isolated GND arc
+        # VCC chain (arc + segment) + base GND segment + isolated GND arc.
+        assert result["trace_count"] == 3
 
     def test_arc_entries_have_kind_and_mid(self, tools, board_with_arcs):
         result = _run(tools["list_tracks"](pcb_path=board_with_arcs, ctx=None))
@@ -473,36 +476,51 @@ class TestListTracks:
         assert all("mid" not in seg for seg in segment_segs)
 
     def test_arc_merges_with_adjacent_segment(self, tools, board_with_arcs):
-        """The VCC arc spans (20,20)-(20,30); the base segment ends at
-        (20,20) and the added segment starts at (20,30), so all three
-        merge into a single trace."""
+        """The VCC arc spans (20,20)-(20,30); the added VCC segment starts
+        at (20,30), so both merge into a single two-piece trace.  The base
+        GND segment and the B.Cu GND arc stay separate: different nets and
+        layers do not merge."""
         result = _run(tools["list_tracks"](pcb_path=board_with_arcs, ctx=None))
         vcc_traces = [t for t in result["traces"] if t["net"] == "VCC"]
         gnd_traces = [t for t in result["traces"] if t["net"] == "GND"]
         assert len(vcc_traces) == 1
-        assert len(gnd_traces) == 1
-        assert vcc_traces[0]["segment_count"] == 3
+        assert len(gnd_traces) == 2
+        assert vcc_traces[0]["segment_count"] == 2
         kinds = {seg["kind"] for seg in vcc_traces[0]["segments"]}
         assert kinds == {"segment", "arc"}
-        assert gnd_traces[0]["segment_count"] == 1
-        assert gnd_traces[0]["segments"][0]["kind"] == "arc"
+        gnd_by_layer = {t["layer"]: t for t in gnd_traces}
+        assert set(gnd_by_layer) == {"F.Cu", "B.Cu"}
+        assert gnd_by_layer["F.Cu"]["segment_count"] == 1
+        assert gnd_by_layer["F.Cu"]["segments"][0]["kind"] == "segment"
+        assert gnd_by_layer["B.Cu"]["segment_count"] == 1
+        assert gnd_by_layer["B.Cu"]["segments"][0]["kind"] == "arc"
 
     def test_arc_net_and_layer_filters(self, tools, board_with_arcs):
-        result = _run(tools["list_tracks"](pcb_path=board_with_arcs, ctx=None, net="GND"))
-        assert result["segment_count"] == 1
-        assert result["trace_count"] == 1
-        assert all(t["net"] == "GND" for t in result["traces"])
+        gnd = _run(tools["list_tracks"](pcb_path=board_with_arcs, ctx=None, net="GND"))
+        assert gnd["segment_count"] == 2
+        assert gnd["trace_count"] == 2
+        assert all(t["net"] == "GND" for t in gnd["traces"])
 
-        result = _run(tools["list_tracks"](pcb_path=board_with_arcs, ctx=None, layer="B.Cu"))
-        assert result["segment_count"] == 1
-        assert result["trace_count"] == 1
-        assert all(t["layer"] == "B.Cu" for t in result["traces"])
-        assert result["traces"][0]["segments"][0]["kind"] == "arc"
+        # The arc-only layer view is exactly one segment lower than GND:
+        # the base F.Cu segment is filtered out, the B.Cu arc remains.
+        bcu = _run(tools["list_tracks"](pcb_path=board_with_arcs, ctx=None, layer="B.Cu"))
+        assert bcu["segment_count"] == 1
+        assert bcu["segment_count"] == gnd["segment_count"] - 1
+        assert bcu["trace_count"] == 1
+        assert all(t["layer"] == "B.Cu" for t in bcu["traces"])
+        assert bcu["traces"][0]["segments"][0]["kind"] == "arc"
 
-        result = _run(tools["list_tracks"](pcb_path=board_with_arcs, ctx=None, layer="F.Cu"))
-        assert result["segment_count"] == 3
-        assert result["trace_count"] == 1
-        assert all(t["layer"] == "F.Cu" for t in result["traces"])
+        fcu = _run(tools["list_tracks"](pcb_path=board_with_arcs, ctx=None, layer="F.Cu"))
+        assert fcu["segment_count"] == 3
+        assert fcu["trace_count"] == 2
+        assert all(t["layer"] == "F.Cu" for t in fcu["traces"])
+
+        # VCC and GND must remain distinguishable by the net filter: the
+        # merged VCC chain is one trace, GND stays two.
+        vcc = _run(tools["list_tracks"](pcb_path=board_with_arcs, ctx=None, net="VCC"))
+        assert vcc["segment_count"] == 2
+        assert vcc["trace_count"] == 1
+        assert vcc["trace_count"] != gnd["trace_count"]
 
 
 class TestListVias:

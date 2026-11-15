@@ -1147,7 +1147,8 @@ def test_unknown_layer_in_pcb_raises_route_failure(tmp_path: Path) -> None:
         pad_b="1",
         net="VCC",
         width=0.3,
-        via_pairs=(("F.Cu", "In2.Cu"),),  # 4-layer fixture has no In2.Cu
+        # The fixture declares F.Cu, In1.Cu, In2.Cu and B.Cu; In3.Cu is absent.
+        via_pairs=(("F.Cu", "In3.Cu"),),
     )
     with pytest.raises(RouteFailure) as excinfo:
         auto_route_pair(req)

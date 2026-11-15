@@ -13,7 +13,7 @@ from kcaa.utils.pcb_footprint_utils import (
     get_fp_at,
     get_fp_layer,
 )
-from kcaa.utils.pcb_sexp_utils import load_pcb
+from kcaa.utils.pcb_sexp_utils import load_pcb, save_pcb
 
 FIXTURE_DIR = os.path.join(os.path.dirname(__file__), "fixtures")
 BOARD_FIXTURE = os.path.join(FIXTURE_DIR, "test_board.kicad_pcb")
@@ -85,9 +85,23 @@ def helper_tools():
 
 @pytest.fixture
 def sides_board_copy(tmp_path):
-    """Board with mixed F.Cu/B.Cu parts and one footprint without a layer."""
+    """Board with mixed F.Cu/B.Cu parts and one footprint without a layer.
+
+    KiCad always writes a layer for a footprint, so the committed fixture
+    carries ``F.Cu`` on R5.  The unknown-side case is reconstructed here by
+    removing that node: a footprint whose side cannot be read must collide
+    with both sides.
+    """
     dest = tmp_path / "board_sides.kicad_pcb"
     shutil.copy(SIDES_FIXTURE, dest)
+    data = load_pcb(str(dest))
+    r5 = find_footprint(data, "R5")
+    r5[:] = [
+        child
+        for child in r5
+        if not (isinstance(child, list) and child and str(child[0]) == "layer")
+    ]
+    save_pcb(str(dest), data)
     return str(dest)
 
 
@@ -509,7 +523,8 @@ class TestSideAwareCollisions:
       R2 — B.Cu at (10, 10)   (overlaps R1 in XY, opposite side)
       R3 — F.Cu at (30, 10)   (same side as R1)
       R4 — B.Cu at (12.7, 10) (B-side-only obstacle next to R1)
-      R5 — no layer node at (20, 10)  (unknown side)
+      R5 — no layer node at (20, 10)  (unknown side; the test fixture copy
+           strips the F.Cu layer KiCad writes)
     """
 
     def test_move_across_sides_allowed(self, tools, sides_board_copy):

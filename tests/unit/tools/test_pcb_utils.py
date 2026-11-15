@@ -335,11 +335,20 @@ class TestUpsertFpProperty:
 
     def test_reference_default_stays_visible(self):
         """The Reference designator path must never gain a hide marker."""
+        node = _property_node(self.fp, "Reference")
+        effects_before = sum(
+            1 for s in node[3:] if isinstance(s, list) and s and str(s[0]) == "effects"
+        )
         upsert_fp_property(self.fp, "Reference", "R1A")
         node = _property_node(self.fp, "Reference")
         assert get_fp_property(self.fp, "Reference") == "R1A"
         assert _fp_property_is_hidden(node) is False
-        assert all(not (isinstance(s, list) and s and str(s[0]) == "effects") for s in node[3:])
+        # KiCad writes an effects block for every field; the upsert must leave
+        # it exactly as it found it instead of adding a second one.
+        effects_after = sum(
+            1 for s in node[3:] if isinstance(s, list) and s and str(s[0]) == "effects"
+        )
+        assert effects_after == effects_before
 
 
 class TestFpPropertyHiddenReadCompat:
