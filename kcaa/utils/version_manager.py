@@ -113,7 +113,7 @@ def _read_project_manifest(archive_path: str) -> dict[str, Any] | None:
             if member is None:
                 return None
             return json.loads(member.read().decode("utf-8"))
-    except (OSError, tarfile.TarError, json.JSONDecodeError):
+    except (KeyError, OSError, tarfile.TarError, json.JSONDecodeError):
         return None
 
 
@@ -151,6 +151,7 @@ def save_project_version(
     project_file: str,
     keep: int | None = None,
     include_files: list[str] | None = None,
+    exclude_versions: set[str] | None = None,
 ) -> str:
     """Save a version archive bundling the project's schematic + PCB + .kicad_pro.
 
@@ -166,6 +167,8 @@ def save_project_version(
     :param keep: Number of archives to retain, or None for the default.
     :param include_files: Extra files to archive, such as the nested sheet
         being edited.  Each must resolve inside the project directory.
+    :param exclude_versions: Version ids that must never be pruned, such as
+        the archive a restore is currently reading from.
     :returns: Path of the (new or existing) archive.
     :raises FileNotFoundError: If *project_file* or the whole file set is missing.
     :raises ValueError: If an *include_files* entry is outside the project.
@@ -191,8 +194,15 @@ def save_project_version(
 
     limit = MAX_PROJECT_VERSIONS if keep is None else keep
     if limit > 0:
+        prefix = os.path.join(_project_versions_dir(project_file), _archive_prefix(project_file))
+        excluded = {
+            os.path.abspath(f"{prefix}.{version_id}.tar.gz")
+            for version_id in (exclude_versions or ())
+        }
         all_archives = _list_project_archive_paths(project_file)
         for old in all_archives[:-limit]:
+            if os.path.abspath(old) in excluded:
+                continue
             with contextlib.suppress(OSError):
                 os.remove(old)
 
@@ -228,21 +238,65 @@ def list_project_versions(project_file: str) -> list[dict[str, Any]]:
     return result
 
 
-def _restorable_member_names(archive_path: str) -> list[str]:
-    """Return the safe file members of *archive_path*.
+def _safe_restore_target(project_dir: str, member_name: str) -> str | None:
+    """Return the extraction target for *member_name*, or ``None`` if unsafe.
 
-    Rejects the manifest, non-files, absolute paths and ``..`` traversal,
-    matching the filtering applied during extraction.
+    A member is refused when its name is absolute, contains ``..``, resolves
+    outside the project root, or would be written through a symlinked parent
+    (or over a symlink).  This mirrors the containment rule used on save and
+    prevents an archive from escaping the project tree during restore.
     """
-    names: list[str] = []
+    if os.path.isabs(member_name):
+        return None
+    normalized = os.path.normpath(member_name)
+    parts = normalized.split(os.sep)
+    if normalized in ("", os.curdir, os.pardir) or os.pardir in parts:
+        return None
+    if parts and parts[0] == os.curdir:
+        parts = parts[1:]
+    if not parts:
+        return None
+
+    root = os.path.realpath(project_dir)
+    current = root
+    for part in parts[:-1]:
+        current = os.path.join(current, part)
+        if os.path.islink(current):
+            return None
+
+    target = os.path.join(root, *parts)
+    if os.path.islink(target):
+        return None
+    real_target = os.path.realpath(target)
+    try:
+        rel = os.path.relpath(real_target, root)
+    except ValueError:
+        return None
+    if rel == os.pardir or rel.startswith(os.pardir + os.sep) or os.path.isabs(rel):
+        return None
+    return target
+
+
+def _restorable_members(project_dir: str, archive_path: str) -> tuple[list[tuple[str, str]], int]:
+    """Return safe ``(member_name, target)`` pairs and the unsafe count.
+
+    The manifest and non-file members are ignored.  Members whose path would
+    escape the project root (including through a symlinked parent) are
+    counted and refused.  Legacy archives without ``.manifest.json`` are
+    handled from their member list alone.
+    """
+    members: list[tuple[str, str]] = []
+    unsafe = 0
     with tarfile.open(archive_path, "r:gz") as tar:
         for member in tar.getmembers():
             if member.name == ".manifest.json" or not member.isfile():
                 continue
-            if os.path.isabs(member.name) or ".." in os.path.normpath(member.name).split(os.sep):
+            target = _safe_restore_target(project_dir, member.name)
+            if target is None:
+                unsafe += 1
                 continue
-            names.append(member.name)
-    return names
+            members.append((member.name, target))
+    return members, unsafe
 
 
 def restore_project_version(project_file: str, version_id: str) -> dict[str, Any]:
@@ -258,7 +312,9 @@ def restore_project_version(project_file: str, version_id: str) -> dict[str, Any
     :param version_id: The ``id`` value returned by :func:`list_project_versions`.
     :returns: Dict with keys ``restored_from`` (version_id),
               ``backup_of_current`` (archive path taken before restore),
-              ``backup_version_id`` and ``files`` (relative paths restored).
+              ``backup_version_id``, ``backup_skipped`` (number of unsafe
+              archive members excluded from the backup and restore) and
+              ``files`` (relative paths restored).
     :raises FileNotFoundError: If *project_file* or the requested archive does not exist.
     :raises OSError: If the extraction fails.
     """
@@ -276,34 +332,35 @@ def restore_project_version(project_file: str, version_id: str) -> dict[str, Any
 
     restored: list[str] = []
     project_dir = os.path.dirname(project_file)
-    member_names = _restorable_member_names(archive_path)
+    members, backup_skipped = _restorable_members(project_dir, archive_path)
 
     # Snapshot the current state first so the restore is undoable.  Include
-    # every archived file that still exists, so the backup covers nested
-    # sheets the restore is about to overwrite.
-    backup_files = [
-        os.path.join(project_dir, name)
-        for name in member_names
-        if os.path.isfile(os.path.join(project_dir, name))
-    ]
-    backup_path = save_project_version(project_file, include_files=backup_files)
+    # every safe archived file that still exists, so the backup covers nested
+    # sheets the restore is about to overwrite; files that now resolve
+    # outside the project cannot be backed up or restored and are counted.
+    backup_files = [target for _, target in members if os.path.isfile(target)]
+    backup_path = save_project_version(
+        project_file,
+        include_files=backup_files,
+        exclude_versions={version_id},
+    )
     backup_version_id = project_version_id(backup_path, project_file)
 
     with tarfile.open(archive_path, "r:gz") as tar:
-        for name in member_names:
+        for name, target in members:
             member = tar.getmember(name)
             fh = tar.extractfile(member)
             if fh is None:
                 continue
-            target = os.path.join(project_dir, member.name)
             os.makedirs(os.path.dirname(target), exist_ok=True)
             with open(target, "wb") as out:
                 shutil.copyfileobj(fh, out)
-            restored.append(member.name)
+            restored.append(name)
 
     return {
         "restored_from": version_id,
         "backup_of_current": backup_path,
         "backup_version_id": backup_version_id,
+        "backup_skipped": backup_skipped,
         "files": sorted(restored),
     }

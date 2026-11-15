@@ -118,9 +118,11 @@ def register_version_tools(mcp: FastMCP) -> None:
         previously saved project version, returning all files to one
         consistent snapshot.
 
-        The current file set is automatically archived before the restore,
-        so the operation is undoable (the new archive's id is returned in
-        ``backup_version_id``).
+        The current state of every safe file in the selected archive is
+        automatically archived before the restore, so the operation is
+        undoable (the new archive's id is returned in ``backup_version_id``).
+        Archive members that now escape the project are refused, skipped and
+        counted in ``backup_skipped``.
 
         Args:
             project_file: Absolute path to the project file (.kicad_pro).
@@ -132,6 +134,8 @@ def register_version_tools(mcp: FastMCP) -> None:
               - ``restored_from`` (str): The version_id that was restored
               - ``backup_of_current`` (str): Archive path of the pre-restore state
               - ``backup_version_id`` (str): Version id of the pre-restore archive
+              - ``backup_skipped`` (int): Unsafe members excluded from backup
+                and restore
               - ``files`` (list): Relative paths restored from the archive
         """
         try:

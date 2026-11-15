@@ -1,5 +1,6 @@
 """Tests for project archive include-file support in version_manager."""
 
+import io
 import os
 import tarfile
 
@@ -139,3 +140,85 @@ class TestSaveAndRestoreWithIncludeFiles:
         with tarfile.open(result["backup_of_current"], "r:gz") as tar:
             assert "hardware/main_bus.kicad_sch" not in tar.getnames()
         assert sheet.read_text() == "nested v1\n"
+
+
+def _write_archive(project_file, version_id, members, *, manifest=True):
+    """Write a project archive directly, optionally without a manifest."""
+    archive_dir = os.path.join(os.path.dirname(project_file), ".versions", "project")
+    os.makedirs(archive_dir, exist_ok=True)
+    stem = os.path.splitext(os.path.basename(project_file))[0]
+    archive_path = os.path.join(archive_dir, f"{stem}.project.{version_id}.tar.gz")
+    with tarfile.open(archive_path, "w:gz") as tar:
+        if manifest:
+            data = b'{"version": 1, "files": {}}'
+            info = tarfile.TarInfo(".manifest.json")
+            info.size = len(data)
+            tar.addfile(info, io.BytesIO(data))
+        for name, content in members.items():
+            info = tarfile.TarInfo(name)
+            info.size = len(content)
+            tar.addfile(info, io.BytesIO(content))
+    return archive_path
+
+
+class TestRestoreSafety:
+    def test_restore_refuses_escaping_member_and_backs_up_safe_one(self, tmp_path):
+        pro, root_sch, _ = _project(tmp_path)
+        outside = tmp_path / "outside"
+        outside.mkdir()
+        (pro.parent / "link").symlink_to(outside)
+        version_id = "20260101_000000_000000"
+        archive = _write_archive(
+            str(pro),
+            version_id,
+            {
+                "aria.kicad_sch": b"restored\n",
+                "link/evil.kicad_sch": b"evil\n",
+            },
+        )
+        assert os.path.isfile(archive)
+
+        result = version_manager.restore_project_version(str(pro), version_id)
+
+        assert result["backup_skipped"] == 1
+        assert result["restored_from"] == version_id
+        assert root_sch.read_text() == "restored\n"
+        assert not (outside / "evil.kicad_sch").exists()
+        with tarfile.open(result["backup_of_current"], "r:gz") as tar:
+            names = tar.getnames()
+        assert "aria.kicad_sch" in names
+        assert "link/evil.kicad_sch" not in names
+
+    def test_restore_handles_legacy_archive_without_manifest(self, tmp_path):
+        pro, root_sch, _ = _project(tmp_path)
+        version_id = "20260102_000000_000000"
+        _write_archive(
+            str(pro),
+            version_id,
+            {"aria.kicad_sch": b"legacy restored\n"},
+            manifest=False,
+        )
+
+        result = version_manager.restore_project_version(str(pro), version_id)
+
+        assert result["restored_from"] == version_id
+        assert root_sch.read_text() == "legacy restored\n"
+
+    def test_restore_does_not_prune_its_source_archive(self, tmp_path):
+        pro, root_sch, _ = _project(tmp_path)
+        version_ids = []
+        for index in range(11):
+            root_sch.write_text(f"v{index}\n")
+            archive = version_manager.save_project_version(str(pro), keep=100)
+            version_ids.append(version_manager.project_version_id(archive, str(pro)))
+        source_id = version_ids[0]
+        archive_dir = os.path.join(os.path.dirname(pro), ".versions", "project")
+        source_archive = os.path.join(archive_dir, f"aria.project.{source_id}.tar.gz")
+        assert os.path.isfile(source_archive)
+
+        # Make the current state differ so the safety backup creates a new
+        # archive and runs the pruning pass.
+        root_sch.write_text("current\n")
+        version_manager.restore_project_version(str(pro), source_id)
+
+        assert os.path.isfile(source_archive)

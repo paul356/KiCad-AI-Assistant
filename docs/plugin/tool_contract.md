@@ -611,9 +611,9 @@ Routing is orthogonal (horizontal-vertical). If an endpoint lies on the interior
 
 **Purpose:** Restores every file in a saved version archive over the project tree, returning the whole project to one consistent state.
 
-**Pre-restore backup:** before extracting, the tool archives the current on-disk state of every safe file member of the selected archive (manifest, non-files, absolute paths and `..` members are ignored). This is the archive's file set — including nested sheets such as `hardware/main_bus.kicad_sch` — not just the default project trio; members that no longer exist on disk are skipped. The backup's path and version id are returned as `backup_of_current` and `backup_version_id`, so restoring that backup rolls the edited nested file back too.
+**Pre-restore backup:** before extracting, the tool archives the current on-disk state of every safe file member of the selected archive (manifest, non-files, absolute paths, `..`, symlinked parents and members that resolve outside the project are refused). This is the archive's file set — including nested sheets such as `hardware/main_bus.kicad_sch` — not just the default project trio; safe members that no longer exist on disk are skipped. The backup's path and version id are returned as `backup_of_current` and `backup_version_id`, so restoring that backup rolls the edited nested file back too. Unsafe members are never extracted, cannot abort the restore, and are counted in `backup_skipped`. The source archive is excluded from retention pruning while it is being restored. Archives written before manifests existed are restored from their member list alone.
 
-**Success response:** `{"success": true, "restored_from": "...", "backup_of_current": "...", "backup_version_id": "...", "files": [...]}`
+**Success response:** `{"success": true, "restored_from": "...", "backup_of_current": "...", "backup_version_id": "...", "backup_skipped": 0, "files": [...]}`
 
 ---
 
