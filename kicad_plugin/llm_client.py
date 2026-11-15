@@ -106,6 +106,21 @@ def _normalize_tool_calls(tool_calls: Any) -> Any:
     return normalized
 
 
+def _wire_message(msg: dict[str, Any]) -> dict[str, Any]:
+    """Copy only the fields defined by the chat-message wire contract.
+
+    History also carries client-side bookkeeping such as
+    ``reasoning_content``; spreading the entry would echo it back to the
+    provider (#283).  Adding another internal key later must not reach the
+    wire by accident.
+    """
+    return {
+        key: msg[key]
+        for key in ("role", "content", "name", "tool_calls", "tool_call_id")
+        if key in msg
+    }
+
+
 def _is_slot_index(value: Any) -> bool:
     """Return whether *value* is a usable tool-call slot index (bools are not)."""
     return isinstance(value, int) and not isinstance(value, bool)
@@ -274,6 +289,9 @@ MUTATION_RIPPLES: dict[str, set[str]] = {
         "placement",
     },
     "set_symbol_property": {"symbol_properties"},
+    "update_schematic_symbol_pin": {"netlist"},
+    "update_schematic_symbol_from_library": {"symbol_pins", "netlist"},
+    "update_library_symbol_pin": {"symbol_pins"},
     "rename_symbol": {"symbol_inventory"},
     "delete_symbol_property": {"symbol_properties"},
     "move_component": {"symbol_inventory", "placement"},
@@ -527,7 +545,7 @@ _COMPACTION_SUMMARY_FLOOR_CHARS = 800
 # "python-requests/2.32.3" from PluginSettings ("Don't use kicad plugin as a
 # type of agent" — review on #150). Version literal must stay in sync with
 # pyproject.toml (the plugin package has no __version__).
-_LLM_USER_AGENT = "KiCad-AI-Assistant/0.2.10 (+https://github.com/paul356/KiCad-AI-Assistant)"
+_LLM_USER_AGENT = "KiCad-AI-Assistant/0.2.11 (+https://github.com/paul356/KiCad-AI-Assistant)"
 
 # ------------------------------------------------------------------
 # On-demand tool loading (issue #129)
@@ -4066,7 +4084,9 @@ class LLMClient:
         base = self._settings.llm_base_url or "https://api.openai.com"
         url = self._openai_endpoint_url(base)
 
-        messages = [{"role": "system", "content": system}] + self._history
+        messages = [{"role": "system", "content": system}] + [
+            _wire_message(msg) for msg in self._history
+        ]
         payload = json.dumps(
             {
                 "model": self._settings.llm_model,
@@ -4230,7 +4250,8 @@ class LLMClient:
                             data = url
                         images.append(data)
                 content = "\n".join(p for p in text_parts if p)
-            converted = {**msg, "content": content}
+            converted = _wire_message(msg)
+            converted["content"] = content
             if msg.get("role") == "assistant" and msg.get("tool_calls"):
                 # Ollama's native API requires arguments as JSON objects; the
                 # internal representation is always a JSON string.
@@ -4285,6 +4306,17 @@ class LLMClient:
         try:
             with _urlopen(req, 300) as resp:
                 text_parts = []
+                thinking_parts: list[str] = []
+                pending_whitespace: list[str] = []
+
+                def emit_text(chunk_text: str) -> None:
+                    if on_stream_event is None:
+                        return
+                    try:
+                        on_stream_event({"type": "text_chunk", "content": chunk_text})
+                    except Exception as e:
+                        log.error("Text delta callback error in Ollama streaming: %s", e)
+
                 if on_stream_event is not None:
                     on_stream_event({"type": "text_start"})
                 tool_calls_by_index: dict[int, dict] = {}
@@ -4304,77 +4336,135 @@ class LLMClient:
                     except json.JSONDecodeError:
                         continue
 
-                    if chunk.get("done"):
-                        finish_reason = chunk.get("done_reason", "stop")
-                        break
+                    done = bool(chunk.get("done"))
 
                     msg = chunk.get("message")
                     if not isinstance(msg, dict):
                         # e.g. an /api/generate-style payload (bare string) or a
                         # truncated chunk — nothing to accumulate.
-                        continue
-                    content = msg.get("content")
-                    if isinstance(content, str):
-                        if content:
-                            text_parts.append(content)
-                            try:
-                                on_stream_event({"type": "text_chunk", "content": content})
-                            except Exception as e:
-                                log.error("Text delta callback error in Ollama streaming: %s", e)
-                    elif content:
-                        # Some compatible endpoints return content blocks
-                        # (list/dict).  Joining them would raise TypeError and
-                        # JSON-pasting them would corrupt the chat text.
-                        log.warning(
-                            "Ignoring non-string content in Ollama stream (%s)",
-                            type(content).__name__,
-                        )
+                        msg = None
+                    if msg is not None:
+                        content = msg.get("content")
+                        if isinstance(content, str):
+                            if content:
+                                text_parts.append(content)
+                                if on_stream_event is not None:
+                                    if content.strip():
+                                        emit_text("".join(pending_whitespace) + content)
+                                        pending_whitespace.clear()
+                                    else:
+                                        pending_whitespace.append(content)
+                        elif content:
+                            # Some compatible endpoints return content blocks
+                            # (list/dict).  Joining them would raise TypeError
+                            # and JSON-pasting them would corrupt the chat text.
+                            log.warning(
+                                "Ignoring non-string content in Ollama stream (%s)",
+                                type(content).__name__,
+                            )
 
-                    for tc_delta in msg.get("tool_calls") or []:
-                        # Ollama nests the call index inside `function` (older
-                        # releases omit it and send one complete call per
-                        # chunk); _tool_call_slot honours either and gives
-                        # every index-less named entry its own slot instead of
-                        # merging into slot 0 (#234).
-                        idx, next_slot, last_slot = _tool_call_slot(
-                            tool_calls_by_index, tc_delta, next_slot, last_slot
-                        )
-                        if idx not in tool_calls_by_index:
-                            tool_calls_by_index[idx] = {
-                                "id": "",
-                                "type": "function",
-                                "function": {"name": "", "arguments": ""},
-                            }
-                        tc = tool_calls_by_index[idx]
-                        call_id = tc_delta.get("id")
-                        if isinstance(call_id, str) and call_id:
-                            tc["id"] += call_id
-                        elif call_id:
-                            log.debug("Skipping non-string tool-call id %r", call_id)
-                        fn = tc_delta.get("function") or {}
-                        if not isinstance(fn, dict):
-                            continue
-                        name = fn.get("name")
-                        if isinstance(name, str) and name:
-                            tc["function"]["name"] += name
-                        elif name:
-                            log.debug("Skipping non-string tool name %r", name)
-                        arguments = fn.get("arguments")
-                        if arguments:
-                            if isinstance(arguments, str):
-                                tc["function"]["arguments"] += arguments
-                            else:
-                                # Ollama's native /api/chat sends arguments as a
-                                # JSON object, not a serialized string: dumping
-                                # once replaces the empty accumulator instead of
-                                # raising TypeError on str + dict (#232).
-                                tc["function"]["arguments"] = _normalize_tool_arguments(arguments)
+                        thinking = msg.get("thinking")
+                        if isinstance(thinking, str) and thinking:
+                            thinking_parts.append(thinking)
+
+                        raw_tool_calls = msg.get("tool_calls")
+                        if raw_tool_calls is not None and not isinstance(raw_tool_calls, list):
+                            log.warning(
+                                "Ignoring non-list tool_calls in Ollama stream (%s)",
+                                type(raw_tool_calls).__name__,
+                            )
+                            raw_tool_calls = None
+                        for tc_delta in raw_tool_calls or []:
+                            # Ollama nests the call index inside `function`
+                            # (older releases omit it and send one complete call
+                            # per chunk); _tool_call_slot honours either and
+                            # gives every index-less named entry its own slot
+                            # instead of merging into slot 0 (#234).
+                            idx, next_slot, last_slot = _tool_call_slot(
+                                tool_calls_by_index, tc_delta, next_slot, last_slot
+                            )
+                            if idx not in tool_calls_by_index:
+                                tool_calls_by_index[idx] = {
+                                    "id": "",
+                                    "type": "function",
+                                    "function": {"name": "", "arguments": ""},
+                                }
+                            tc = tool_calls_by_index[idx]
+                            call_id = tc_delta.get("id")
+                            if isinstance(call_id, str) and call_id:
+                                tc["id"] += call_id
+                            elif call_id:
+                                log.debug("Skipping non-string tool-call id %r", call_id)
+                            fn = tc_delta.get("function") or {}
+                            if not isinstance(fn, dict):
+                                continue
+                            name = fn.get("name")
+                            if isinstance(name, str) and name:
+                                tc["function"]["name"] += name
+                            elif name:
+                                log.debug("Skipping non-string tool name %r", name)
+                            arguments = fn.get("arguments")
+                            if arguments:
+                                if isinstance(arguments, str):
+                                    tc["function"]["arguments"] += arguments
+                                else:
+                                    # Ollama's native /api/chat sends arguments
+                                    # as a JSON object, not a serialized string:
+                                    # dumping once replaces the empty
+                                    # accumulator instead of raising TypeError
+                                    # on str + dict (#232).
+                                    tc["function"]["arguments"] = _normalize_tool_arguments(
+                                        arguments
+                                    )
+
+                    if done:
+                        # The final chunk may also carry the last assistant
+                        # message (content and/or tool calls); it was consumed
+                        # above before leaving the stream (#272).  Ollama emits
+                        # that message as a delta (empty content, calls sent
+                        # once), so accumulating it is not double-counting; a
+                        # shim that repeats the cumulative message is out of
+                        # contract.
+                        finish_reason = chunk.get("done_reason", "stop")
+                        break
+
+                # A stream can end without a done chunk (connection closed or
+                # truncated); the calls accumulated so far are still usable.
+                if tool_calls_by_index:
+                    finish_reason = "tool_calls"
 
                 tool_calls = [tool_calls_by_index[k] for k in sorted(tool_calls_by_index)]
-                message: dict[str, Any] = {"content": "".join(text_parts)}
+                content_text = "".join(text_parts)
+                thinking_text = "".join(thinking_parts)
+                used_thinking = False
+                # Some models answer only in ``message.thinking``, which would
+                # otherwise leave the assistant message blank.  Treat that
+                # reasoning as the reply when no content was produced — but
+                # never for a tool-call turn (even an unparsable one), whose
+                # content must stay empty.
+                if (
+                    not tool_calls
+                    and finish_reason != "tool_calls"
+                    and not content_text.strip()
+                    and thinking_text.strip()
+                ):
+                    content_text = thinking_text
+                    used_thinking = True
+                if (tool_calls or finish_reason == "tool_calls") and not content_text.strip():
+                    # Whitespace-only content on a tool-call turn is noise: the
+                    # UI and history must show nothing for that message.
+                    content_text = ""
+                    pending_whitespace.clear()
+                message: dict[str, Any] = {"content": content_text}
                 if tool_calls:
                     message["tool_calls"] = tool_calls
                 if on_stream_event is not None:
+                    if used_thinking:
+                        # Buffered whitespace would duplicate the fallback text.
+                        emit_text(content_text)
+                    elif pending_whitespace:
+                        # No fallback: keep the streamed text equal to content.
+                        emit_text("".join(pending_whitespace))
                     on_stream_event({"type": "text_end"})
                 return {"finish_reason": finish_reason, "message": message}
 
@@ -4608,7 +4698,9 @@ class LLMClient:
 
     def _openai_payload(self, system: str, tools: list[dict], stream: bool) -> bytes:
         """Build the OpenAI-compatible chat-completions request body."""
-        messages = [{"role": "system", "content": system}] + self._history
+        messages = [{"role": "system", "content": system}] + [
+            _wire_message(msg) for msg in self._history
+        ]
         payload_dict: dict[str, Any] = {
             "model": self._settings.llm_model,
             "messages": messages,
@@ -4783,11 +4875,35 @@ class LLMClient:
         msg = body.get("message", {})
         # Ollama returns tool-call arguments as JSON objects; normalize the
         # copy we hand back so downstream json.loads(arguments) works.
-        if isinstance(msg, dict) and msg.get("tool_calls"):
-            msg = {**msg, "tool_calls": _normalize_tool_calls(msg["tool_calls"])}
-        finish_reason = "stop"
-        if body.get("done_reason") == "tool_calls":
-            finish_reason = "tool_calls"
+        has_tool_calls = (
+            isinstance(msg, dict)
+            and isinstance(msg.get("tool_calls"), list)
+            and bool(msg["tool_calls"])
+        )
+        # Ollama's DoneReason is only stop/length/connection_closed, so a
+        # tool-call turn is identified by the message payload; otherwise keep
+        # the provider's reason (e.g. "length" when num_predict truncates).
+        finish_reason = "tool_calls" if has_tool_calls else body.get("done_reason", "stop")
+        # Some models answer only in ``message.thinking``, which this client
+        # would otherwise drop, leaving the assistant message blank.  Treat
+        # that reasoning as the reply when no content was produced — but never
+        # for a tool-call turn (even an unparsable one), whose content must
+        # stay empty.
+        if not has_tool_calls and finish_reason != "tool_calls" and isinstance(msg, dict):
+            content = msg.get("content")
+            thinking = msg.get("thinking")
+            if (
+                (not isinstance(content, str) or not content.strip())
+                and isinstance(thinking, str)
+                and thinking.strip()
+            ):
+                msg = {**msg, "content": thinking}
+        if isinstance(msg, dict) and (has_tool_calls or finish_reason == "tool_calls"):
+            content = msg.get("content")
+            if not isinstance(content, str) or not content.strip():
+                msg = {**msg, "content": ""}
+            if has_tool_calls:
+                msg = {**msg, "tool_calls": _normalize_tool_calls(msg["tool_calls"])}
         return {
             "finish_reason": finish_reason,
             "message": msg,

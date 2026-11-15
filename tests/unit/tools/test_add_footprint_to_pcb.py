@@ -17,6 +17,7 @@ import os
 import shutil
 
 import pytest
+import sexpdata
 
 from kcaa.utils.pcb_footprint_utils import (
     get_fp_property,
@@ -119,6 +120,18 @@ def _pad_net(pad: list) -> tuple[int, str]:
         if isinstance(sub, list) and _sym(sub[0]) == "net":
             return int(sub[1]), _sym(sub[2])
     return None
+
+
+def _add_numberless_net_decls(data: list, names: tuple[str, ...]) -> None:
+    """Append legacy/synthetic ``(net "name")`` declarations to a board.
+
+    KiCad 10 writes no top-level net table and rejects a numberless top-level
+    declaration (``need a number for 'net number'``); only net *references*
+    inside pads/segments/zones may omit the id.  This shape exists solely to
+    exercise the defensive parser.
+    """
+    for name in names:
+        data.append([sexpdata.Symbol("net"), name])
 
 
 def _nets(board_path: str) -> dict[str, int]:
@@ -273,6 +286,13 @@ class TestPlacement:
             assert calc_y == pytest.approx(wy, abs=1e-9)
 
     def test_assigns_same_existing_net_to_all_pads(self, tools, board_with_table):
+        # KiCad 10 output has no top-level net table, so seed a numbered VCC
+        # declaration explicitly: the test must exercise the reuse branch,
+        # not the auto-add path.
+        data = load_pcb(board_with_table)
+        data.append([sexpdata.Symbol("net"), 3, "VCC"])
+        save_pcb(board_with_table, data)
+
         res = _add_one(
             tools,
             board_with_table,
@@ -288,7 +308,18 @@ class TestPlacement:
             {"pad": "2", "net": "VCC"},
         ]
         for pad in _pads(_fp_node(board_with_table, "R9")):
-            assert _pad_net(pad) == (1, "VCC")
+            assert _pad_net(pad) == (3, "VCC")
+        # Reuse must not append a second VCC declaration.
+        vcc_decls = [
+            node
+            for node in load_pcb(board_with_table)
+            if isinstance(node, list)
+            and len(node) >= 3
+            and _sym(node[0]) == "net"
+            and _sym(node[2]) == "VCC"
+        ]
+        assert len(vcc_decls) == 1
+        assert vcc_decls[0][1] == 3
 
     def test_auto_adds_missing_net(self, tools, board_with_table):
         assert "NEWNET" not in _nets(board_with_table)
@@ -302,11 +333,12 @@ class TestPlacement:
             nets={"1": "NEWNET", "2": "NEWNET"},
         )
         assert "error" not in res, res
-        # Fixture max net number is 3 → auto-add gets 4.
+        # A KiCad 10 fixture has no top-level net table, so the first
+        # auto-added net number is 1.
         nets = _nets(board_with_table)
-        assert nets["NEWNET"] == 4
+        assert nets["NEWNET"] == 1
         for pad in _pads(_fp_node(board_with_table, "R9")):
-            assert _pad_net(pad) == (4, "NEWNET")
+            assert _pad_net(pad) == (1, "NEWNET")
 
 
 class TestNets:
@@ -405,18 +437,16 @@ class TestNets:
         assert all(get_fp_property(n, "Reference") != "R9" for n in iter_footprint_nodes(data))
 
     def test_numberless_board_net_matches_numberless_form(self, tools, tmp_path, lib_dir):
-        """KiCad 10 boards may declare ``(net "GND")`` without a numeric id.
-        Placing onto an existing numberless net must reuse it in the same
-        numberless form (``(net "GND")`` on the pad) instead of int()-ing
-        the id (ValueError before the fix) or inventing a numbered twin."""
+        """Legacy/synthetic boards may declare ``(net "GND")`` without an id
+        (KiCad 10 rejects that top-level form).  Placing onto an existing
+        numberless net must reuse it in the same numberless form
+        (``(net "GND")`` on the pad) instead of int()-ing the id (ValueError
+        before the fix) or inventing a numbered twin."""
         board = tmp_path / "numberless.kicad_pcb"
         shutil.copy(BOARD_FIXTURE, board)
         (tmp_path / "fp-lib-table").write_text(FP_TABLE)
         data = load_pcb(str(board))
-        for item in data:
-            if isinstance(item, list) and len(item) >= 2 and _sym(item[0]) == "net":
-                if isinstance(item[1], int):
-                    del item[1]
+        _add_numberless_net_decls(data, ("VCC", "GND", "NET_A"))
         save_pcb(str(board), data)
 
         res = _add_one(
@@ -454,15 +484,10 @@ class TestNets:
         shutil.copy(BOARD_FIXTURE, board)
         (tmp_path / "fp-lib-table").write_text(FP_TABLE)
         data = load_pcb(str(board))
-        net_nodes = [i for i in data if isinstance(i, list) and len(i) >= 2 and _sym(i[0]) == "net"]
-        assert net_nodes, "fixture board must declare nets"
-        # Strip the numeric id from EVERY declaration and rename the
-        # first (and only the first) to a digit string.
-        for i, item in enumerate(data):
-            if isinstance(item, list) and len(item) >= 2 and _sym(item[0]) == "net":
-                if isinstance(item[1], int):
-                    del item[1]
+        _add_numberless_net_decls(data, ("VCC", "GND", "NET_A"))
         net_nodes = [i for i in data if isinstance(i, list) and _sym(i[0]) == "net"]
+        assert net_nodes, "the test must declare numberless nets"
+        # Rename the first declaration to a digit-string name.
         net_nodes[0][-1] = "7"
         save_pcb(str(board), data)
 
@@ -558,11 +583,12 @@ class TestRemoveFootprint:
         refs = self._refs(board_with_table)
         assert "R9" not in refs
         assert "R10" in refs
-        # Net definitions are kept; R10 still references NEWNET (net 4).
+        # Net definitions are kept; R10 still references NEWNET (net 1 on a
+        # board whose KiCad 10 fixture starts with no net table).
         nets = _nets(board_with_table)
-        assert nets.get("NEWNET") == 4
+        assert nets.get("NEWNET") == 1
         for pad in _pads(_fp_node(board_with_table, "R10")):
-            assert _pad_net(pad) == (4, "NEWNET")
+            assert _pad_net(pad) == (1, "NEWNET")
 
     def test_remove_again_returns_not_found_untouched(self, tools, board_with_table):
         assert self._place(tools, board_with_table, "R9", 20.0, 20.0)["success"]

@@ -16,6 +16,7 @@ from kcaa.utils.footprint_index_manager import FootprintIndexManager
 from kcaa.utils.pcb_library_utils import (
     _build_env_map,
     _parse_fp_lib_table_recursive,
+    _parse_pad,
     build_effective_library_list,
     parse_fp_lib_table,
     parse_kicad_mod,
@@ -1497,3 +1498,20 @@ class TestFootprintIndexManagerRemoveLibrary:
     def test_remove_missing_returns_false(self, tmp_path):
         mgr = FootprintIndexManager(db_path=str(tmp_path / "fp.db"))
         assert mgr.remove_library("NoSuchLib") is False
+
+
+class TestBareSymbolAtoms:
+    def test_parse_pad_bare_layer_token_is_plain_str(self):
+        """Reproduces #295: a bare (layers F.Cu) token must not leak a Symbol."""
+        import sexpdata
+
+        node = [
+            sexpdata.Symbol("pad"),
+            "1",
+            sexpdata.Symbol("smd"),
+            sexpdata.Symbol("rect"),
+            [sexpdata.Symbol("layers"), sexpdata.Symbol("F.Cu")],
+        ]
+        result = _parse_pad(node, str)
+        assert result["layer"] == "F.Cu"
+        assert type(result["layer"]) is str

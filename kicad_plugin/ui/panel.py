@@ -16,13 +16,102 @@ import datetime
 import json
 import logging
 import os
+import tempfile
 import threading
+import time
 from typing import Any
 
+from ..server_manager import ACTIVE_PROJECT_STATE_FILENAME
 from .colors import ERR_HEX, WARN_HEX
 from .stream_events import apply_stream_event, make_ai_entry
 
 log = logging.getLogger(__name__)
+
+# Windows: the server may hold the state file open for the instant it reads
+# it, so os.replace can transiently fail with PermissionError. Retry briefly
+# before giving up (the caller logs and keeps serving without the switch).
+_REPLACE_ATTEMPTS = 5
+_REPLACE_RETRY_DELAY_S = 0.05
+
+# Consecutive empty project probes before the published root is cleared. Two
+# ticks debounce the empty window during a project switch.
+_PROJECT_GONE_TICKS = 2
+
+
+def _project_root_for_publish(active_project: str | None) -> str | None:
+    """Directory to publish for *active_project*.
+
+    ``active_project`` is the absolute path of the open ``.kicad_pro`` **file**
+    (panel probe, context bridge and session store all use the file path); the
+    trust root is its parent directory. ``None`` publishes ``null``.
+    """
+    return os.path.dirname(active_project) if active_project else None
+
+
+def _project_state_for_tick(
+    active_project: str | None, none_ticks: int, probed_project: str | None
+) -> tuple[int, str | None, bool]:
+    """Decide what one project-watch tick publishes.
+
+    Returns ``(none_ticks, root_to_publish, should_publish)``. A detected
+    switch publishes nothing here — the caller also reloads the session and
+    publishes after updating ``_active_project``.
+
+    A probe that is empty two ticks in a row means the project was closed:
+    publish ``null`` (the panel keeps the last project for session stamps).
+    When a project reappears after that, republish its root.
+    """
+    if probed_project is None:
+        none_ticks += 1
+        if none_ticks == _PROJECT_GONE_TICKS and active_project is not None:
+            return none_ticks, None, True
+        return none_ticks, None, False
+
+    if probed_project == active_project:
+        # Republish only if the previous tick(s) cleared the published root.
+        if none_ticks >= _PROJECT_GONE_TICKS:
+            return 0, _project_root_for_publish(active_project), True
+        return 0, None, False
+
+    return 0, None, False
+
+
+def _write_active_project_state(config_dir: str, project_root: str | None) -> str:
+    """Atomically publish the open project root for the MCP server.
+
+    Writes ``<config_dir>/active_project.json`` with
+    ``{"project_root": "<abs path>"}`` (or ``null`` when no project is open)
+    through a temp file in the same directory followed by ``os.replace``, so
+    the server never observes a partially written file. ``os.replace`` is
+    retried briefly on ``PermissionError`` (a reader may hold the file open on
+    Windows). The server re-reads the file on each path validation and
+    re-points its trust root in place.
+
+    Returns the state-file path.
+    """
+    os.makedirs(config_dir, exist_ok=True)
+    path = os.path.join(config_dir, ACTIVE_PROJECT_STATE_FILENAME)
+    fd, tmp_path = tempfile.mkstemp(prefix=".active_project_", suffix=".json", dir=config_dir)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump({"project_root": project_root}, f)
+            f.write("\n")
+        for attempt in range(_REPLACE_ATTEMPTS):
+            try:
+                os.replace(tmp_path, path)
+                break
+            except PermissionError:
+                if attempt == _REPLACE_ATTEMPTS - 1:
+                    raise
+                time.sleep(_REPLACE_RETRY_DELAY_S)
+    except BaseException:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise
+    return path
+
 
 try:
     import wx
@@ -154,6 +243,19 @@ def _update_check_message(result, current: str, editable: bool = False) -> str |
     return f"You are running the latest version ({current})."
 
 
+def _jump_chevron_geometry(
+    width: int, height: int, direction: str
+) -> tuple[tuple[float, float], tuple[float, float], tuple[float, float]]:
+    """Return (tip, left_wing, right_wing) for the up/down chevrons."""
+    cx = width / 2
+    cy = height / 2
+    if direction == "up":
+        return ((cx, cy - 3.5), (cx - 6.0, cy + 3.5), (cx + 6.0, cy + 3.5))
+    if direction == "down":
+        return ((cx, cy + 3.5), (cx - 6.0, cy - 3.5), (cx + 6.0, cy - 3.5))
+    raise ValueError(f"unknown jump chevron direction: {direction!r}")
+
+
 if _WX_AVAILABLE:
 
     class _FileDropTarget(wx.FileDropTarget):
@@ -264,6 +366,7 @@ if _WX_AVAILABLE:
             # switching projects can re-offer that project's saved sessions
             # (same flow as startup auto-restore). Started by _init_llm_client.
             self._active_project: str | None = None
+            self._project_none_ticks = 0
             self._project_watch_timer = wx.Timer(self)
             # Version-based dirty tracking: _conv_version bumps on every
             # conversation mutation; saves skip the write when the last
@@ -506,8 +609,8 @@ if _WX_AVAILABLE:
             self._prompt_drag_max_height = 0
 
             # ---- Input row ----
-            #  [📎] [____ Ask the AI assistant… ____] [ ●  ]
-            #  Attach  Text input (expands)         [➤/⬛]
+            #  [📎] [____ Ask the AI assistant… ____] [↑ ↓]
+            #  Attach  Text input (expands)      [➤/⬛  ●]
             hbox = wx.BoxSizer(wx.HORIZONTAL)
 
             # Attach button — single entry point for images & PDFs.
@@ -529,17 +632,23 @@ if _WX_AVAILABLE:
             self._prompt_default_min_size = self._input.GetMinSize()
             hbox.Add(self._input, 1, wx.EXPAND)
 
-            # Right-hand column: status dot on top, Send/Stop toggle below.
+            # Right-hand column: jump-up, [send ●], jump-down.
             side_vbox = wx.BoxSizer(wx.VERTICAL)
 
-            # Status dot — 14 px coloured circle, tooltip carries full text.
-            self._status_dot = wx.StaticBitmap(
+            # Jump-to-start: 36×18 so the column stays 76 px tall.
+            # Centred over the send+status row below.
+            icon_bg = panel.GetBackgroundColour()
+            self._jump_top_btn = wx.BitmapButton(
                 panel,
-                bitmap=self._make_status_dot_bitmap(self._C_GREY, bg=panel.GetBackgroundColour()),
+                bitmap=self._make_jump_bitmap("up", bg=icon_bg),
+                style=wx.BU_EXACTFIT | wx.BORDER_NONE,
             )
-            self._status_dot.SetToolTip("Starting backend…")
-            side_vbox.Add(self._status_dot, 0, wx.ALIGN_CENTER_HORIZONTAL | wx.BOTTOM, 2)
+            self._jump_top_btn.SetToolTip("Jump to start")
+            self._jump_top_btn.SetName("Jump to start")
+            side_vbox.Add(self._jump_top_btn, 0, wx.ALIGN_CENTER_HORIZONTAL | wx.BOTTOM, 2)
 
+            # Send/Stop with the backend status dot 12 px to its right.
+            send_row = wx.BoxSizer(wx.HORIZONTAL)
             # Send / Stop toggle button — doubles as Stop during generation.
             self._send_btn = wx.BitmapButton(
                 panel,
@@ -550,7 +659,30 @@ if _WX_AVAILABLE:
             # Backend not ready until _on_server_started(True); the button is
             # enabled there, not clickable while the backend is down.
             self._send_btn.Disable()
-            side_vbox.Add(self._send_btn, 0, wx.ALIGN_CENTER_HORIZONTAL)
+            send_row.Add(self._send_btn, 0, wx.ALIGN_CENTER_VERTICAL)
+
+            # Status dot — 18 px bitmap: 16 px green ball inside the light ring.
+            self._status_dot = wx.StaticBitmap(
+                panel,
+                bitmap=self._make_status_dot_bitmap(self._C_GREY, bg=panel.GetBackgroundColour()),
+            )
+            self._status_dot.SetToolTip("Starting backend…")
+            # 16 px left, 18 px dot, 12 px right + the 4 px hbox border:
+            # the dot is centred between the chip and the panel edge.
+            send_row.Add(self._status_dot, 0, wx.ALIGN_CENTER_VERTICAL | wx.LEFT, 16)
+            send_row.AddSpacer(12)
+
+            side_vbox.Add(send_row, 0, wx.ALIGN_LEFT | wx.BOTTOM, 2)
+
+            # Jump-to-latest: 36×18, centred over the send+status row.
+            self._jump_latest_btn = wx.BitmapButton(
+                panel,
+                bitmap=self._make_jump_bitmap("down", bg=icon_bg),
+                style=wx.BU_EXACTFIT | wx.BORDER_NONE,
+            )
+            self._jump_latest_btn.SetToolTip("Jump to latest")
+            self._jump_latest_btn.SetName("Jump to latest")
+            side_vbox.Add(self._jump_latest_btn, 0, wx.ALIGN_CENTER_HORIZONTAL)
 
             hbox.Add(side_vbox, 0, wx.ALIGN_CENTER_VERTICAL | wx.LEFT, 4)
 
@@ -602,6 +734,8 @@ if _WX_AVAILABLE:
 
             # ---- Events ----
             self._send_btn.Bind(wx.EVT_BUTTON, self._on_send_btn)
+            self._jump_top_btn.Bind(wx.EVT_BUTTON, self._on_jump_start)
+            self._jump_latest_btn.Bind(wx.EVT_BUTTON, self._on_jump_latest)
             self._attach_btn.Bind(wx.EVT_BUTTON, self._on_attach)
             self._input.Bind(wx.EVT_TEXT_ENTER, self._on_send)
             self._input.Bind(wx.EVT_CHAR_HOOK, self._on_input_key)
@@ -741,6 +875,8 @@ if _WX_AVAILABLE:
                             project,
                         )
                         self._active_project = project
+                        self._project_none_ticks = 0
+                        self._publish_active_project()
                         self._autoload_session(prompt_if_missing=True)
                         self._request_footprint_sync(project)
                 except Exception:
@@ -1295,9 +1431,12 @@ if _WX_AVAILABLE:
 
         @staticmethod
         def _new_icon_bitmap(
-            size: int, bg: wx.Colour | None = None
+            size: int, bg: wx.Colour | None = None, height: int | None = None
         ) -> tuple[wx.Bitmap, wx.MemoryDC]:
             """Create a canvas for a custom-drawn icon with the given background.
+
+            ``height`` defaults to ``size`` for square icons; the jump icons
+            pass 36×18 so the column stays short.
 
             wx.Bitmap(size, size) starts uninitialised (often black on GTK) and
             MemoryDC.Clear() does not reliably repaint it, so build the base
@@ -1307,8 +1446,9 @@ if _WX_AVAILABLE:
                 # Explicit RGB: wx.WHITE is a null placeholder when KiCad's
                 # embedded wxPython never created a wx.App (see issue #225).
                 bg = wx.Colour(255, 255, 255)
-            data = bytes((bg.Red(), bg.Green(), bg.Blue())) * (size * size)
-            img = wx.Image(size, size, data)
+            h = size if height is None else height
+            data = bytes((bg.Red(), bg.Green(), bg.Blue())) * (size * h)
+            img = wx.Image(size, h, data)
             bmp = wx.Bitmap(img)
             mdc = wx.MemoryDC()
             mdc.SelectObject(bmp)
@@ -1368,45 +1508,95 @@ if _WX_AVAILABLE:
             return bmp
 
         @staticmethod
-        def _make_send_bitmap(size: int = 28, bg: wx.Colour | None = None) -> wx.Bitmap:
-            """Paper-plane send icon drawn with GraphicsContext."""
+        def _make_send_bitmap(size: int = 36, bg: wx.Colour | None = None) -> wx.Bitmap:
+            """Blue rounded chip with a white paper-plane glyph."""
             bmp, mdc = AssistantPanel._new_icon_bitmap(size, bg)
             gc = wx.GraphicsContext.Create(mdc)
-            gc.SetBrush(wx.Brush(wx.Colour(34, 85, 204)))  # _C_USER blue
-            gc.SetPen(wx.Pen(wx.Colour(24, 65, 180), 1))
-            path = gc.CreatePath()
-            path.MoveToPoint(4, 4)
-            path.AddLineToPoint(size - 4, size / 2)
-            path.AddLineToPoint(4, size - 4)
-            path.AddLineToPoint(4, 4)
-            gc.DrawPath(path)
+            chip = gc.CreatePath()
+            chip.AddRoundedRectangle(0.5, 0.5, size - 1, size - 1, 8)
+            gc.SetBrush(wx.Brush(wx.Colour(34, 85, 204)))  # #2255CC
+            gc.SetPen(wx.Pen(wx.Colour(28, 76, 184), 1))  # #1C4CB8
+            gc.DrawPath(chip)
+
+            # White paper plane, 16 px across, centred.
+            cx = size / 2
+            cy = size / 2
+            plane = gc.CreatePath()
+            plane.MoveToPoint(cx - 8, cy - 6)
+            plane.AddLineToPoint(cx + 8, cy)
+            plane.AddLineToPoint(cx - 8, cy + 6)
+            plane.AddLineToPoint(cx - 4, cy)
+            plane.CloseSubpath()
+            gc.SetBrush(wx.Brush(wx.Colour(255, 255, 255)))
+            gc.SetPen(wx.Pen(wx.Colour(255, 255, 255), 1))
+            gc.DrawPath(plane)
             del gc, mdc
             return bmp
 
         @staticmethod
-        def _make_stop_bitmap(size: int = 28, bg: wx.Colour | None = None) -> wx.Bitmap:
-            """Red rounded-square stop icon drawn with GraphicsContext."""
+        def _make_stop_bitmap(size: int = 36, bg: wx.Colour | None = None) -> wx.Bitmap:
+            """Red rounded chip with a white stop square."""
             bmp, mdc = AssistantPanel._new_icon_bitmap(size, bg)
             gc = wx.GraphicsContext.Create(mdc)
-            gc.SetBrush(wx.Brush(wx.Colour(220, 70, 70)))
-            gc.SetPen(wx.Pen(wx.Colour(180, 50, 50), 1))
+            chip = gc.CreatePath()
+            chip.AddRoundedRectangle(0.5, 0.5, size - 1, size - 1, 8)
+            gc.SetBrush(wx.Brush(wx.Colour(220, 70, 70)))  # #DC4646
+            gc.SetPen(wx.Pen(wx.Colour(185, 56, 56), 1))  # #B93838
+            gc.DrawPath(chip)
+
+            # White 12×12 stop square, centred.
+            margin = (size - 12) / 2
+            square = gc.CreatePath()
+            square.AddRoundedRectangle(margin, margin, 12, 12, 2)
+            gc.SetBrush(wx.Brush(wx.Colour(255, 255, 255)))
+            gc.SetPen(wx.Pen(wx.Colour(255, 255, 255), 1))
+            gc.DrawPath(square)
+            del gc, mdc
+            return bmp
+
+        @staticmethod
+        def _make_jump_bitmap(
+            direction: str,
+            width: int = 36,
+            height: int = 18,
+            bg: wx.Colour | None = None,
+        ) -> wx.Bitmap:
+            """Bold grey chevron for the conversation jump buttons."""
+            bmp, mdc = AssistantPanel._new_icon_bitmap(width, bg, height)
+            gc = wx.GraphicsContext.Create(mdc)
+            colour = wx.Colour(91, 100, 112)  # #5B6470
+            gc.SetPen(wx.Pen(colour, 3))
+            tip, left_wing, right_wing = _jump_chevron_geometry(width, height, direction)
             path = gc.CreatePath()
-            margin = 5
-            path.AddRoundedRectangle(margin, margin, size - 2 * margin, size - 2 * margin, 3)
-            gc.DrawPath(path)
+            path.MoveToPoint(left_wing[0], left_wing[1])
+            path.AddLineToPoint(tip[0], tip[1])
+            path.AddLineToPoint(right_wing[0], right_wing[1])
+            gc.StrokePath(path)
             del gc, mdc
             return bmp
 
         @staticmethod
         def _make_status_dot_bitmap(
-            rgb: tuple, size: int = 14, bg: wx.Colour | None = None
+            rgb: tuple, size: int = 18, bg: wx.Colour | None = None
         ) -> wx.Bitmap:
-            """Coloured circle for the status indicator."""
+            """16 px status-coloured ball inside a 1 px light ring on an 18 px bitmap.
+
+            The fill path is 15 px; its 1 px centred stroke extends 0.5 px on
+            each side, rendering a 16 px ball. The ring path is 17 px, kept
+            1 px outside the fill path so the ball never covers the ring,
+            leaving 1 px visible. (Previously the bitmap was 16 px, the fill
+            path 12 px and the ring 14 px.)
+            """
             bmp, mdc = AssistantPanel._new_icon_bitmap(size, bg)
             gc = wx.GraphicsContext.Create(mdc)
-            gc.SetBrush(wx.Brush(wx.Colour(*rgb)))
-            gc.SetPen(wx.Pen(wx.Colour(*rgb), 1))
-            gc.DrawEllipse(1, 1, size - 2, size - 2)
+            ring = wx.Colour(214, 218, 224)  # #D6DAE0
+            gc.SetBrush(wx.Brush(ring))
+            gc.SetPen(wx.Pen(ring, 1))
+            gc.DrawEllipse(0.5, 0.5, size - 1, size - 1)
+            fill = wx.Colour(*rgb)
+            gc.SetBrush(wx.Brush(fill))
+            gc.SetPen(wx.Pen(fill, 1))
+            gc.DrawEllipse(1.5, 1.5, size - 3, size - 3)
             del gc, mdc
             return bmp
 
@@ -1440,6 +1630,26 @@ if _WX_AVAILABLE:
                 self._on_stop(event)
             else:
                 self._on_send(event)
+
+        def _on_jump_start(self, event) -> None:
+            """Scroll the conversation to its first entry."""
+            try:
+                if self._use_webview and self._shell_loaded:
+                    self._run_script("_jumpToStart()")
+                elif not self._use_webview:
+                    self._conv_view.Scroll(0, 0)
+            except Exception as e:
+                log.warning("_on_jump_start: %s", e)
+
+        def _on_jump_latest(self, event) -> None:
+            """Scroll the conversation to its newest entry."""
+            try:
+                if self._use_webview and self._shell_loaded:
+                    self._run_script("_jumpToLatest()")
+                elif not self._use_webview:
+                    self._conv_view.Scroll(0, self._conv_view.GetScrollRange(wx.VERTICAL))
+            except Exception as e:
+                log.warning("_on_jump_latest: %s", e)
 
         def _on_attach(self, event) -> None:
             """Unified attach dialog: images or PDF in one file picker."""
@@ -3218,6 +3428,21 @@ if _WX_AVAILABLE:
                 log.debug("_collect_active_project failed", exc_info=True)
             return None
 
+        def _publish_project_state(self, project_root: str | None) -> None:
+            """Write the published project root, never breaking the panel."""
+            try:
+                _write_active_project_state(self._settings.config_dir, project_root)
+            except OSError as e:
+                log.warning("Could not publish active project state: %s", e)
+
+        def _publish_active_project(self) -> None:
+            """Publish the active project's directory for the path validator.
+
+            ``_active_project`` is the ``.kicad_pro`` file; the trust root is
+            its parent directory. No project publishes ``null``.
+            """
+            self._publish_project_state(_project_root_for_publish(self._active_project))
+
         def _start_project_watch(self) -> None:
             """Start polling for KiCad project switches (1 s interval).
 
@@ -3228,6 +3453,8 @@ if _WX_AVAILABLE:
             if not self._project_watch_timer:
                 return
             self._active_project = self._collect_active_project()
+            self._project_none_ticks = 0
+            self._publish_active_project()
             log.info(
                 "project watch started: active=%r",
                 self._active_project,
@@ -3246,9 +3473,10 @@ if _WX_AVAILABLE:
             auto-restores the right session on first display.
 
             A switch is acted on as soon as the probe returns a different
-            non-None project.  None readings (mid-switch GetBoard() empty,
-            window-title fallback missing) are deliberately ignored so the
-            last valid project is never downgraded.
+            non-None project.  A single None reading (mid-switch GetBoard()
+            empty, window-title fallback missing) is ignored; two in a row
+            publish ``null`` so the server stops trusting a closed project,
+            while ``_active_project`` is kept for session stamps.
             """
             if not self.IsShown():
                 # Panel dismissed: stay silent — no session dialogs from a
@@ -3263,17 +3491,28 @@ if _WX_AVAILABLE:
                 )
                 return
             project = self._collect_active_project()
+            ticks, publish_root, should_publish = _project_state_for_tick(
+                self._active_project, self._project_none_ticks, project
+            )
+            self._project_none_ticks = ticks
             if project is None:
                 # Probing failed (GetBoard empty / no window-title match) —
-                # e.g. mid-project-switch.  Never downgrade a known project
-                # to None: keep the last valid value so session saves keep
-                # their project stamp.
+                # e.g. mid-project-switch.  A single empty probe is ignored so
+                # session saves keep their project stamp (issue #108); two in
+                # a row mean the project was closed, so the published trust
+                # root is cleared while _active_project is kept.
+                if should_publish:
+                    log.info("project watch: no project open; clearing published root")
+                    self._publish_project_state(None)
                 log.debug(
                     "project watch: probe returned None — keeping active=%r",
                     self._active_project,
                 )
                 return
             if project == self._active_project:
+                # Reopened after the published root was cleared.
+                if should_publish:
+                    self._publish_project_state(publish_root)
                 return
             log.info(
                 "Project switch detected: %s -> %s; switching session",
@@ -3281,6 +3520,7 @@ if _WX_AVAILABLE:
                 project,
             )
             self._active_project = project
+            self._publish_active_project()
             # Keep this panel open and re-run the startup restore flow for
             # the new project: matching current.json is restored in place,
             # otherwise the new project's sessions are offered.  Never

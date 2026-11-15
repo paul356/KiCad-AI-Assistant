@@ -7,7 +7,7 @@
 .DESCRIPTION
     Run this script from inside the kicad_ai_assistant plugin folder, e.g.:
 
-        cd "$env:APPDATA\kicad\10.0\scripting\plugins\kicad_ai_assistant"
+        cd "$env:USERPROFILE\Documents\KiCad\10.0\scripting\plugins\kicad_ai_assistant"
         .\setup_plugin.ps1                            # kcaa from PyPI
         .\setup_plugin.ps1 C:\path\to\kcaa-build      # local build
 

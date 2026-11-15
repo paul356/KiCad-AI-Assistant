@@ -144,6 +144,16 @@ function _shouldScrollBottom() {
     return (sh - ih - sy) < 80;
 }
 
+// ---- Jump to edges ----
+// The native panel buttons call these; no DOM state is involved.
+window._jumpToLatest = function() {
+    window.scrollTo(0, document.body ? document.body.scrollHeight : 0);
+};
+
+window._jumpToStart = function() {
+    window.scrollTo(0, 0);
+};
+
 window._updateConversation = function(entriesJson, scrollMode, replaceDocument) {
     try {
         // Measure the reader's position before mutating the DOM: new content

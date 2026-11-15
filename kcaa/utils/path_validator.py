@@ -3,12 +3,46 @@ Path validation utility for KiCad MCP.
 
 Provides secure path validation to prevent path traversal attacks
 and ensure file operations are restricted to safe directories.
+
+Containment is decided on fully-resolved paths (``realpath``) with
+``os.path.commonpath``, so ``..`` segments and symlinks cannot escape a
+trusted root.
+
+The trust roots are:
+
+1. the open KiCad project, when one is known;
+2. the KiCad user directory (``config.kicad_user_dir``);
+3. KiCad's symbol, footprint and third-party directories;
+4. every entry of ``config.additional_search_paths``;
+5. the server's private temp directory (``<kcaa data dir>/tmp``), solely for
+   server-generated output that the subprocess runner validates;
+6. roots passed explicitly to the constructor (tests/embedding only).
+
+The process working directory is deliberately NOT a root: it is unrelated to
+the open project and to KiCad, and under the plugin it is the plugin data
+directory. The rest of the kcaa data directory — settings, session records,
+the server ``.env`` — is outside the trust boundary. The project root is
+optional (it may be ``None``) and is re-read from a state file the plugin
+publishes on every validation call (see ``PathValidator``).
 """
 
+import json
+import logging
 import os
-import pathlib
+import tempfile
+import threading
 
 from kcaa.utils.config import config
+
+log = logging.getLogger(__name__)
+
+# Set by the plugin launcher; names the state file the panel writes whenever
+# the open project changes. Missing/unreadable/malformed state is not fatal.
+_PROJECT_STATE_ENV = "KCAA_PROJECT_STATE_FILE"
+
+# Private server temp directory, created below the kcaa data directory.
+_TEMP_DIR_NAME = "tmp"
+_TEMP_DIR_MODE = 0o700
 
 
 class PathValidationError(Exception):
@@ -17,37 +51,168 @@ class PathValidationError(Exception):
     pass
 
 
-class PathValidator:
-    """
-    Validates file paths for security and correctness.
+def _normalize(path: str) -> str:
+    """Return the absolute, symlink-resolved, user-expanded form of *path*."""
+    return os.path.realpath(os.path.expanduser(path))
 
-    Prevents path traversal attacks and ensures files are within
-    trusted directories with valid KiCad extensions.
+
+class PathValidator:
+    """Validate paths against the project and KiCad directory trust roots.
+
+    A path is accepted when its fully-resolved form is contained in one of
+    the roots listed in the module docstring. Containment is checked with
+    ``os.path.commonpath`` on realpaths, so neither ``..`` traversal nor an
+    escaping symlink can smuggle a path out of a root.
+
+    The project root is **optional**. When it is ``None``, matching is done
+    by the KiCad roots alone, which is normal for a standalone server with no
+    plugin publishing a project. In plugin mode the root is re-set in place
+    whenever the active project changes: the panel atomically writes
+    ``<kcaa data dir>/active_project.json`` containing
+    ``{"project_root": "<abs path>"}`` (or ``null``), and each ``validate_*``
+    call re-reads that file and applies a changed value in place. The state
+    file is a trusted channel written by the plugin, never by the model;
+    ``KCAA_PROJECT_STATE_FILE`` tells the server where it lives. A missing,
+    unreadable or malformed file keeps the current root.
     """
 
     def __init__(self, trusted_roots: set[str] | None = None):
-        """
-        Initialize path validator.
+        """Initialize the validator.
 
         Args:
-            trusted_roots: Set of trusted root directories. If None,
-                          uses current working directory.
+            trusted_roots: Extra root directories, for tests/embedding only.
+                Production callers leave this unset; the trust roots are the
+                project root, the configured KiCad directories and the private
+                server temp directory. The process working directory is never
+                added implicitly.
         """
-        self.trusted_roots = trusted_roots or {os.getcwd()}
-        # Normalize trusted roots to absolute paths
-        self.trusted_roots = {
-            os.path.realpath(os.path.expanduser(root)) for root in self.trusted_roots
-        }
+        self._lock = threading.Lock()
+        self._project_root: str | None = None
+        self._state_file = os.environ.get(_PROJECT_STATE_ENV)
+        self._data_dir = config.get_kcaa_data_dir()
+        # The fixed roots are resolved once: realpath may touch a stalled
+        # network mount, and it must never run while holding the lock.
+        self._static_roots = self._compute_static_roots(
+            {_normalize(root) for root in trusted_roots or ()}
+        )
+        self.trusted_roots: set[str] = set(self._static_roots)
 
-    def add_trusted_root(self, root_path: str) -> None:
-        """
-        Add a trusted root directory.
+    # ------------------------------------------------------------------ #
+    # Project root
+    # ------------------------------------------------------------------ #
+
+    def set_project_root(self, path: str | None) -> None:
+        """Set (or clear) the open project's root directory.
+
+        The project root is a single entry: replacing it drops the previous
+        one. ``None`` (or an empty string) clears it, leaving the KiCad
+        directory roots in effect. A path that exists and is a regular file is
+        refused — the published contract is a directory (the parent of the
+        open ``.kicad_pro`` file).
 
         Args:
-            root_path: Path to add as trusted root
+            path: Absolute path to the open project directory, or None.
+
+        Raises:
+            PathValidationError: If *path* is an existing regular file.
         """
-        normalized_root = os.path.realpath(os.path.expanduser(root_path))
-        self.trusted_roots.add(normalized_root)
+        normalized = _normalize(path) if path else None
+        self._install_root(normalized)
+
+    def _install_root(self, normalized: str | None) -> None:
+        """Install an already-normalized project root.
+
+        The caller resolves the path (``realpath``) exactly once: resolving it
+        again here would add a filesystem round-trip that can fail between the
+        state-file read and the install, and there is nothing left to resolve.
+
+        Raises:
+            PathValidationError: If *normalized* is an existing regular file.
+        """
+        if normalized and os.path.isfile(normalized):
+            raise PathValidationError(f"Project root must be a directory, not a file: {normalized}")
+        with self._lock:
+            if normalized == self._project_root:
+                return
+            self._project_root = normalized
+            roots = set(self._static_roots)
+            if normalized:
+                roots.add(normalized)
+            self.trusted_roots = roots
+
+    def _compute_static_roots(self, extra_roots: set[str]) -> set[str]:
+        """Resolve the roots that never change for this validator instance.
+
+        Runs once in ``__init__`` (no lock held). The project root is the only
+        moving part and is added in ``set_project_root``.
+        """
+        roots = set(extra_roots)
+        temp_dir = os.path.join(self._data_dir, _TEMP_DIR_NAME)
+        if os.path.islink(temp_dir):
+            # Trusting its target would widen the boundary beyond the private
+            # temp dir; create_safe_temp_path refuses it for writes too.
+            log.warning("Ignoring symlinked server temp directory as a trust root: %s", temp_dir)
+        else:
+            # Only the private temp subdirectory is trusted — never the data
+            # directory itself, which holds settings, sessions and the server
+            # .env. This entry exists solely for server-generated output that
+            # the subprocess runner validates (see create_safe_temp_path).
+            roots.add(_normalize(temp_dir))
+        for root in (
+            config.kicad_user_dir,
+            config.kicad_symbol_dir,
+            config.kicad_footprint_dir,
+            config.kicad_3rd_party,
+            *config.additional_search_paths,
+        ):
+            if root:
+                roots.add(_normalize(root))
+        return roots
+
+    def _refresh_project_root(self) -> None:
+        """Reload the project root from the plugin-published state file.
+
+        The file is tiny, so it is re-read and parsed on every validation call
+        (no mtime tracking). Any failure — missing/unreadable file, malformed
+        JSON, wrong type (including a transient Windows ``os.replace``
+        collision with an open handle) — keeps the current root and never
+        raises.
+        """
+        state_file = self._state_file
+        if not state_file:
+            return
+        try:
+            with open(state_file, encoding="utf-8") as f:
+                payload = json.load(f)
+            root = payload["project_root"]
+            if root is not None and not isinstance(root, str):
+                raise TypeError("project_root must be a string or null")
+            normalized = _normalize(root) if root else None
+        except (OSError, ValueError, TypeError, KeyError, AttributeError) as exc:
+            log.debug(
+                "Ignoring unreadable project state file %s (%s); keeping project root %r",
+                state_file,
+                exc,
+                self._project_root,
+            )
+            return
+
+        if normalized == self._project_root:
+            return
+        log.debug("Project state file %s: project_root=%r", state_file, root)
+        try:
+            self._install_root(normalized)
+        except (PathValidationError, OSError, ValueError) as exc:
+            log.debug(
+                "Ignoring unusable project root from %s (%s); keeping %r",
+                state_file,
+                exc,
+                self._project_root,
+            )
+
+    # ------------------------------------------------------------------ #
+    # Public validation API
+    # ------------------------------------------------------------------ #
 
     def validate_path(self, file_path: str, must_exist: bool = False) -> str:
         """
@@ -65,6 +230,9 @@ class PathValidator:
         """
         if not file_path or not isinstance(file_path, str):
             raise PathValidationError("Path must be a non-empty string")
+
+        # Pick up a project switch published by the plugin before matching.
+        self._refresh_project_root()
 
         try:
             # Expand user home directory and resolve symbolic links
@@ -151,7 +319,12 @@ class PathValidator:
 
     def create_safe_temp_path(self, base_name: str, extension: str = "") -> str:
         """
-        Create a safe temporary file path within trusted directories.
+        Create a safe temporary file path for server-generated output.
+
+        Temp files never depend on the project root: they live in a private
+        directory below the server's data directory, created with mode
+        ``0o700``. A symlinked temp directory is refused. The file itself is
+        created with ``mkstemp`` (unique name, mode ``0o600``).
 
         Args:
             base_name: Base name for the temporary file
@@ -159,17 +332,20 @@ class PathValidator:
 
         Returns:
             Safe temporary file path
+
+        Raises:
+            PathValidationError: If the temp directory is a symlink or cannot
+                be created.
         """
-        import tempfile
+        temp_dir = os.path.join(self._data_dir, _TEMP_DIR_NAME)
+        if os.path.islink(temp_dir):
+            raise PathValidationError(f"Refusing symlinked temp directory: {temp_dir}")
+        try:
+            os.makedirs(temp_dir, mode=_TEMP_DIR_MODE, exist_ok=True)
+            os.chmod(temp_dir, _TEMP_DIR_MODE)
+        except OSError as e:
+            raise PathValidationError(f"Cannot prepare temp directory {temp_dir}: {e}") from e
 
-        # Use the first trusted root as temp directory base
-        temp_root = next(iter(self.trusted_roots))
-
-        # Create temp directory if it doesn't exist
-        temp_dir = os.path.join(temp_root, "temp")
-        os.makedirs(temp_dir, exist_ok=True)
-
-        # Generate unique temp file path
         temp_fd, temp_path = tempfile.mkstemp(
             suffix=extension, prefix=f"{base_name}_", dir=temp_dir
         )
@@ -181,6 +357,10 @@ class PathValidator:
         """
         Check if a path is within any trusted root directory.
 
+        Both *path* and every root are already realpaths, so containment via
+        ``commonpath`` rejects ``..`` traversal and escaping symlinks. A
+        ``ValueError`` (different drives on Windows) means "not contained".
+
         Args:
             path: Normalized absolute path to check
 
@@ -189,12 +369,9 @@ class PathValidator:
         """
         for root in self.trusted_roots:
             try:
-                # Check if path is within this root
-                pathlib.Path(root).resolve()
-                pathlib.Path(path).resolve().relative_to(pathlib.Path(root).resolve())
-                return True
+                if os.path.commonpath((root, path)) == root:
+                    return True
             except ValueError:
-                # Path is not relative to this root
                 continue
         return False
 

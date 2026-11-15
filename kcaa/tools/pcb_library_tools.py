@@ -44,15 +44,9 @@ from kcaa.utils.pcb_library_utils import (
     scan_footprint_library,
 )
 from kcaa.utils.pcb_sexp_utils import load_pcb, save_pcb
+from kcaa.utils.sexp_utils import sym_str as _sym
 
 log = logging.getLogger(__name__)
-
-
-def _sym(value: Any) -> str:
-    """Return the string form of a sexpdata Symbol or plain string."""
-    if isinstance(value, sexpdata.Symbol):
-        return str(value)
-    return str(value)
 
 
 def _footprint_scope_dir(project_dir: str | None) -> str:

@@ -84,6 +84,12 @@ class TestServerManager:
         env = mgr._build_env(1234)
         assert env["KICAD_MCP_LOG_DIR"] == "/tmp/logs"
 
+    def test_build_env_sets_project_state_file(self):
+        """The server learns the plugin-published project state file path."""
+        mgr = self._make_manager()
+        env = mgr._build_env(1234)
+        assert env["KCAA_PROJECT_STATE_FILE"] == "/tmp/active_project.json"
+
     def test_build_env_omits_log_dir_when_empty(self):
         mgr = self._make_manager(log_dir="")
         env = mgr._build_env(1234)

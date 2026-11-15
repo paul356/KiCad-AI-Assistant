@@ -20,6 +20,7 @@ from fastmcp import Context, FastMCP
 import sexpdata
 
 from kcaa.utils.pcb_sexp_utils import load_pcb, save_pcb
+from kcaa.utils.sexp_utils import sym_str as _sym
 
 log = logging.getLogger(__name__)
 
@@ -29,20 +30,15 @@ log = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 
-def _sym(value: Any) -> str:
-    """Return the string form of a sexpdata Symbol or plain string."""
-    if isinstance(value, sexpdata.Symbol):
-        return value.value()
-    return str(value)
-
-
 def _parse_zone(node: list[Any]) -> dict[str, Any]:
     """Parse a ``(zone ...)`` S-expression node into a plain dict.
 
     Returns a dict with:
         uuid         – zone UUID string (empty string if absent)
         zone_type    – ``"keepout"`` or ``"copper_pour"``
-        net          – net number (int), 0 for keepout
+        net          – netcode (``int``); ``None`` for the name-only
+                       ``(net "GND")`` form; 0 when the zone has no
+                       ``(net ...)`` node at all (e.g. keepout)
         net_name     – net name string
         layer        – layer string (single-layer zones) or list of layers
         hatch_style  – hatch style string (e.g. ``"edge"``)
@@ -69,23 +65,23 @@ def _parse_zone(node: list[Any]) -> dict[str, Any]:
         key = _sym(sub[0])
 
         if key == "uuid":
-            result["uuid"] = sub[1] if isinstance(sub[1], str) else _sym(sub[1])
+            result["uuid"] = _sym(sub[1])
         elif key == "net":
             try:
                 result["net"] = int(sub[1])
             except (IndexError, ValueError, TypeError):
                 if len(sub) >= 2 and sub[1] != "":
                     result["net"] = None
-                    result["net_name"] = sub[1] if isinstance(sub[1], str) else _sym(sub[1])
+                    result["net_name"] = _sym(sub[1])
         elif key == "net_name":
-            result["net_name"] = sub[1] if isinstance(sub[1], str) else _sym(sub[1])
+            result["net_name"] = _sym(sub[1])
         elif key == "layer":
-            result["layer"] = sub[1] if isinstance(sub[1], str) else _sym(sub[1])
+            result["layer"] = _sym(sub[1])
         elif key == "layers":
-            result["layer"] = [(s if isinstance(s, str) else _sym(s)) for s in sub[1:]]
+            result["layer"] = [_sym(s) for s in sub[1:]]
         elif key == "hatch":
             if len(sub) >= 2:
-                result["hatch_style"] = sub[1] if isinstance(sub[1], str) else _sym(sub[1])
+                result["hatch_style"] = _sym(sub[1])
         elif key == "keepout":
             result["zone_type"] = "keepout"
             rules: dict[str, str] = {}
@@ -96,7 +92,7 @@ def _parse_zone(node: list[Any]) -> dict[str, Any]:
         elif key == "fill":
             # (fill yes ...) or (fill (thermal_gap ...) ...)
             if len(sub) >= 2:
-                val = sub[1] if isinstance(sub[1], str) else _sym(sub[1])
+                val = _sym(sub[1])
                 result["fill"] = val not in ("no", "none")
             else:
                 result["fill"] = True
@@ -130,7 +126,7 @@ def _get_layer_names(data: list[Any]) -> set[str]:
             names: set[str] = set()
             for sub in item[1:]:
                 if isinstance(sub, list) and len(sub) >= 2:
-                    names.add(sub[1] if isinstance(sub[1], str) else _sym(sub[1]))
+                    names.add(_sym(sub[1]))
             return names
     return set()
 
@@ -143,7 +139,7 @@ def _find_net_by_name(data: list[Any], net_name: str) -> tuple[int | None, str] 
                 net_id = int(item[1])
             except (TypeError, ValueError):
                 continue
-            name = item[2] if isinstance(item[2], str) else _sym(item[2])
+            name = _sym(item[2])
             if name == net_name:
                 return net_id, name
 
@@ -159,9 +155,9 @@ def _find_net_by_name(data: list[Any], net_name: str) -> tuple[int | None, str] 
                 if not (isinstance(psub, list) and len(psub) >= 2 and _sym(psub[0]) == "net"):
                     continue
                 if len(psub) >= 3:
-                    raw_name = psub[2] if isinstance(psub[2], str) else _sym(psub[2])
+                    raw_name = _sym(psub[2])
                 else:
-                    raw_name = psub[1] if isinstance(psub[1], str) else _sym(psub[1])
+                    raw_name = _sym(psub[1])
                 if raw_name == net_name:
                     return None, raw_name
     return None
@@ -181,7 +177,6 @@ def _build_zone_node(
     zone_type: str,
     layer: str,
     polygon_pts: list[dict[str, float]],
-    net_id: int | None,
     net_name: str,
     hatch_style: str,
     hatch_pitch: float,
@@ -194,7 +189,6 @@ def _build_zone_node(
     keepout_vias: str,
     keepout_copperpour: str,
     keepout_footprints: str,
-    keepout_text: str,
 ) -> list[Any]:
     """Build a top-level KiCad ``(zone ...)`` node."""
     zone_node: list[Any] = [
@@ -204,23 +198,23 @@ def _build_zone_node(
         [sexpdata.Symbol("hatch"), sexpdata.Symbol(hatch_style), float(hatch_pitch)],
     ]
 
-    if net_id is None:
+    if zone_type == "copper_pour":
+        # KiCad 10 writes a copper zone's net as a name, with no net_name node.
         zone_node.insert(1, [sexpdata.Symbol("net"), net_name])
-        if net_name:
-            zone_node.insert(2, [sexpdata.Symbol("net_name"), net_name])
-    else:
-        zone_node.insert(1, [sexpdata.Symbol("net"), net_id])
-        zone_node.insert(2, [sexpdata.Symbol("net_name"), net_name])
 
     if zone_type == "keepout":
+        # KiCad 10 rule areas carry no net node at all, and exactly these five
+        # rules in this order. This tool always allows pads, matching KiCad's
+        # rule-area default (10.x can write ``pads not_allowed``, but exposing
+        # that flag is out of scope). There is no ``text`` rule in the format.
         zone_node.append(
             [
                 sexpdata.Symbol("keepout"),
                 [sexpdata.Symbol("tracks"), sexpdata.Symbol(keepout_tracks)],
                 [sexpdata.Symbol("vias"), sexpdata.Symbol(keepout_vias)],
+                [sexpdata.Symbol("pads"), sexpdata.Symbol("allowed")],
                 [sexpdata.Symbol("copperpour"), sexpdata.Symbol(keepout_copperpour)],
                 [sexpdata.Symbol("footprints"), sexpdata.Symbol(keepout_footprints)],
-                [sexpdata.Symbol("text"), sexpdata.Symbol(keepout_text)],
             ]
         )
     else:
@@ -310,13 +304,18 @@ def register_pcb_zone_tools(mcp: FastMCP) -> None:
         keepout_vias: str = "not_allowed",
         keepout_copperpour: str = "not_allowed",
         keepout_footprints: str = "allowed",
-        keepout_text: str = "allowed",
     ) -> dict[str, Any]:
         """Add a copper-pour zone or keepout zone to a KiCad PCB file.
 
         For ``zone_type="copper_pour"``, ``net_name`` is required and must match
         an existing board net. For ``zone_type="keepout"``, ``net_name`` is
-        ignored and the zone is created on net 0.
+        ignored: a KiCad 10 rule area is written with no net node.
+
+        A keepout's rules default to ``"not_allowed"`` for ``tracks``,
+        ``vias`` and ``copperpour``, and ``"allowed"`` for ``footprints``.
+        Pads are always allowed by this tool, matching KiCad's rule-area
+        default. The format has no ``text`` rule, so there is no parameter for
+        it.
 
         Polygon points are in board coordinates (mm, +X right, +Y down) and are
         used as the zone outline in the given order. The polygon must contain at
@@ -358,7 +357,6 @@ def register_pcb_zone_tools(mcp: FastMCP) -> None:
             zone_type=zone_type,
             layer=layer,
             polygon_pts=polygon_pts,
-            net_id=resolved_net_id,
             net_name=resolved_net_name,
             hatch_style=hatch_style,
             hatch_pitch=hatch_pitch,
@@ -371,7 +369,6 @@ def register_pcb_zone_tools(mcp: FastMCP) -> None:
             keepout_vias=keepout_vias,
             keepout_copperpour=keepout_copperpour,
             keepout_footprints=keepout_footprints,
-            keepout_text=keepout_text,
         )
         data.append(zone_node)
 

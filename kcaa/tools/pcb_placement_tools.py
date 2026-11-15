@@ -248,7 +248,8 @@ def register_pcb_placement_tools(mcp: FastMCP) -> None:
         flip_fp_layers(fp)
         new_layer = get_fp_layer(fp) or "unknown"
 
-        # Collision check: compare against footprints on the destination layer only
+        # Collision check: the flipped footprint now lives on the destination
+        # layer, so only same-side footprints can conflict
         collisions = find_collisions(
             data,
             [(reference, fp_x, fp_y, fp_rot)],

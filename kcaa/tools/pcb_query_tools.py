@@ -14,7 +14,6 @@ import re
 from typing import Any
 
 from fastmcp import Context, FastMCP
-import sexpdata
 
 from kcaa.tools.pcb_placement_helpers import (
     _TIER_NAMES,
@@ -26,13 +25,13 @@ from kcaa.tools.pcb_placement_helpers import (
 )
 from kcaa.utils.pcb_board_utils import get_fp_courtyard_bbox, get_fp_edge_cuts_items
 from kcaa.utils.pcb_footprint_utils import (
-    _sym,
     find_footprint,
     get_fp_at,
     get_fp_layer,
     get_fp_property,
 )
 from kcaa.utils.pcb_sexp_utils import load_pcb
+from kcaa.utils.sexp_utils import sym_str as _sym
 
 log = logging.getLogger(__name__)
 
@@ -54,7 +53,7 @@ def _collect_top_level_nets(data: list[Any]) -> tuple[dict[int, str], dict[str, 
         if len(item) >= 3:
             try:
                 net_id = int(item[1])
-                net_name = item[2] if isinstance(item[2], str) else _sym(item[2])
+                net_name = _sym(item[2])
                 net_id_to_name[net_id] = net_name
                 if net_name:
                     net_name_to_id[net_name] = net_id
@@ -64,7 +63,7 @@ def _collect_top_level_nets(data: list[Any]) -> tuple[dict[int, str], dict[str, 
             except (TypeError, ValueError):
                 pass
         # KiCad 10: (net "<name>")
-        net_name = item[1] if isinstance(item[1], str) else _sym(item[1])
+        net_name = _sym(item[1])
         if net_name and net_name not in net_name_to_id:
             net_id_to_name[next_id] = net_name
             net_name_to_id[net_name] = next_id
@@ -86,14 +85,14 @@ def _parse_net_ref(
     if len(net_node) >= 3:
         try:
             net_id = int(net_node[1])
-            net_name = net_node[2] if isinstance(net_node[2], str) else _sym(net_node[2])
+            net_name = _sym(net_node[2])
             return net_id, net_name
         except (TypeError, ValueError):
             pass
 
     # KiCad 10 format: (net "<name>")
     if len(net_node) >= 2:
-        raw = net_node[1] if isinstance(net_node[1], str) else _sym(net_node[1])
+        raw = _sym(net_node[1])
         if raw in net_name_to_id:
             return net_name_to_id[raw], raw
         return None, raw
@@ -150,8 +149,8 @@ def register_pcb_query_tools(mcp: FastMCP) -> None:
                         layers.append(
                             {
                                 "id": int(sub[0]) if isinstance(sub[0], int) else sub[0],
-                                "name": sub[1] if isinstance(sub[1], str) else _sym(sub[1]),
-                                "type": sub[2] if isinstance(sub[2], str) else _sym(sub[2]),
+                                "name": _sym(sub[1]),
+                                "type": _sym(sub[2]),
                             }
                         )
             elif key == "footprint":
@@ -171,11 +170,13 @@ def register_pcb_query_tools(mcp: FastMCP) -> None:
             elif key == "via":
                 via_count += 1
             elif key == "generator":
-                generator = item[1] if isinstance(item[1], str) else _sym(item[1])
+                generator = _sym(item[1])
             elif key == "generator_version":
-                generator_version = item[1] if isinstance(item[1], str) else _sym(item[1])
+                generator_version = _sym(item[1])
 
-        copper_layers = [lay for lay in layers if lay["type"] in ("signal", "mixed", "power")]
+        copper_layers = [
+            lay for lay in layers if lay["type"] in ("signal", "mixed", "power", "jumper")
+        ]
 
         # KiCad 8 has net 0 with empty name, KiCad 10 doesn't
         has_empty_net = any(name == "" for name in pad_net_names) or net_count == 0
@@ -322,8 +323,8 @@ def register_pcb_query_tools(mcp: FastMCP) -> None:
             props: dict[str, str] = {}
             for sub in fp:
                 if isinstance(sub, list) and len(sub) >= 3 and _sym(sub[0]) == "property":
-                    name = sub[1] if isinstance(sub[1], str) else _sym(sub[1])
-                    val = sub[2] if isinstance(sub[2], str) else _sym(sub[2])
+                    name = _sym(sub[1])
+                    val = _sym(sub[2])
                     props[name] = val
 
             # Collect pads
@@ -331,9 +332,9 @@ def register_pcb_query_tools(mcp: FastMCP) -> None:
             for sub in fp:
                 if not (isinstance(sub, list) and len(sub) >= 4 and _sym(sub[0]) == "pad"):
                     continue
-                pad_num = sub[1] if isinstance(sub[1], str) else _sym(sub[1])
-                pad_type = sub[2] if isinstance(sub[2], str) else _sym(sub[2])
-                pad_shape = sub[3] if isinstance(sub[3], str) else _sym(sub[3])
+                pad_num = _sym(sub[1])
+                pad_type = _sym(sub[2])
+                pad_shape = _sym(sub[3])
                 pad_x, pad_y = 0.0, 0.0
                 pad_rot = 0.0
                 pad_w, pad_h = 0.0, 0.0
@@ -487,9 +488,6 @@ def register_pcb_query_tools(mcp: FastMCP) -> None:
             fall back to raw graphics or were skipped).
         """
 
-        def _sym_local(v: Any) -> str:
-            return str(v) if isinstance(v, sexpdata.Symbol) else str(v)
-
         data = load_pcb(pcb_path)
         all_min_x: list[float] = []
         all_min_y: list[float] = []
@@ -501,17 +499,17 @@ def register_pcb_query_tools(mcp: FastMCP) -> None:
         for item in data:
             if not (isinstance(item, list) and len(item) > 0):
                 continue
-            if _sym_local(item[0]) != "footprint":
+            if _sym(item[0]) != "footprint":
                 continue
             fp_count += 1
             ref = ""
             for sub in item:
-                if isinstance(sub, list) and len(sub) >= 3 and _sym_local(sub[0]) == "property":
-                    if (sub[1] if isinstance(sub[1], str) else _sym_local(sub[1])) == "Reference":
-                        ref = sub[2] if isinstance(sub[2], str) else _sym_local(sub[2])
+                if isinstance(sub, list) and len(sub) >= 3 and _sym(sub[0]) == "property":
+                    if _sym(sub[1]) == "Reference":
+                        ref = _sym(sub[2])
             fp_x, fp_y, fp_rot = 0.0, 0.0, 0.0
             for sub in item:
-                if isinstance(sub, list) and len(sub) >= 3 and _sym_local(sub[0]) == "at":
+                if isinstance(sub, list) and len(sub) >= 3 and _sym(sub[0]) == "at":
                     fp_x, fp_y = float(sub[1]), float(sub[2])
                     fp_rot = float(sub[3]) if len(sub) > 3 else 0.0
 
@@ -668,7 +666,7 @@ def register_pcb_query_tools(mcp: FastMCP) -> None:
             for sub in item:
                 if not (isinstance(sub, list) and len(sub) >= 4 and _sym(sub[0]) == "pad"):
                     continue
-                pad_num = sub[1] if isinstance(sub[1], str) else _sym(sub[1])
+                pad_num = _sym(sub[1])
                 rel_x, rel_y = 0.0, 0.0
                 net_key = ""
                 for psub in sub:
@@ -747,11 +745,11 @@ def register_pcb_query_tools(mcp: FastMCP) -> None:
                         if len(sub) >= 3:
                             try:
                                 int(sub[1])
-                                zone_net = sub[2] if isinstance(sub[2], str) else _sym(sub[2])
+                                zone_net = _sym(sub[2])
                             except (TypeError, ValueError):
-                                zone_net = sub[1] if isinstance(sub[1], str) else _sym(sub[1])
+                                zone_net = _sym(sub[1])
                         elif len(sub) >= 2:
-                            zone_net = sub[1] if isinstance(sub[1], str) else _sym(sub[1])
+                            zone_net = _sym(sub[1])
                     elif zk == "keepout":
                         is_keepout = True
                     elif zk == "polygon":
@@ -1196,7 +1194,7 @@ def register_pcb_query_tools(mcp: FastMCP) -> None:
             for sub in item:
                 if not (isinstance(sub, list) and len(sub) >= 4 and _sym(sub[0]) == "pad"):
                     continue
-                pad_num = sub[1] if isinstance(sub[1], str) else _sym(sub[1])
+                pad_num = _sym(sub[1])
                 rel_x, rel_y = 0.0, 0.0
                 net_key = ""
                 for psub in sub:
@@ -1607,4 +1605,4 @@ def _get_net_name_pq(net_node: list) -> str | None:
         raw = net_node[1]
     else:
         return None
-    return raw if isinstance(raw, str) else str(raw)
+    return _sym(raw)

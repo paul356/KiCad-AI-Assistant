@@ -1,0 +1,69 @@
+(kicad_sch (version 20260306) (generator "eeschema") (generator_version "10.0") (uuid "b1f7a3c2-5d4e-4a91-8c6f-2e7d0b9a4c11") (paper "A4") (lib_symbols 
+
+(symbol "PinEdit:Plain" (pin_numbers (hide yes)) (pin_names (offset 0.254)) (exclude_from_sim no) (in_bom yes) (on_board yes) (in_pos_files yes) (duplicate_pin_numbers_are_jumpers yes) 
+
+(property "Reference" "R" (at 0 0 90) (show_name no) (do_not_autoplace no) (effects (font (size 1.016 1.016)))) 
+
+(property "Value" "Plain" (at 0 0 90) (show_name no) (do_not_autoplace no) (effects (font (size 1.016 1.016)))) 
+
+(property "Footprint" "" (at 0 0 0) (show_name no) (do_not_autoplace no) (hide yes) (effects (font (size 1.016 1.016)))) 
+
+(property "Datasheet" "~" (at 0 0 0) (show_name no) (do_not_autoplace no) (hide yes) (effects (font (size 1.016 1.016)))) 
+
+(symbol "Plain_0_1" 
+
+(rectangle (start -2.54 2.54) (end 2.54 -2.54) (stroke (width 0.254) (type default)) (fill (type none))) (pin passive line (at 0 -2.54 90) (length 2.54) (name "COMMON" (effects (font (size 1.27 1.27)))) (number "C0" (effects (font (size 1.27 1.27)))))) 
+
+(symbol "Plain_1_1" (pin passive line (at -5.08 0 0) (length 2.54) (name "A" (effects (font (size 1.27 1.27)))) (number "P$1" (effects (font (size 1.27 1.27))))) (pin passive line (at 5.08 0 180) (length 2.54) (name "B" (effects (font (size 1.27 1.27)))) (number "P$2" (effects (font (size 1.27 1.27)))))) (embedded_fonts no)) 
+
+(symbol "Device:C" (pin_numbers (hide yes)) (pin_names (offset 0.254)) (exclude_from_sim no) (in_bom yes) (on_board yes) (in_pos_files yes) (duplicate_pin_numbers_are_jumpers no) 
+
+(property "Reference" "C" (at 0.635 2.54 0) (show_name no) (do_not_autoplace no) (effects (font (size 1.27 1.27)) (justify left))) 
+
+(property "Value" "C" (at 0.635 -2.54 0) (show_name no) (do_not_autoplace no) (effects (font (size 1.27 1.27)) (justify left))) 
+
+(property "Footprint" "" (at 0.9652 -3.81 0) (show_name no) (do_not_autoplace no) (hide yes) (effects (font (size 1.27 1.27)))) 
+
+(property "Datasheet" "" (at 0 0 0) (show_name no) (do_not_autoplace no) (hide yes) (effects (font (size 1.27 1.27)))) 
+
+(symbol "C_0_1" 
+
+(polyline (pts 
+
+(xy -2.032 0.762) 
+
+(xy 2.032 0.762)) (stroke (width 0.508) (type default)) (fill (type none))) 
+
+(polyline (pts 
+
+(xy -2.032 -0.762) 
+
+(xy 2.032 -0.762)) (stroke (width 0.508) (type default)) (fill (type none)))) 
+
+(symbol "C_1_1" (pin passive line (at 0 3.81 270) (length 2.794) (name "" (effects (font (size 1.27 1.27)))) (number "1" (effects (font (size 1.27 1.27))))) (pin passive line (at 0 -3.81 90) (length 2.794) (name "" (effects (font (size 1.27 1.27)))) (number "2" (effects (font (size 1.27 1.27)))))) (embedded_fonts no))) 
+
+(wire (pts 
+
+(xy 90 100) 
+
+(xy 95 100)) (stroke (width 0) (type default)) (uuid "c9a1e7f4-2b6d-4c38-9f01-7d5a2e8b6c22")) 
+
+(symbol (lib_id "PinEdit:Plain") (at 100 100 0) (unit 1) (body_style 1) (exclude_from_sim no) (in_bom yes) (on_board yes) (in_pos_files yes) (dnp no) (fields_autoplaced yes) (uuid "d2b8f1a6-7c3e-4d29-8a5f-1e9b0c4a7d33") 
+
+(property "Reference" "R1" (at 102.54 98.73 0) (show_name no) (do_not_autoplace no) (effects (font (size 1.27 1.27)))) 
+
+(property "Value" "Plain" (at 102.54 101.27 0) (show_name no) (do_not_autoplace no) (effects (font (size 1.27 1.27)))) 
+
+(property "Footprint" "" (at 100 100 0) (hide yes) (show_name no) (do_not_autoplace no) (effects (font (size 1.27 1.27)))) 
+
+(property "Datasheet" "~" (at 100 100 0) (hide yes) (show_name no) (do_not_autoplace no) (effects (font (size 1.27 1.27)))) (pin "C0" (uuid "a0b1c2d3-e4f5-4607-8899-aabbccddee01")) (pin "P$1" (uuid "e3c9a2b7-8d4f-4e3a-9b6c-2f0a1d5b8e44")) (pin "P$2" (uuid "f4d0b3c8-9e5a-4f4b-8c7d-3a1b2e6c9f55")) (instances (project "pin_edit" (path "/b1f7a3c2-5d4e-4a91-8c6f-2e7d0b9a4c11" (reference "R1") (unit 1))))) 
+
+(symbol (lib_id "PinEdit:Plain") (at 120 100 0) (unit 1) (body_style 1) (exclude_from_sim no) (in_bom yes) (on_board yes) (in_pos_files yes) (dnp no) (fields_autoplaced yes) (uuid "0a1e2d3c-4b5a-4697-8877-665544332211") 
+
+(property "Reference" "R2" (at 122.54 98.73 0) (show_name no) (do_not_autoplace no) (effects (font (size 1.27 1.27)))) 
+
+(property "Value" "Plain" (at 122.54 101.27 0) (show_name no) (do_not_autoplace no) (effects (font (size 1.27 1.27)))) 
+
+(property "Footprint" "" (at 120 100 0) (hide yes) (show_name no) (do_not_autoplace no) (effects (font (size 1.27 1.27)))) 
+
+(property "Datasheet" "~" (at 120 100 0) (hide yes) (show_name no) (do_not_autoplace no) (effects (font (size 1.27 1.27)))) (pin "C0" (uuid "a0b1c2d3-e4f5-4607-8899-aabbccddee02")) (pin "P$1" (uuid "1a2b3c4d-5e6f-4708-9a0b-1c2d3e4f5a66")) (pin "P$2" (uuid "2b3c4d5e-6f70-4819-0a1b-2c3d4e5f6b77")) (instances (project "pin_edit" (path "/b1f7a3c2-5d4e-4a91-8c6f-2e7d0b9a4c11" (reference "R2") (unit 1))))) (sheet_instances (path "/" (page "1"))) (embedded_fonts no))

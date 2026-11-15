@@ -184,6 +184,18 @@ class TestSegmentFields:
         }
 
 
+class TestBareSymbolAtoms:
+    def test_bare_net_reference_name_is_plain_str(self):
+        """Reproduces #295: a bare (net GND) atom must not leak a Symbol."""
+        import sexpdata
+
+        from kcaa.tools.pcb_routing_tools import _get_net_name
+
+        name = _get_net_name([sexpdata.Symbol("net"), sexpdata.Symbol("GND")])
+        assert name == "GND"
+        assert type(name) is str
+
+
 def _get_tools() -> dict:
     from kcaa.tools.pcb_routing_tools import register_pcb_routing_tools
 

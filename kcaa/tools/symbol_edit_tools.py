@@ -5,6 +5,7 @@ the symbol index DB, the streaming extractor, and the skip library.
 """
 
 import asyncio
+from collections import Counter
 import contextlib
 import copy
 import logging
@@ -43,14 +44,19 @@ from kcaa.utils.symbol_index_reader import SymbolIndexReader
 from kcaa.utils.symbol_library_utils import (
     SymbolNameExistsError,
     SymbolNotFoundError,
+    _plan_pin_edit_batch,
+    _split_sub_symbol_name,
+    _validate_pin_edit_requests,
     append_symbol_to_library,
     build_effective_symbol_library_list,
     create_empty_library_file,
+    find_pin_collisions,
     is_safe_symbol_name,
     list_library_symbols,
     remove_symbol_from_library_file,
     resolve_symbol_library,
     sanitize_lib_nickname,
+    set_symbol_pin,
 )
 
 log = logging.getLogger(__name__)
@@ -2450,6 +2456,1286 @@ def _do_create_symbol(
 
 
 # ---------------------------------------------------------------------------
+# Pin number / pin name editing
+# ---------------------------------------------------------------------------
+
+
+def _raw_node_keyword(node: Any) -> str | None:
+    """Return a raw s-expression node's head keyword, or None."""
+    if not isinstance(node, list) or not node:
+        return None
+    head = node[0]
+    if isinstance(head, sexpdata.Symbol):
+        return head.value()
+    if isinstance(head, str):
+        return head
+    return None
+
+
+def _raw_child_node(node: list, keyword: str) -> list | None:
+    """Return the first direct child of *node* whose keyword matches."""
+    for child in node[1:]:
+        if _raw_node_keyword(child) == keyword:
+            return child
+    return None
+
+
+def _edit_cached_symbol_pins(
+    raw: list,
+    symbol_name: str,
+    pins: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Edit pins in a cached lib_symbols raw tree in place.
+
+    Mirrors :func:`kcaa.utils.symbol_library_utils.set_symbol_pin` — same batch
+    selector, final-state collision rules and return shape — but writes into
+    the parsed S-expression tree the schematic serialises on save.  Every
+    matching occurrence in every unit and body style is edited; duplicate
+    numbers that already existed stay legal.
+    """
+    requests = _validate_pin_edit_requests(pins)
+
+    extends_base: str | None = None
+    sub_symbols: list[tuple[int, int, list]] = []
+    for child in raw[2:]:
+        keyword = _raw_node_keyword(child)
+        if keyword == "extends" and len(child) > 1:
+            extends_base = str(child[1])
+        elif keyword == "symbol" and len(child) > 1:
+            parsed = _split_sub_symbol_name(str(child[1]), symbol_name)
+            if parsed is not None:
+                sub_symbols.append((parsed[0], parsed[1], child))
+
+    pin_nodes: list[dict[str, Any]] = []
+    for pin_unit, pin_style, sub_symbol in sub_symbols:
+        for child in sub_symbol[1:]:
+            if _raw_node_keyword(child) != "pin":
+                continue
+            number_node = _raw_child_node(child, "number")
+            name_node = _raw_child_node(child, "name")
+            pin_nodes.append(
+                {
+                    "unit": pin_unit,
+                    "style": pin_style,
+                    "number": str(number_node[1])
+                    if number_node is not None and len(number_node) > 1
+                    else "",
+                    "name": str(name_node[1])
+                    if name_node is not None and len(name_node) > 1
+                    else "",
+                    "number_node": number_node,
+                    "name_node": name_node,
+                }
+            )
+
+    if extends_base is not None and not pin_nodes:
+        raise ValueError(
+            f"symbol '{symbol_name}' extends '{extends_base}' and defines no pins; "
+            f"update the base symbol '{extends_base}' instead"
+        )
+
+    # The tool has no unit selector: every matching pin is edited.
+    plan = _plan_pin_edit_batch(pin_nodes, symbol_name, requests, None)
+    find_pin_collisions(pin_nodes, plan["final_numbers"], plan["pre_existing_pairs"])
+    for pin, change in zip(plan["changed_pins"], plan["changes"], strict=True):
+        if change["new_number"] != pin["number"]:
+            if pin["number_node"] is None:
+                raise ValueError(f"pin '{change['pin_number']}' has no (number ...) node to edit")
+            pin["number_node"][1] = change["new_number"]
+        if change["new_name"] != pin["name"]:
+            if pin["name_node"] is None:
+                raise ValueError(f"pin '{change['pin_number']}' has no (name ...) node to edit")
+            pin["name_node"][1] = change["new_name"]
+    return plan
+
+
+def _references_using_lib_id(sch: Any, lib_id: str) -> list[str]:
+    """Return the unique reference designators of placed units using *lib_id*."""
+    references: list[str] = []
+    try:
+        symbols = sch.symbol
+    except AttributeError:
+        return references
+    for symbol in symbols:
+        try:
+            if symbol.lib_id.value != lib_id:
+                continue
+            reference = symbol.property.Reference.value
+        except AttributeError:
+            continue
+        if reference not in references:
+            references.append(reference)
+    return references
+
+
+def _symbol_raw_tree(symbol: Any) -> list | None:
+    """Return a placed symbol's live raw S-expression tree, or None."""
+    pv = getattr(symbol, "_pv", None)
+    tree = getattr(pv, "_tree", None)
+    return tree if isinstance(tree, list) else None
+
+
+def _rewrite_placement_pin_keys(
+    sch: Any,
+    lib_id: str,
+    number_mapping: dict[str, str],
+) -> int:
+    """Rewrite instance pin keys in placements of *lib_id*; return placements changed.
+
+    skip resolves a placement's pins by intersecting the cached lib-symbol
+    numbers with the placement's own ``(pin "<number>" (uuid …))`` keys, so
+    renumbering only the cache would make the pin disappear.  The instance key
+    *is* the pin number (skip ignores the uuid child), and the mapping is built
+    from the pre-edit snapshot and applied in one pass, so chains never rewrite
+    twice.  Only the key token changes; the ``(uuid …)`` child is preserved.
+    """
+    if not number_mapping:
+        return 0
+    updated = 0
+    try:
+        symbols = sch.symbol
+    except AttributeError:
+        return 0
+    for symbol in symbols:
+        try:
+            if symbol.lib_id.value != lib_id:
+                continue
+        except AttributeError:
+            continue
+        raw = _symbol_raw_tree(symbol)
+        if raw is None:
+            continue
+        rewrote = False
+        for child in raw:
+            if _raw_node_keyword(child) != "pin":
+                continue
+            if len(child) < 2:
+                continue
+            key_number = str(child[1])
+            new_number = number_mapping.get(key_number)
+            if new_number is not None and new_number != key_number:
+                child[1] = new_number
+                rewrote = True
+        if rewrote:
+            updated += 1
+    return updated
+
+
+def _raw_placement_unit_style(raw: list) -> tuple[int, int]:
+    """Return ``(unit, body_style)`` from a placement's raw tree."""
+    unit = 1
+    style = 1
+    for child in raw[1:]:
+        keyword = _raw_node_keyword(child)
+        if keyword == "unit" and len(child) > 1:
+            unit = int(_atom_number(child[1]))
+        elif keyword == "body_style" and len(child) > 1:
+            style = int(_atom_number(child[1]))
+    return unit, style
+
+
+def _rewrite_placement_pin_keys_per_unit(
+    sch: Any,
+    lib_id: str,
+    mapping_by_unit: dict[tuple[int, int], dict[str, str]],
+    present_by_scope: dict[tuple[int, int], set[str]],
+) -> tuple[int, list[tuple[str, int, int, str]], set[tuple[int, int]]]:
+    """Rewrite placement pin keys using only each placement's own unit maps.
+
+    A pin number is unique per unit/style, so a map inferred for unit 2 must
+    never touch a unit-1 placement.  The map for the placement's own
+    ``(unit, body_style)`` and for the common unit ``(0, body_style)`` are
+    merged.  If they disagree about the same old number, or a number is mapped
+    in one scope while the other scope retains it (or retains the target), the
+    placement is left untouched and reported instead of being partially
+    rewritten.
+
+    Returns ``(updated_placements, conflicts, scopes_seen)`` where each
+    conflict is ``(reference, unit, style, pin_number)`` and *scopes_seen*
+    holds every placement's ``(unit, style)``.
+    """
+    if not mapping_by_unit:
+        return 0, [], set()
+    updated = 0
+    conflicts: list[tuple[str, int, int, str]] = []
+    scopes_seen: set[tuple[int, int]] = set()
+    try:
+        symbols = sch.symbol
+    except AttributeError:
+        return 0, [], set()
+    for symbol in symbols:
+        try:
+            if symbol.lib_id.value != lib_id:
+                continue
+        except AttributeError:
+            continue
+        raw = _symbol_raw_tree(symbol)
+        if raw is None:
+            continue
+        unit, style = _raw_placement_unit_style(raw)
+        scopes_seen.add((unit, style))
+        placement_scopes = ((unit, style), (0, style))
+        merged: dict[str, str] = {}
+        conflict_number: str | None = None
+        for scope in placement_scopes:
+            for old_number, new_number in mapping_by_unit.get(scope, {}).items():
+                if old_number in merged and merged[old_number] != new_number:
+                    conflict_number = old_number
+                    break
+                merged[old_number] = new_number
+            if conflict_number is not None:
+                break
+        if conflict_number is None:
+            for old_number, new_number in merged.items():
+                for scope in placement_scopes:
+                    scope_map = mapping_by_unit.get(scope, {})
+                    scope_numbers = present_by_scope.get(scope, set())
+                    if old_number in scope_numbers and scope_map.get(old_number) != new_number:
+                        conflict_number = old_number
+                        break
+                    if new_number in scope_numbers and new_number not in scope_map:
+                        conflict_number = new_number
+                        break
+                if conflict_number is not None:
+                    break
+        if conflict_number is not None:
+            reference = _read_instance_reference(symbol)
+            if reference is None:
+                reference = ""
+                for child in raw[1:]:
+                    if _raw_node_keyword(child) == "property" and len(child) > 2:
+                        if _property_atom_text(child[1]) == "Reference":
+                            reference = _property_atom_text(child[2]) or ""
+                            break
+            conflicts.append((reference, unit, style, conflict_number))
+            continue
+        rewrote = False
+        for child in raw:
+            if _raw_node_keyword(child) != "pin" or len(child) < 2:
+                continue
+            key_number = str(child[1])
+            new_number = merged.get(key_number)
+            if new_number is not None and new_number != key_number:
+                child[1] = new_number
+                rewrote = True
+        if rewrote:
+            updated += 1
+    return updated, conflicts, scopes_seen
+
+
+def _do_update_library_symbol_pin(
+    project_dir: str,
+    lib_id: str,
+    pins: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Core implementation of ``update_library_symbol_pin``.
+
+    Splits *lib_id* on its first colon into nickname and symbol name,
+    resolves the nickname through *project_dir*'s ``sym-lib-table`` first and
+    the global table second (nothing else), applies the whole pin batch to the
+    ``.kicad_sym`` definition in place (format-preserving), and re-indexes the
+    library once under its own ownership.  A pin number is KiCad's identity for
+    a physical connection, so every occurrence in every unit and body style is
+    edited together.  System libraries are refused, exactly like
+    ``remove_symbols_from_library``.
+    """
+    library_name, sep, symbol_name = lib_id.partition(":")
+    if not sep or not library_name or not symbol_name:
+        return {"error": f"lib_id must be 'Library:Symbol' (got {lib_id!r})"}
+
+    try:
+        _validate_pin_edit_requests(pins)
+    except ValueError as exc:
+        return {"error": str(exc)}
+
+    try:
+        lib = resolve_symbol_library(library_name, project_path=project_dir)
+    except ValueError as exc:
+        return {"error": str(exc)}
+    lib_file = lib["path"]
+
+    if config.is_system_library_path(lib_file):
+        return {
+            "error": (
+                f"Refusing to modify system library '{library_name}' "
+                f"(resolves to {lib_file}, inside the KiCad installation): "
+                "symbol library tools operate on user libraries only."
+            )
+        }
+
+    try:
+        result = set_symbol_pin(lib_file, symbol_name, pins)
+    except Exception as exc:
+        log.warning("update_library_symbol_pin failed for %s: %s", symbol_name, exc)
+        return {"error": str(exc)}
+
+    indexed = False
+    if result["changed"]:
+        target_project = _target_project_of(lib["table_path"], project_dir)
+        indexed = (
+            _index_symbol_library(
+                library_name, lib_file, project_dir=project_dir, project=target_project
+            )
+            >= 0
+        )
+
+    return {
+        "success": True,
+        "library_name": library_name,
+        "symbol_name": symbol_name,
+        "library_path": lib_file,
+        "pins_requested": result["pins_requested"],
+        "pins_changed": result["pins_changed"],
+        "occurrences": result["occurrences"],
+        "changes": result["changes"],
+        "changed": result["changed"],
+        "backup_path": result["backup_path"],
+        "indexed": indexed,
+        "warnings": result["warnings"],
+    }
+
+
+def _do_update_schematic_symbol_pin(
+    schematic_path: str,
+    lib_id: str,
+    pins: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Core implementation of ``update_schematic_symbol_pin``.
+
+    Edits the schematic's cached ``lib_symbols`` copy of *lib_id* and rewrites
+    the matching ``(pin "…" (uuid …))`` keys on affected placements so skip can
+    still resolve the renamed pins.  Renumbering uses one simultaneous
+    pre-edit mapping, so chain/cycle renames never rewrite a key twice.
+    Wires, junctions, labels, instances, properties and every other cached
+    symbol are left untouched.  The file is rewritten through the project's
+    normal schematic save path (not preserved byte-for-byte); it is saved only
+    when something actually changed.
+    """
+    if not schematic_path.endswith(".kicad_sch"):
+        return {"error": f"Not a .kicad_sch file: {schematic_path!r}"}
+    if not os.path.isfile(schematic_path):
+        return {"error": f"Schematic file not found: {schematic_path!r}"}
+
+    try:
+        _validate_pin_edit_requests(pins)
+    except ValueError as exc:
+        return {"error": str(exc)}
+
+    try:
+        sch = safe_schematic(schematic_path)
+    except Exception as exc:
+        return {"error": f"Failed to open schematic: {exc}"}
+
+    raw = _cached_lib_symbol_raw(sch, lib_id)
+    if raw is None:
+        available = [stored_id for stored_id, _ in _extract_cached_raw_entries(sch)][:5]
+        hint = f" (available: {', '.join(map(repr, available))})" if available else ""
+        return {"error": f"lib_id '{lib_id}' not found in the schematic's lib_symbols cache{hint}"}
+
+    # The cache key is *lib_id* exactly as stored (no split, no fallback); the
+    # bare part after the colon only names ``<symbol>_<unit>_<style>`` children.
+    symbol_name = lib_id.split(":", 1)[-1]
+    try:
+        result = _edit_cached_symbol_pins(raw, symbol_name, pins)
+    except ValueError as exc:
+        return {"error": str(exc)}
+
+    affected_references = _references_using_lib_id(sch, lib_id)
+
+    number_mapping: dict[str, str] = {}
+    for change in result["changes"]:
+        if change["old_number"] != change["new_number"]:
+            number_mapping[change["old_number"]] = change["new_number"]
+
+    placements_updated = 0
+    if result["changed"] and number_mapping:
+        placements_updated = _rewrite_placement_pin_keys(sch, lib_id, number_mapping)
+
+    backup_path: str | None = None
+    if result["changed"]:
+        try:
+            backup_path = save_schematic(schematic_path, sch)
+        except Exception as exc:
+            return {"error": f"Failed to save schematic: {exc}"}
+
+    return {
+        "success": True,
+        "lib_id": lib_id,
+        "symbol_name": symbol_name,
+        "pins_requested": len(pins),
+        "pins_changed": result["pins_changed"],
+        "occurrences": result["occurrences"],
+        "changes": result["changes"],
+        "changed": result["changed"],
+        "backup_path": backup_path,
+        "affected_references": affected_references,
+        "affected_count": len(affected_references),
+        "placements_updated": placements_updated,
+        "warnings": result["warnings"],
+    }
+
+
+# ---------------------------------------------------------------------------
+# Definition refresh from the library
+# ---------------------------------------------------------------------------
+
+
+class _LibPinRecord(NamedTuple):
+    """One pin occurrence of a symbol definition.
+
+    Records are kept per *occurrence* (a symbol may legally carry duplicate
+    numbers, e.g. stacked pins), so renumber inference can see collisions that
+    a number-keyed map would hide.
+    """
+
+    unit: int
+    style: int
+    number: str
+    name: str
+    x: float
+    y: float
+    angle: float
+    pin_type: str
+    shape: str
+    length: float
+    hidden: bool
+    node: list
+
+
+def _atom_number(atom: object) -> float:
+    """Return a numeric atom as ``float`` (0.0 for anything unparseable)."""
+    if isinstance(atom, (int, float)):
+        return float(atom)
+    try:
+        return float(str(atom))
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _flag_is_set(node: list | None) -> bool:
+    """Return True for a flag node such as ``(hide yes)`` or bare ``(hide)``."""
+    if node is None:
+        return False
+    if len(node) < 2:
+        return True
+    text = _property_atom_text(node[1])
+    return str(text).lower() not in ("no", "false", "0")
+
+
+def _canonical_sexp(value: object) -> object:
+    """Return a formatting-insensitive view of an s-expression tree.
+
+    Used for structural comparison: quoted strings and bare symbols stay
+    distinct, and integers compare equal to their float spelling (``0`` and
+    ``0.0``), so a round trip through another KiCad writer does not look like
+    a definition change.
+    """
+    if isinstance(value, list):
+        return tuple(_canonical_sexp(item) for item in value)
+    if isinstance(value, sexpdata.Symbol):
+        return ("sym", value.value())
+    if isinstance(value, str):
+        return ("str", value)
+    if isinstance(value, bool):
+        return ("num", float(value))
+    if isinstance(value, (int, float)):
+        return ("num", float(value))
+    return value
+
+
+def _definition_pin_occurrences(raw: list, symbol_name: str) -> list[_LibPinRecord]:
+    """Return every pin occurrence of *raw* in unit/style sub-symbols.
+
+    Only sub-symbols named ``<symbol_name>_<unit>_<style>`` carry pins.
+    Duplicate numbers are preserved here (one record per pin node) because
+    renumber inference must reject ambiguous duplicate-number rewrites.
+    """
+    pins: list[_LibPinRecord] = []
+    for child in raw[2:]:
+        if _raw_node_keyword(child) != "symbol" or len(child) < 2:
+            continue
+        parsed = _split_sub_symbol_name(str(child[1]), symbol_name)
+        if parsed is None:
+            continue
+        unit, style = parsed
+        for pin in child[1:]:
+            if _raw_node_keyword(pin) != "pin":
+                continue
+            number_node = _raw_child_node(pin, "number")
+            number = (
+                _property_atom_text(number_node[1])
+                if number_node is not None and len(number_node) > 1
+                else None
+            )
+            if not number:
+                continue
+            name_node = _raw_child_node(pin, "name")
+            name = (
+                _property_atom_text(name_node[1])
+                if name_node is not None and len(name_node) > 1
+                else ""
+            )
+            at_node = _raw_child_node(pin, "at")
+            x = y = angle = 0.0
+            if at_node is not None:
+                if len(at_node) > 1:
+                    x = _atom_number(at_node[1])
+                if len(at_node) > 2:
+                    y = _atom_number(at_node[2])
+                if len(at_node) > 3:
+                    angle = _atom_number(at_node[3])
+            length_node = _raw_child_node(pin, "length")
+            pin_type = str(pin[1]) if len(pin) > 1 else ""
+            shape = str(pin[2]) if len(pin) > 2 else ""
+            pins.append(
+                _LibPinRecord(
+                    unit=unit,
+                    style=style,
+                    number=number,
+                    name=name or "",
+                    x=x,
+                    y=y,
+                    angle=angle,
+                    pin_type=pin_type,
+                    shape=shape,
+                    length=_atom_number(length_node[1])
+                    if length_node is not None and len(length_node) > 1
+                    else 0.0,
+                    hidden=_flag_is_set(_raw_child_node(pin, "hide")),
+                    node=pin,
+                )
+            )
+    return pins
+
+
+def _definition_pins(raw: list, symbol_name: str) -> dict[tuple[int, int, str], _LibPinRecord]:
+    """Return ``{(unit, style, number): _LibPinRecord}`` for *raw*.
+
+    This number-keyed view is what the per-key diff uses; duplicate numbers
+    collapse to the last occurrence.  Renumber inference uses
+    :func:`_definition_pin_occurrences` instead so duplicates stay visible.
+    """
+    pins: dict[tuple[int, int, str], _LibPinRecord] = {}
+    for record in _definition_pin_occurrences(raw, symbol_name):
+        pins[(record.unit, record.style, record.number)] = record
+    return pins
+
+
+def _pin_occurrence_summary(record: _LibPinRecord) -> dict[str, Any]:
+    """Return a compact JSON-friendly summary of one pin occurrence."""
+    return {
+        "name": record.name,
+        "at": [record.x, record.y, record.angle],
+        "type": record.pin_type,
+        "shape": record.shape,
+        "length": record.length,
+        "hide": record.hidden,
+    }
+
+
+def _definition_properties(raw: list) -> dict[str, list]:
+    """Return ``{property_name: raw_node}`` for the symbol-level *raw* body."""
+    properties: dict[str, list] = {}
+    for child in raw[2:]:
+        if _raw_node_keyword(child) != "property":
+            continue
+        try:
+            name = _parse_lib_property(child).name
+        except ValueError:
+            continue
+        properties.setdefault(name, child)
+    return properties
+
+
+def _definition_graphics(raw: list, symbol_name: str) -> tuple:
+    """Return a canonical view of everything that is neither pin nor property.
+
+    Covers symbol-level children (flags such as ``pin_numbers``, ``in_bom``,
+    ``embedded_fonts``, …) and each unit/style sub-symbol's graphic nodes.
+    Sub-symbols are keyed by ``(unit, style)`` so ordering between units does
+    not count, but ordering inside one unit does.
+    """
+    body: list = []
+    units: dict[tuple[int, int], list] = {}
+    for child in raw[2:]:
+        keyword = _raw_node_keyword(child)
+        if keyword in ("property", "pin"):
+            continue
+        if keyword == "symbol" and len(child) > 1:
+            parsed = _split_sub_symbol_name(str(child[1]), symbol_name)
+            if parsed is not None:
+                units[parsed] = [
+                    node for node in child[1:] if _raw_node_keyword(node) not in ("pin", "property")
+                ]
+                continue
+        body.append(child)
+    return _canonical_sexp([body, sorted(units.items())])
+
+
+def _infer_pin_renumbering(
+    old_pins: list[_LibPinRecord],
+    new_pins: list[_LibPinRecord],
+) -> tuple[
+    dict[tuple[int, int], dict[str, str]],
+    dict[tuple[int, int], set[str]],
+    list[dict[str, Any]],
+    bool,
+    dict[tuple[int, int], set[str]],
+]:
+    """Infer ``(unit, style) -> {old_number: new_number}`` from pin positions.
+
+    Identity is positional because the library no longer carries the old
+    numbers.  Maps are kept per unit/style: the same number in another unit is
+    a different physical pin, so applying one unit's mapping to another would
+    corrupt its placement keys.
+
+    A positional group maps when every old occurrence there shares one number
+    and every new occurrence there shares one different number, with equal
+    occurrence counts.  That covers both a single pin and fully renumbered
+    stacked pins (``1,1 -> 9,9``).  Partially changed or heterogeneous groups
+    are refused visibly as ambiguous.
+
+    The returned second value is the set of pin numbers present per unit/style
+    in the *old* definition.  Callers use it to prevent one scope's map from
+    rewriting a key that another scope retains.  The fifth value lists the old
+    numbers involved in rejected renumber groups, so diagnostics do not claim
+    they were simply removed.
+    """
+    present_by_scope: dict[tuple[int, int], set[str]] = {}
+    for record in old_pins:
+        present_by_scope.setdefault((record.unit, record.style), set()).add(record.number)
+
+    keys = sorted(
+        {(record.unit, record.style) for record in old_pins}
+        | {(record.unit, record.style) for record in new_pins}
+    )
+    mapping_by_unit: dict[tuple[int, int], dict[str, str]] = {}
+    renumbered: list[dict[str, Any]] = []
+    rejected_by_scope: dict[tuple[int, int], set[str]] = {}
+    ambiguous_any = False
+
+    for unit, style in keys:
+        scope = (unit, style)
+        old_records = [record for record in old_pins if (record.unit, record.style) == scope]
+        new_records = [record for record in new_pins if (record.unit, record.style) == scope]
+        old_by_position: dict[tuple[float, float], list[_LibPinRecord]] = {}
+        new_by_position: dict[tuple[float, float], list[_LibPinRecord]] = {}
+        for record in old_records:
+            old_by_position.setdefault((record.x, record.y), []).append(record)
+        for record in new_records:
+            new_by_position.setdefault((record.x, record.y), []).append(record)
+
+        mapping: dict[str, str] = {}
+        old_mapped_counts: Counter = Counter()
+        new_mapped_counts: Counter = Counter()
+        candidates: set[str] = set()
+        scope_ambiguous = False
+
+        for position, old_entries in old_by_position.items():
+            new_entries = new_by_position.get(position, [])
+            if not new_entries:
+                continue
+            old_multiset = Counter(record.number for record in old_entries)
+            new_multiset = Counter(record.number for record in new_entries)
+            if old_multiset != new_multiset:
+                candidates.update(record.number for record in old_entries)
+                candidates.update(record.number for record in new_entries)
+            old_numbers = set(old_multiset)
+            new_numbers = set(new_multiset)
+            if len(old_numbers) != 1 or len(new_numbers) != 1:
+                # Heterogeneous numbers share a position: no single key
+                # mapping can describe the change.
+                scope_ambiguous = True
+                continue
+            old_number = next(iter(old_numbers))
+            new_number = next(iter(new_numbers))
+            if old_number == new_number:
+                continue
+            if len(old_entries) != len(new_entries):
+                scope_ambiguous = True
+                continue
+            if old_number in mapping and mapping[old_number] != new_number:
+                scope_ambiguous = True
+                continue
+            mapping[old_number] = new_number
+            old_mapped_counts[old_number] += len(old_entries)
+            new_mapped_counts[new_number] += len(new_entries)
+
+        old_numbers = [record.number for record in old_records]
+        new_numbers = [record.number for record in new_records]
+        old_counts = Counter(old_numbers)
+        new_counts = Counter(new_numbers)
+        retained_numbers = set(old_numbers) - set(mapping)
+
+        if len(set(mapping.values())) != len(mapping) or set(mapping.values()) & retained_numbers:
+            scope_ambiguous = True
+        for old_number, new_number in mapping.items():
+            if old_counts[old_number] != old_mapped_counts[old_number]:
+                scope_ambiguous = True
+            if new_counts.get(new_number, 0) != new_mapped_counts[new_number]:
+                scope_ambiguous = True
+
+        rejected_by_scope[scope] = candidates
+        if scope_ambiguous:
+            ambiguous_any = True
+            continue
+        if not mapping:
+            continue
+        mapping_by_unit[scope] = mapping
+        for old_number, new_number in mapping.items():
+            new_record = next(record for record in new_records if record.number == new_number)
+            renumbered.append(
+                {
+                    "old_number": old_number,
+                    "new_number": new_number,
+                    "name": new_record.name,
+                    "unit": unit,
+                    "style": style,
+                }
+            )
+
+    if ambiguous_any:
+        return {}, present_by_scope, [], True, rejected_by_scope
+
+    renumbered.sort(key=lambda entry: (entry["unit"], entry["style"], entry["old_number"]))
+    return mapping_by_unit, present_by_scope, renumbered, False, {}
+
+
+def _replace_cached_lib_symbol(sch: Any, lib_id: str, raw: list) -> None:
+    """Replace the cached ``lib_symbols`` entry for *lib_id* in memory.
+
+    Mirrors :func:`_add_lib_symbol`: the parsed tree's element is swapped and
+    the wrapper's lookup table is pointed at the same raw list, so both a
+    subsequent read through :func:`_cached_lib_symbol_raw` and the final
+    ``sch.write()`` see the new definition.
+    """
+    wrapper = sch.lib_symbols
+    tree = wrapper._pv._tree
+    for entry in tree:
+        if isinstance(entry, list) and len(entry) > 1 and entry[1] == lib_id:
+            # Slice assignment keeps the list object that the source tree (and
+            # therefore sch.write()) holds, whether the entry is a raw list or
+            # the tree behind a skip LibSymbol wrapper.
+            entry[:] = raw
+            wrapper._libsyms_by_id[lib_id] = entry
+            return
+    raise ValueError(f"lib_symbols cache entry for {lib_id!r} could not be replaced")
+
+
+def _resolve_refresh_source(
+    project_dir: str,
+    nickname: str,
+    symbol_name: str,
+) -> tuple[Any, Any] | None:
+    """Resolve the library record and symbol record for a refresh.
+
+    Tries the nickname as registered, then the symbol-directory form
+    ``<nickname>/<symbol>`` used by ``.kicad_symdir`` libraries.  The index
+    manager itself is scoped to *project_dir*; no other scope is consulted.
+    """
+    mgr = _get_index_manager(project_dir)
+    for library_name in (nickname, f"{nickname}/{symbol_name}"):
+        lib_rec = mgr.get_library_by_name(library_name)
+        if lib_rec is None:
+            continue
+        sym_rec = mgr.get_symbol(library_name, symbol_name)
+        if sym_rec is not None:
+            return lib_rec, sym_rec
+    return None
+
+
+def _refresh_diff(
+    old_raw: list,
+    new_raw: list,
+    symbol_name: str,
+) -> dict[str, Any]:
+    """Return the structural diff between two symbol definitions.
+
+    The top-level name is ignored (the cache stores ``"Library:Symbol"`` while
+    the library stores the plain name); everything below it is compared
+    structurally, so formatting, line endings and number spelling do not
+    count as changes.
+    """
+    old_pins = _definition_pins(old_raw, symbol_name)
+    new_pins = _definition_pins(new_raw, symbol_name)
+    old_occurrences = _definition_pin_occurrences(old_raw, symbol_name)
+    new_occurrences = _definition_pin_occurrences(new_raw, symbol_name)
+    old_props = _definition_properties(old_raw)
+    new_props = _definition_properties(new_raw)
+
+    old_keys = set(old_pins)
+    new_keys = set(new_pins)
+
+    pins_added = [
+        {
+            "number": number,
+            "name": new_pins[(unit, style, number)].name,
+            "unit": unit,
+            "style": style,
+        }
+        for unit, style, number in sorted(new_keys - old_keys)
+    ]
+    pins_removed = [
+        {
+            "number": number,
+            "name": old_pins[(unit, style, number)].name,
+            "unit": unit,
+            "style": style,
+        }
+        for unit, style, number in sorted(old_keys - new_keys)
+    ]
+
+    pins_renamed: list[dict[str, Any]] = []
+    pins_moved: list[dict[str, Any]] = []
+    pins_modified: list[dict[str, Any]] = []
+    for key in sorted(old_keys & new_keys):
+        unit, style, number = key
+        old_pin = old_pins[key]
+        new_pin = new_pins[key]
+        if old_pin.name != new_pin.name:
+            pins_renamed.append(
+                {
+                    "number": number,
+                    "old_name": old_pin.name,
+                    "new_name": new_pin.name,
+                    "unit": unit,
+                    "style": style,
+                }
+            )
+        old_at = [old_pin.x, old_pin.y, old_pin.angle]
+        new_at = [new_pin.x, new_pin.y, new_pin.angle]
+        if old_at != new_at:
+            pins_moved.append(
+                {
+                    "number": number,
+                    "name": new_pin.name,
+                    "old_at": old_at,
+                    "new_at": new_at,
+                    "unit": unit,
+                    "style": style,
+                }
+            )
+        field_changes = [
+            ("type", old_pin.pin_type, new_pin.pin_type),
+            ("shape", old_pin.shape, new_pin.shape),
+            ("length", old_pin.length, new_pin.length),
+            ("hide", old_pin.hidden, new_pin.hidden),
+        ]
+        changed_fields = 0
+        for field, old_value, new_value in field_changes:
+            if old_value == new_value:
+                continue
+            changed_fields += 1
+            pins_modified.append(
+                {
+                    "number": number,
+                    "unit": unit,
+                    "style": style,
+                    "field": field,
+                    "old": old_value,
+                    "new": new_value,
+                }
+            )
+        if (
+            not changed_fields
+            and old_pin.name == new_pin.name
+            and old_at == new_at
+            and _canonical_sexp(old_pin.node) != _canonical_sexp(new_pin.node)
+        ):
+            pins_modified.append(
+                {
+                    "number": number,
+                    "unit": unit,
+                    "style": style,
+                    "field": "node",
+                    "old": sexpdata.dumps(old_pin.node),
+                    "new": sexpdata.dumps(new_pin.node),
+                }
+            )
+
+    mapping, present_by_scope, pins_renumbered, renumber_ambiguous, rejected_numbers = (
+        _infer_pin_renumbering(old_occurrences, new_occurrences)
+    )
+
+    pins_unclassified: list[dict[str, Any]] = []
+    old_by_scope: dict[tuple[int, int], list[_LibPinRecord]] = {}
+    new_by_scope: dict[tuple[int, int], list[_LibPinRecord]] = {}
+    for record in old_occurrences:
+        old_by_scope.setdefault((record.unit, record.style), []).append(record)
+    for record in new_occurrences:
+        new_by_scope.setdefault((record.unit, record.style), []).append(record)
+
+    classified_entries = pins_renamed + pins_moved + pins_modified
+    classified_keys: dict[tuple[int, int], set[tuple[int, int, str]]] = {}
+    for entry in classified_entries:
+        scope = (entry["unit"], entry["style"])
+        classified_keys.setdefault(scope, set()).add(
+            (entry["unit"], entry["style"], entry["number"])
+        )
+    added_keys: dict[tuple[int, int], set[tuple[int, int, str]]] = {}
+    for entry in pins_added:
+        scope = (entry["unit"], entry["style"])
+        added_keys.setdefault(scope, set()).add((entry["unit"], entry["style"], entry["number"]))
+    removed_keys: dict[tuple[int, int], set[tuple[int, int, str]]] = {}
+    for entry in pins_removed:
+        scope = (entry["unit"], entry["style"])
+        removed_keys.setdefault(scope, set()).add((entry["unit"], entry["style"], entry["number"]))
+
+    def _subtract_key(
+        counter: Counter,
+        record_by_key: dict[tuple[int, int, str], _LibPinRecord],
+        key: tuple[int, int, str],
+    ) -> None:
+        record = record_by_key.get(key)
+        if record is None:
+            return
+        canonical = _canonical_sexp(record.node)
+        if counter.get(canonical, 0) > 0:
+            counter[canonical] -= 1
+            if counter[canonical] <= 0:
+                del counter[canonical]
+
+    def _subtract_number(
+        counter: Counter,
+        records: list[_LibPinRecord],
+        number: str,
+    ) -> None:
+        # Inference only accepts a mapping when every occurrence of the number
+        # belongs to it, so removing all occurrences cannot over-subtract.
+        # Counter guards make this idempotent with the added/removed pass.
+        for record in records:
+            if record.number != number:
+                continue
+            canonical = _canonical_sexp(record.node)
+            if counter.get(canonical, 0) > 0:
+                counter[canonical] -= 1
+                if counter[canonical] <= 0:
+                    del counter[canonical]
+
+    for scope in sorted(set(old_by_scope) | set(new_by_scope)):
+        unit, style = scope
+        old_records = old_by_scope.get(scope, [])
+        new_records = new_by_scope.get(scope, [])
+        old_counter = Counter(_canonical_sexp(record.node) for record in old_records)
+        new_counter = Counter(_canonical_sexp(record.node) for record in new_records)
+        if old_counter == new_counter:
+            continue
+
+        # Subtract exactly the occurrence nodes already described by the
+        # number-keyed entries for this scope.  Whatever multiset difference
+        # remains is a real change those entries did not account for.
+        for key in classified_keys.get(scope, set()):
+            _subtract_key(old_counter, old_pins, key)
+            _subtract_key(new_counter, new_pins, key)
+        for key in added_keys.get(scope, set()):
+            _subtract_key(new_counter, new_pins, key)
+        for key in removed_keys.get(scope, set()):
+            _subtract_key(old_counter, old_pins, key)
+        for entry in pins_renumbered:
+            if (entry["unit"], entry["style"]) != scope:
+                continue
+            _subtract_number(old_counter, old_records, entry["old_number"])
+            _subtract_number(new_counter, new_records, entry["new_number"])
+
+        old_by_key = {_canonical_sexp(record.node): record for record in old_records}
+        new_by_key = {_canonical_sexp(record.node): record for record in new_records}
+        additions: list[dict[str, Any]] = []
+        for key, count in (old_counter - new_counter).items():
+            record = old_by_key[key]
+            for _ in range(count):
+                additions.append(
+                    {
+                        "number": record.number,
+                        "unit": unit,
+                        "style": style,
+                        "old": _pin_occurrence_summary(record),
+                        "new": None,
+                    }
+                )
+        for key, count in (new_counter - old_counter).items():
+            record = new_by_key[key]
+            for _ in range(count):
+                additions.append(
+                    {
+                        "number": record.number,
+                        "unit": unit,
+                        "style": style,
+                        "old": None,
+                        "new": _pin_occurrence_summary(record),
+                    }
+                )
+        additions.sort(
+            key=lambda entry: (
+                entry["number"],
+                str(entry["old"]),
+                str(entry["new"]),
+            )
+        )
+        pins_unclassified.extend(additions)
+
+    properties_added = sorted(set(new_props) - set(old_props))
+    properties_removed = sorted(set(old_props) - set(new_props))
+    properties_changed = sorted(
+        name
+        for name in set(old_props) & set(new_props)
+        if _canonical_sexp(old_props[name]) != _canonical_sexp(new_props[name])
+    )
+    old_property_order = list(old_props)
+    new_property_order = list(new_props)
+    properties_reordered = (
+        sorted(old_property_order) == sorted(new_property_order)
+        and old_property_order != new_property_order
+    )
+
+    graphics_changed = _definition_graphics(old_raw, symbol_name) != _definition_graphics(
+        new_raw, symbol_name
+    )
+    changed = bool(
+        pins_added
+        or pins_removed
+        or pins_renamed
+        or pins_renumbered
+        or pins_moved
+        or pins_modified
+        or pins_unclassified
+        or properties_added
+        or properties_removed
+        or properties_changed
+        or properties_reordered
+        or graphics_changed
+    )
+
+    # A rejected renumber makes the per-key view describe changes that were
+    # not applied (a shadowed rename, a spurious move/field change).  Keep
+    # those facts out of the number-keyed lists; the ambiguity warning and
+    # `pins_unclassified` carry the real signal.  `changed` was computed from
+    # the unedited classification above, so the definition change is not lost.
+    if rejected_numbers:
+
+        def _not_rejected(entry: dict[str, Any]) -> bool:
+            scope = (entry["unit"], entry["style"])
+            return entry["number"] not in rejected_numbers.get(scope, set())
+
+        pins_renamed = [entry for entry in pins_renamed if _not_rejected(entry)]
+        pins_moved = [entry for entry in pins_moved if _not_rejected(entry)]
+        pins_modified = [entry for entry in pins_modified if _not_rejected(entry)]
+
+    return {
+        "changed": changed,
+        "pins_added": pins_added,
+        "pins_removed": pins_removed,
+        "pins_renamed": pins_renamed,
+        "pins_renumbered": pins_renumbered,
+        "pins_moved": pins_moved,
+        "pins_modified": pins_modified,
+        "pins_unclassified": pins_unclassified,
+        "properties_added": properties_added,
+        "properties_removed": properties_removed,
+        "properties_changed": properties_changed,
+        "properties_reordered": properties_reordered,
+        "graphics_changed": graphics_changed,
+        "renumber_mapping": mapping,
+        "renumber_present": present_by_scope,
+        "renumber_rejected": rejected_numbers,
+        "renumber_ambiguous": renumber_ambiguous,
+    }
+
+
+def _do_update_schematic_symbol_from_library(
+    schematic_path: str,
+    project_dir: str,
+    lib_id: str,
+    dry_run: bool = False,
+) -> dict[str, Any]:
+    """Core implementation of ``update_schematic_symbol_from_library``.
+
+    Refreshes only the schematic's cached definition of *lib_id*.  Placements
+    keep their position, rotation, unit, uuid, instances and every property;
+    the one mechanical fix-up is rewriting ``(pin "<number>" …)`` keys when a
+    pin number changed at the same position.  Wires, junctions, labels and
+    other cached symbols are untouched.
+    """
+    if not schematic_path.endswith(".kicad_sch"):
+        return {"error": f"Not a .kicad_sch file: {schematic_path!r}"}
+    if not os.path.isfile(schematic_path):
+        return {"error": f"Schematic file not found: {schematic_path!r}"}
+
+    try:
+        sch = safe_schematic(schematic_path)
+    except Exception as exc:
+        return {"error": f"Failed to open schematic: {exc}"}
+
+    old_raw = _cached_lib_symbol_raw(sch, lib_id)
+    if old_raw is None:
+        available = [stored_id for stored_id, _ in _extract_cached_raw_entries(sch)][:5]
+        hint = f" (available: {', '.join(map(repr, available))})" if available else ""
+        return {"error": f"lib_id '{lib_id}' not found in the schematic's lib_symbols cache{hint}"}
+
+    nickname, sep, symbol_name = lib_id.partition(":")
+    if not sep or not nickname or not symbol_name:
+        return {
+            "error": (
+                f"lib_id {lib_id!r} has no library nickname; "
+                "pass a 'Library:Symbol' id so the definition can be resolved "
+                "from a symbol library"
+            )
+        }
+
+    try:
+        resolved = _resolve_refresh_source(project_dir, nickname, symbol_name)
+    except Exception as exc:
+        return {"error": f"Failed to query the symbol index: {exc}"}
+    if resolved is None:
+        return {
+            "error": (
+                f"Library '{nickname}' / symbol '{symbol_name}' not found in the symbol index"
+                f"{_not_found_scope(project_dir, hint=False)}"
+            )
+        }
+    lib_rec, sym_rec = resolved
+
+    try:
+        new_raw = extract_lib_symbol_raw(
+            lib_rec.file_path,
+            sym_rec.file_index,
+            symbol_name,
+            lib_rec.mtime,
+            lib_rec.file_size,
+        )
+    except Exception as exc:
+        return {"error": f"Failed to extract lib symbol: {exc}"}
+
+    warnings: list[str] = []
+    try:
+        new_raw = _resolve_extends_symbol(
+            new_raw,
+            lib_rec.library_name,
+            project_path=project_dir,
+            warnings=warnings,
+        )
+    except Exception as exc:
+        return {"error": f"Failed to resolve extends chain: {exc}"}
+
+    # Unit sub-symbols keep the plain name; only the top-level key is the
+    # stored (qualified) lib id, exactly like _add_lib_symbol.
+    new_raw = copy.deepcopy(new_raw)
+    new_raw[1] = lib_id
+
+    diff = _refresh_diff(old_raw, new_raw, symbol_name)
+
+    affected_references = _references_using_lib_id(sch, lib_id)
+
+    number_mapping: dict[tuple[int, int], dict[str, str]] = diff["renumber_mapping"]
+    renumber_ambiguous = diff["renumber_ambiguous"]
+    rejected_numbers: dict[tuple[int, int], set[str]] = diff["renumber_rejected"]
+    if renumber_ambiguous:
+        warnings.append(
+            "could not infer a unique pin renumbering mapping; "
+            "placement pin keys were left unchanged"
+        )
+
+    for entry in diff["pins_removed"]:
+        scope = (entry["unit"], entry["style"])
+        scoped_mapping = number_mapping.get(scope, {})
+        if entry["number"] in scoped_mapping:
+            # Renumbered at the same position and in the same unit/style: the
+            # placement key was rewritten, not lost.
+            continue
+        if entry["number"] in rejected_numbers.get(scope, set()):
+            warnings.append(
+                f"pin number {entry['number']!r} (unit {entry['unit']}, "
+                f"style {entry['style']}) no longer exists in the library; "
+                "it may have been renumbered and the mapping was rejected - "
+                "see the ambiguity warning"
+            )
+            continue
+        warnings.append(
+            f"pin {entry['number']!r} (name {entry['name']!r}, unit {entry['unit']}, "
+            f"style {entry['style']}) was removed from the library; "
+            "placement pin keys were kept"
+        )
+    for entry in diff["pins_moved"]:
+        scope = (entry["unit"], entry["style"])
+        if renumber_ambiguous and entry["number"] in rejected_numbers.get(scope, set()):
+            # The per-key view sees a rejected renumber as a move; the
+            # ambiguity warning is the truthful diagnostic.
+            continue
+        old_at = ", ".join(str(value) for value in entry["old_at"])
+        new_at = ", ".join(str(value) for value in entry["new_at"])
+        warnings.append(
+            f"pin {entry['number']!r} (unit {entry['unit']}, style {entry['style']}) "
+            f"moved from ({old_at}) to ({new_at}); attached wires were not moved"
+        )
+
+    placements_updated = 0
+    if diff["changed"] and number_mapping:
+        # Applied in memory even for dry_run: it only affects the parsed tree
+        # (the file is never written), so the preview reports exactly what a
+        # real run would rewrite.
+        placements_updated, conflicts, scopes_seen = _rewrite_placement_pin_keys_per_unit(
+            sch, lib_id, number_mapping, diff["renumber_present"]
+        )
+        for reference, unit, style, number in conflicts:
+            renumber_ambiguous = True
+            warnings.append(
+                f"placement {reference or '<unknown>'!r} (unit {unit}, style {style}) "
+                f"has conflicting renumber targets for pin {number!r}; "
+                "its pin keys were left unchanged"
+            )
+        for unit, style in sorted(number_mapping):
+            if unit == 0 or (unit, style) in scopes_seen:
+                continue
+            warnings.append(
+                f"pin renumbering for unit {unit}, style {style} was not applied: "
+                "no placement uses that unit/style and no pin keys needed rewriting"
+            )
+
+    backup_path: str | None = None
+    if diff["changed"] and not dry_run:
+        try:
+            _replace_cached_lib_symbol(sch, lib_id, new_raw)
+        except Exception as exc:
+            return {"error": f"Failed to apply symbol definition: {exc}"}
+        try:
+            backup_path = save_schematic(schematic_path, sch)
+        except Exception as exc:
+            return {
+                "error": (
+                    "Failed to save schematic (the target file was not replaced; "
+                    f"a backup or temporary file may remain): {exc}"
+                )
+            }
+
+    return {
+        "success": True,
+        "lib_id": lib_id,
+        "symbol_name": symbol_name,
+        "library_name": nickname,
+        "library_path": lib_rec.file_path,
+        "changed": diff["changed"],
+        "dry_run": dry_run,
+        "backup_path": backup_path,
+        "pins_added": diff["pins_added"],
+        "pins_removed": diff["pins_removed"],
+        "pins_renamed": diff["pins_renamed"],
+        "pins_renumbered": diff["pins_renumbered"],
+        "pins_moved": diff["pins_moved"],
+        "pins_modified": diff["pins_modified"],
+        "pins_unclassified": diff["pins_unclassified"],
+        "properties_added": diff["properties_added"],
+        "properties_removed": diff["properties_removed"],
+        "properties_changed": diff["properties_changed"],
+        "properties_reordered": diff["properties_reordered"],
+        "graphics_changed": diff["graphics_changed"],
+        "renumber_ambiguous": renumber_ambiguous,
+        "affected_references": affected_references,
+        "affected_count": len(affected_references),
+        "placements_updated": placements_updated,
+        "warnings": warnings,
+    }
+
+
+# ---------------------------------------------------------------------------
 # MCP tool registration
 # ---------------------------------------------------------------------------
 
@@ -2904,6 +4190,241 @@ def register_symbol_edit_tools(mcp: FastMCP) -> None:
         """
         return _do_remove_symbol_from_library(
             library=library, symbols=symbols, project_dir=project_dir
+        )
+
+    @mcp.tool()
+    async def update_library_symbol_pin(
+        project_dir: str,
+        lib_id: str,
+        pins: list[dict[str, Any]],
+        ctx: Context | None = None,
+    ) -> dict[str, Any]:
+        """Rename pin numbers and/or names in a symbol library definition.
+
+        Applies a batch of pin edits to the ``.kicad_sym`` definition in one
+        atomic write, preserving every other byte of the file (formatting,
+        line endings, other symbols).  Use this to fix symbol pins (e.g.
+        ``P$1`` → ``1``) so they match the footprint pads.  Already-placed
+        symbols keep their cached copy — call ``update_schematic_symbol_pin``
+        as well to fix those schematics.
+
+        The whole batch is validated against its final state before anything
+        is written.  Selectors always match the pre-edit snapshot, so chains
+        and cycles that form a valid permutation (``P$1 → 1``, ``1 → 2``)
+        are accepted; only a newly introduced duplicate number is rejected.  Exactly
+        one ``.bak`` and one write are produced, and the library is re-indexed
+        once when something changed.
+
+        A pin number is KiCad's identity for a physical connection, so every
+        definition carrying it is edited together.  Numbers keep their
+        uniqueness: a number already used inside the same part is rejected,
+        while duplicates that already existed (KiCad's duplicate-pin jumpers)
+        stay legal.  A new number that duplicates a pin KiCad resolves
+        separately (another part of a multi-part symbol) is allowed and
+        reported in ``warnings``.  Pin names are not required to be unique and
+        may be empty.
+
+        Args:
+            project_dir: Project directory (or a file inside it). Its
+                ``sym-lib-table`` is searched first, then the global table,
+                and the re-index is scoped to it. Required: the project can
+                hold project-local libraries (``${KIPRJMOD}``), so there is
+                no global-only mode.
+            lib_id: Target as ``"Library:Symbol"`` — nickname registered in
+                sym-lib-table plus the plain symbol name inside that library.
+            pins: Non-empty list (max 256) of edit dicts.  Each entry has
+                ``pin_number`` (str, required selector), ``new_number``
+                (str, optional) and ``new_name`` (str, optional); at least one
+                of the two replacements is required.
+
+        Returns:
+            dict with keys: success, library_name, symbol_name, library_path,
+            pins_requested, pins_changed, occurrences, changes, changed,
+            backup_path, indexed, warnings; plus ``error`` on failure (no
+            ``success``).  ``library_name`` and ``symbol_name`` are the two
+            halves of *lib_id*.  Each ``changes`` entry reports ``pin_number``,
+            ``old_number``/``old_name``, ``new_number``/``new_name`` and
+            ``changed``.  ``pins_requested`` counts entries while
+            ``pins_changed`` counts changed pin occurrences (one selector
+            matching two pins yields 1 requested, 2 changed).
+        """
+        return await asyncio.to_thread(
+            _do_update_library_symbol_pin,
+            lib_id=lib_id,
+            pins=pins,
+            project_dir=project_dir,
+        )
+
+    @mcp.tool()
+    async def update_schematic_symbol_pin(
+        schematic_path: str,
+        lib_id: str,
+        pins: list[dict[str, Any]],
+        ctx: Context | None = None,
+    ) -> dict[str, Any]:
+        """Rename pin numbers and/or names in a schematic's cached symbol.
+
+        KiCad renders the schematic's embedded ``lib_symbols`` copy, not the
+        library file.  This tool applies a batch of pin edits to that cached
+        entry for *lib_id* and rewrites the matching ``(pin "…" (uuid …))``
+        keys of the affected placements, so skip still resolves the renamed
+        pins after the change.  Renumbering uses one simultaneous pre-edit
+        mapping, so chain/cycle renames never rewrite a key twice.  Wires,
+        junctions, labels, ``instances``, properties and every other cached
+        symbol are untouched.  All placed copies sharing *lib_id* pick up the
+        change; every affected reference designator is reported.
+
+        A pin number is KiCad's identity for a physical connection, so every
+        definition carrying it is edited together and the instance pin keys of
+        every placement of *lib_id* are rewritten.  Numbers keep their
+        uniqueness: a number already used inside the same part is rejected,
+        while duplicates that already existed (KiCad's duplicate-pin jumpers)
+        stay legal.  A new number that duplicates a pin KiCad resolves
+        separately (another part of a multi-part symbol) is allowed and
+        reported in ``warnings``.  Pin names are not required to be unique and
+        may be empty.
+
+        The batch is validated against its final state before writing, with
+        exactly one ``.kicad_sch.bak`` and one save.  The file is rewritten
+        through the project's normal schematic save path (formatting is not
+        preserved byte-for-byte).  To also fix future placements, call
+        ``update_library_symbol_pin``.
+
+        Args:
+            schematic_path: Absolute path to the target ``.kicad_sch`` file.
+            lib_id: The id exactly as stored as the key in the schematic's
+                ``lib_symbols`` cache (``"Library:Symbol"`` for library
+                symbols; a bare ``"R"`` when that is what the file stores).
+                Lookup is an exact, case-sensitive match on that stored key:
+                no format check, no nickname prefixing or stripping, and no
+                fallback between ``"R"`` and ``"Device:R"``.  An unknown id
+                returns the not-found error with up to five available ids.
+            pins: Non-empty list (max 256) of edit dicts.  Each entry has
+                ``pin_number`` (str, required selector), ``new_number``
+                (str, optional) and ``new_name`` (str, optional); at least one
+                of the two replacements is required.
+
+        Returns:
+            dict with keys: success, lib_id, symbol_name, pins_requested,
+            pins_changed, occurrences, changes, changed, backup_path,
+            affected_references, affected_count, placements_updated, warnings;
+            plus ``error`` on failure (no ``success``).  Each ``changes`` entry
+            reports ``pin_number``, ``old_number``/``old_name``,
+            ``new_number``/``new_name`` and ``changed``.  ``pins_requested``
+            counts entries while ``pins_changed`` counts changed pin
+            occurrences (one selector matching two pins yields 1 requested, 2
+            changed).
+        """
+        return await asyncio.to_thread(
+            _do_update_schematic_symbol_pin,
+            schematic_path=schematic_path,
+            lib_id=lib_id,
+            pins=pins,
+        )
+
+    @mcp.tool()
+    async def update_schematic_symbol_from_library(
+        schematic_path: str,
+        project_dir: str,
+        lib_id: str,
+        dry_run: bool = False,
+        ctx: Context | None = None,
+    ) -> dict[str, Any]:
+        """Replace a schematic's cached symbol definition with its library copy.
+
+                KiCad renders the ``lib_symbols`` copy embedded in the schematic, not
+                the ``.kicad_sym`` file, so editing a library never changes parts that
+                are already placed.  This tool fetches the current definition of
+                *lib_id* from the indexed library (expanding ``(extends …)`` variants
+                into a self-contained entry) and replaces the cached definition:
+                graphics, pins (number, name, electrical type, shape, position,
+                length), unit/style sub-symbols, symbol-level flags and the
+                definition's property nodes.  This is the fix for "Update Symbols from
+                Library" after a library change (e.g. renamed pins).  To edit only pin
+                numbers/names without touching anything else, use
+                ``update_schematic_symbol_pin`` instead.
+
+                **Definition-only scope.**  Placements are deliberately *not*
+                refreshed: their position, rotation, mirror, unit, uuid, ``instances``
+                and every property (Reference, Value, Footprint, Datasheet, custom
+                fields and their positions) stay exactly as they are.  The only
+                mechanical fix-up is that, when a pin number changed, each placement's
+                ``(pin "<number>" (uuid …))`` keys are rewritten so skip can still
+                resolve its pins — the same identity rule as
+        ``update_schematic_symbol_pin`` instead.  Renumbering is inferred positionally
+                and kept per unit/style; a placement only receives the maps for its own
+                unit plus unit 0 (common pins), so a renumber in one unit can never
+                touch another.  A placement is skipped (and reported) when its own-unit
+                and unit-0 scopes disagree, or when one scope maps a number that the
+                other scope retains.  Fully renumbered stacked pins (``1,1 -> 9,9`` at
+                one position) map together; partial or heterogeneous stacked changes
+                are rejected.  The mapping is rejected wholesale when it is not
+                one-to-one or a target collides with a pin number that is deliberately
+                retained; then keys are kept, ``renumber_ambiguous`` is true and a
+                warning explains why.  Removed/moved diagnostics are qualified or
+                suppressed when a rejected renumber would otherwise make them lie.  A
+                pin removed from the library keeps its placement key (removing it would
+                silently change netlist identity) and is warned about.  A pin that kept
+                its number but moved is warned about; attached wires are not moved.
+                Wires, junctions, labels, sheets and every other cached symbol are
+                untouched.  The response always carries the structural diff, so a
+                no-op is visible.
+
+                ``changed`` is true iff at least one reported diff component differs
+                (pin adds/removals/renames/renumbers/moves/field changes/unclassified
+                occurrence changes, property adds/removals/changes/reordering, or
+                graphics).  Formatting and the top-level name prefix are ignored; when
+                nothing differs nothing is written and ``backup_path`` is null.  With
+                ``dry_run`` the diff and ``changed`` are returned without writing
+                anything (no ``.bak``, no ``.tmp``).  Otherwise the parsed tree is
+                saved exactly once through the project's normal schematic save path,
+                which creates a ``.kicad_sch.bak``; formatting is not preserved
+                byte-for-byte.
+
+                Args:
+                    schematic_path: Absolute path to the target ``.kicad_sch`` file.
+                    project_dir: Project directory (or a file inside it) scoping the
+                        symbol index.  Only libraries visible in that scope are
+                        consulted: project libraries plus the global libraries.
+                    lib_id: The id exactly as stored as the key in the schematic's
+                        ``lib_symbols`` cache, as ``"Library:Symbol"``.  The key must
+                        contain a colon with both halves non-empty; a bare cached id
+                        such as ``"R"`` cannot be resolved to a library and returns an
+                        actionable error rather than guessing.  Unknown ids return the
+                        not-found error with up to five available ids.
+                    dry_run: Preview only.  The full diff and ``changed`` value are
+                        returned, but the file is left byte-identical.
+
+                Returns:
+                    dict with keys: success, lib_id, symbol_name, library_name,
+                    library_path, changed, dry_run, backup_path, pins_added,
+                    pins_removed, pins_renamed, pins_renumbered, pins_moved,
+                    pins_modified, pins_unclassified, properties_added, properties_removed,
+                    properties_changed, properties_reordered, graphics_changed,
+                    renumber_ambiguous, affected_references, affected_count,
+                    placements_updated, warnings; plus ``error`` on failure (no
+                    ``success``).  Each pin entry carries ``number`` and ``unit`` /
+                    ``style``; ``pins_renamed`` adds ``old_name``/``new_name``,
+                    ``pins_renumbered`` adds ``old_number``/``new_number``,
+                    ``pins_moved`` reports ``old_at``/``new_at`` and ``pins_modified``
+                    reports one ``field``/``old``/``new`` entry per changed pin field
+                    (electrical type, shape, length, hide, or ``node`` for any other
+                    pin-node difference).  ``pins_unclassified`` reports occurrence
+                    changes that the number-keyed diff cannot attribute (for example a
+                    stacked pin shadowed by an identical number) with ``old``/``new``
+                    summaries.  Property lists carry property names;
+                    ``properties_reordered`` reports a pure order change.
+                    ``renumber_ambiguous`` is true when a mapping was rejected or a
+                    placement had conflicting targets.  ``placements_updated`` counts
+                    placements whose pin keys were rewritten;
+                    ``affected_references`` lists every reference using *lib_id*.
+        """
+        return await asyncio.to_thread(
+            _do_update_schematic_symbol_from_library,
+            schematic_path=schematic_path,
+            project_dir=project_dir,
+            lib_id=lib_id,
+            dry_run=dry_run,
         )
 
     @mcp.tool()

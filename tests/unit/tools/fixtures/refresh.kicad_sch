@@ -1,0 +1,437 @@
+(kicad_sch
+  (version 20260306)
+  (generator "eeschema")
+  (generator_version "10.0")
+  (uuid "b1f7a3c2-5d4e-4a91-8c6f-2e7d0b9a4c11")
+  (paper "A4")
+  (lib_symbols
+    (symbol "My:MYOP"
+      (pin_numbers
+        (hide yes)
+      )
+      (pin_names
+        (offset 0.254)
+      )
+      (exclude_from_sim no)
+      (in_bom yes)
+      (on_board yes)
+      (in_pos_files yes)
+      (duplicate_pin_numbers_are_jumpers no)
+      (property "Reference"
+        "U"
+        (at 0 0 0)
+        (show_name no)
+        (do_not_autoplace no)
+        (effects
+          (font
+            (size 1.27 1.27)
+          )
+        )
+      )
+      (property "Value"
+        "MYOP"
+        (at 0 2.54 0)
+        (show_name no)
+        (do_not_autoplace no)
+        (effects
+          (font
+            (size 1.27 1.27)
+          )
+        )
+      )
+      (property "Footprint"
+        ""
+        (at 0 0 0)
+        (show_name no)
+        (do_not_autoplace no)
+        (hide yes)
+        (effects
+          (font
+            (size 1.27 1.27)
+          )
+        )
+      )
+      (property "Datasheet"
+        "~"
+        (at 0 0 0)
+        (show_name no)
+        (do_not_autoplace no)
+        (hide yes)
+        (effects
+          (font
+            (size 1.27 1.27)
+          )
+        )
+      )
+      (property "Description"
+        "Test operational amplifier"
+        (at 0 0 0)
+        (show_name no)
+        (do_not_autoplace no)
+        (hide yes)
+        (effects
+          (font
+            (size 1.27 1.27)
+          )
+        )
+      )
+      (symbol "MYOP_0_1"
+        (rectangle
+          (start -5.08 5.08)
+          (end 5.08 -5.08)
+          (stroke
+            (width 0.254)
+            (type default)
+          )
+          (fill
+            (type background)
+          )
+        )
+      )
+      (symbol "MYOP_1_1"
+        (pin input
+          line
+          (at -7.62 0 0)
+          (length 2.54)
+          (name "IN"
+            (effects
+              (font
+                (size 1.27 1.27)
+              )
+            )
+          )
+          (number "1"
+            (effects
+              (font
+                (size 1.27 1.27)
+              )
+            )
+          )
+        )
+        (pin output
+          line
+          (at 7.62 0 180)
+          (length 2.54)
+          (name "OUT"
+            (effects
+              (font
+                (size 1.27 1.27)
+              )
+            )
+          )
+          (number "2"
+            (effects
+              (font
+                (size 1.27 1.27)
+              )
+            )
+          )
+        )
+      )
+      (symbol "MYOP_2_1"
+        (pin power_in
+          line
+          (at 0 7.62 270)
+          (length 2.54)
+          (name "VCC"
+            (effects
+              (font
+                (size 1.27 1.27)
+              )
+            )
+          )
+          (number "3"
+            (effects
+              (font
+                (size 1.27 1.27)
+              )
+            )
+          )
+        )
+      )
+      (embedded_fonts no)
+    )
+    (symbol "Other:UNRELATED"
+      (pin_names
+        (offset 0.254)
+      )
+      (exclude_from_sim no)
+      (in_bom yes)
+      (on_board yes)
+      (property "Reference"
+        "J"
+        (at 0 0 0)
+        (effects
+          (font
+            (size 1.27 1.27)
+          )
+        )
+      )
+      (property "Value"
+        "UNRELATED"
+        (at 0 2.54 0)
+        (effects
+          (font
+            (size 1.27 1.27)
+          )
+        )
+      )
+      (symbol "UNRELATED_0_1"
+        (rectangle
+          (start -1.27 1.27)
+          (end 1.27 -1.27)
+          (stroke
+            (width 0.254)
+            (type default)
+          )
+          (fill
+            (type none)
+          )
+        )
+      )
+      (symbol "UNRELATED_1_1"
+        (pin passive
+          line
+          (at -3.81 0 0)
+          (length 2.54)
+          (name "P"
+            (effects
+              (font
+                (size 1.27 1.27)
+              )
+            )
+          )
+          (number "1"
+            (effects
+              (font
+                (size 1.27 1.27)
+              )
+            )
+          )
+        )
+      )
+      (embedded_fonts no)
+    )
+  )
+  (wire
+    (pts
+      (xy 90 100)
+      (xy 95 100)
+    )
+    (stroke
+      (width 0)
+      (type default)
+    )
+    (uuid "c9a1e7f4-2b6d-4c38-9f01-7d5a2e8b6c22")
+  )
+  (symbol
+    (lib_id "My:MYOP")
+    (at 100 100 0)
+    (unit 1)
+    (body_style 1)
+    (exclude_from_sim no)
+    (in_bom yes)
+    (on_board yes)
+    (in_pos_files yes)
+    (dnp no)
+    (fields_autoplaced yes)
+    (uuid "d2b8f1a6-7c3e-4d29-8a5f-1e9b0c4a7d33")
+    (property "Reference"
+      "U1"
+      (at 102.54 98.73 0)
+      (effects
+        (font
+          (size 1.27 1.27)
+        )
+      )
+    )
+    (property "Value"
+      "MYOP"
+      (at 102.54 101.27 0)
+      (effects
+        (font
+          (size 1.27 1.27)
+        )
+      )
+    )
+    (property "Footprint"
+      ""
+      (at 100 100 0)
+      (hide yes)
+      (effects
+        (font
+          (size 1.27 1.27)
+        )
+      )
+    )
+    (property "Datasheet"
+      "~"
+      (at 100 100 0)
+      (hide yes)
+      (effects
+        (font
+          (size 1.27 1.27)
+        )
+      )
+    )
+    (property "MPN"
+      "MYOP-8"
+      (at 102.54 103.81 0)
+      (hide yes)
+      (effects
+        (font
+          (size 1.27 1.27)
+        )
+      )
+    )
+    (pin "1"
+      (uuid "a0b1c2d3-e4f5-4607-8899-aabbccddee01")
+    )
+    (pin "2"
+      (uuid "e3c9a2b7-8d4f-4e3a-9b6c-2f0a1d5b8e44")
+    )
+    (instances
+      (project "refresh"
+        (path "/b1f7a3c2-5d4e-4a91-8c6f-2e7d0b9a4c11"
+          (reference "U1")
+          (unit 1)
+        )
+      )
+    )
+  )
+  (symbol
+    (lib_id "My:MYOP")
+    (at 120 100 90)
+    (unit 1)
+    (body_style 1)
+    (exclude_from_sim no)
+    (in_bom yes)
+    (on_board yes)
+    (in_pos_files yes)
+    (dnp no)
+    (fields_autoplaced yes)
+    (uuid "0a1e2d3c-4b5a-4697-8877-665544332211")
+    (property "Reference"
+      "U2"
+      (at 122.54 98.73 0)
+      (effects
+        (font
+          (size 1.27 1.27)
+        )
+      )
+    )
+    (property "Value"
+      "MYOP"
+      (at 122.54 101.27 0)
+      (effects
+        (font
+          (size 1.27 1.27)
+        )
+      )
+    )
+    (property "Footprint"
+      ""
+      (at 120 100 0)
+      (hide yes)
+      (effects
+        (font
+          (size 1.27 1.27)
+        )
+      )
+    )
+    (property "Datasheet"
+      "~"
+      (at 120 100 0)
+      (hide yes)
+      (effects
+        (font
+          (size 1.27 1.27)
+        )
+      )
+    )
+    (pin "1"
+      (uuid "1a2b3c4d-5e6f-4708-9a0b-1c2d3e4f5a66")
+    )
+    (pin "2"
+      (uuid "2b3c4d5e-6f70-4819-0a1b-2c3d4e5f6b77")
+    )
+    (instances
+      (project "refresh"
+        (path "/b1f7a3c2-5d4e-4a91-8c6f-2e7d0b9a4c11"
+          (reference "U2")
+          (unit 1)
+        )
+      )
+    )
+  )
+  (symbol
+    (lib_id "Other:UNRELATED")
+    (at 140 100 0)
+    (unit 1)
+    (body_style 1)
+    (exclude_from_sim no)
+    (in_bom yes)
+    (on_board yes)
+    (in_pos_files yes)
+    (dnp no)
+    (fields_autoplaced yes)
+    (uuid "8c2d3e4f-5061-4728-9930-4b5c6d7e8f02")
+    (property "Reference"
+      "J1"
+      (at 142.54 98.73 0)
+      (effects
+        (font
+          (size 1.27 1.27)
+        )
+      )
+    )
+    (property "Value"
+      "UNRELATED"
+      (at 142.54 101.27 0)
+      (effects
+        (font
+          (size 1.27 1.27)
+        )
+      )
+    )
+    (property "Footprint"
+      ""
+      (at 140 100 0)
+      (hide yes)
+      (effects
+        (font
+          (size 1.27 1.27)
+        )
+      )
+    )
+    (property "Datasheet"
+      "~"
+      (at 140 100 0)
+      (hide yes)
+      (effects
+        (font
+          (size 1.27 1.27)
+        )
+      )
+    )
+    (pin "1"
+      (uuid "7b1c2d3e-4f50-4617-8829-3a4b5c6d7e01")
+    )
+    (instances
+      (project "refresh"
+        (path "/b1f7a3c2-5d4e-4a91-8c6f-2e7d0b9a4c11"
+          (reference "J1")
+          (unit 1)
+        )
+      )
+    )
+  )
+  (junction (at 95 100) (diameter 0) (color 0 0 0 0) (uuid "aa000000-0000-4000-8000-000000000001"))
+  (label "NET_IN" (at 95 100 0) (effects (font (size 1.27 1.27)) (justify left bottom)) (uuid "aa000000-0000-4000-8000-000000000002"))
+  (sheet_instances
+    (path "/"
+      (page "1")
+    )
+  )
+  (embedded_fonts no)
+)

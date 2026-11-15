@@ -19,6 +19,7 @@ import math
 from pathlib import Path
 
 import pytest
+import sexpdata
 
 from kcaa.router.path_postprocess import OutputSegment, OutputVia
 from kcaa.router.router import (
@@ -38,10 +39,14 @@ from kcaa.router.router import (
     _find_pad_center,
     _find_pad_rotation,
     _find_pad_size,
+    _get_pad_name,
     _layers_used,
+    _pad_layers,
+    _pcb_layer_names,
     _project_file_for,
     _replace_pad_path,
     _routing_layers,
+    _same_net_pad_polygons,
     auto_route_pair,
     connect_with_via,
 )
@@ -1142,7 +1147,8 @@ def test_unknown_layer_in_pcb_raises_route_failure(tmp_path: Path) -> None:
         pad_b="1",
         net="VCC",
         width=0.3,
-        via_pairs=(("F.Cu", "In2.Cu"),),  # 4-layer fixture has no In2.Cu
+        # The fixture declares F.Cu, In1.Cu, In2.Cu and B.Cu; In3.Cu is absent.
+        via_pairs=(("F.Cu", "In3.Cu"),),
     )
     with pytest.raises(RouteFailure) as excinfo:
         auto_route_pair(req)
@@ -1227,6 +1233,18 @@ def test_layers_used_empty():
     assert _layers_used([]) == []
 
 
+def test_pcb_layer_names_bare_atoms_are_plain_str():
+    # Hand-built tree: layer atoms are bare Symbols.  Real KiCad files
+    # quote them, which is why the guard went unnoticed.
+    layers_node = [
+        sexpdata.Symbol("layers"),
+        [sexpdata.Symbol("layer"), sexpdata.Symbol("F.Cu")],
+    ]
+    names = _pcb_layer_names([layers_node])
+    assert names == ["F.Cu"]
+    assert type(names[0]) is str
+
+
 # ---------------------------------------------------------------------------
 # _check_vias_in_board
 # ---------------------------------------------------------------------------
@@ -1308,6 +1326,82 @@ def test_find_footprint_returns_footprint_for_existing_ref():
     ]
     fake_pcb = [target, ["footprint", ["property", "Reference", "OTHER"]]]
     assert _find_footprint(fake_pcb, "R1") is target
+
+
+def test_find_footprint_matches_bare_reference_atom():
+    target = [
+        sexpdata.Symbol("footprint"),
+        [
+            sexpdata.Symbol("property"),
+            sexpdata.Symbol("Reference"),
+            sexpdata.Symbol("R1"),
+        ],
+    ]
+    fake_pcb = [
+        [
+            sexpdata.Symbol("footprint"),
+            [
+                sexpdata.Symbol("property"),
+                sexpdata.Symbol("Reference"),
+                sexpdata.Symbol("R2"),
+            ],
+        ],
+        target,
+    ]
+    assert _find_footprint(fake_pcb, "R1") is target
+
+
+# ---------------------------------------------------------------------------
+# pad helper bare-atom reads
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "atom", [sexpdata.Symbol("1"), sexpdata.String("1")], ids=["symbol", "string"]
+)
+def test_get_pad_name_bare_atom_is_plain_str(atom):
+    name = _get_pad_name([sexpdata.Symbol("pad"), atom])
+    assert name == "1"
+    assert type(name) is str
+
+
+def test_pad_layers_expands_bare_wildcard_copper_atom():
+    pad = [
+        sexpdata.Symbol("pad"),
+        sexpdata.Symbol("1"),
+        sexpdata.Symbol("thru_hole"),
+        [sexpdata.Symbol("layers"), sexpdata.Symbol("*.Cu")],
+    ]
+    layers = _pad_layers(pad)
+    assert layers == ["F.Cu", "B.Cu", "In1.Cu", "In2.Cu", "In3.Cu", "In4.Cu"]
+    assert all(type(layer) is str for layer in layers)
+
+
+def test_same_net_pad_polygons_reads_bare_reference_atom():
+    fp = [
+        sexpdata.Symbol("footprint"),
+        [sexpdata.Symbol("at"), 10.0, 20.0],
+        [
+            sexpdata.Symbol("property"),
+            sexpdata.Symbol("Reference"),
+            sexpdata.Symbol("R1"),
+        ],
+        [
+            sexpdata.Symbol("pad"),
+            sexpdata.Symbol("1"),
+            sexpdata.Symbol("smd"),
+            sexpdata.Symbol("rect"),
+            [sexpdata.Symbol("at"), 0.0, 0.0],
+            [sexpdata.Symbol("size"), 1.0, 1.0],
+            [sexpdata.Symbol("layers"), sexpdata.Symbol("F.Cu")],
+            [sexpdata.Symbol("net"), sexpdata.Symbol("VCC")],
+        ],
+    ]
+    found = _same_net_pad_polygons([fp], "VCC")
+    assert len(found) == 1
+    _poly, _players, ref, _pad_name, _center = found[0]
+    assert ref == "R1"
+    assert type(ref) is str
 
 
 # ---------------------------------------------------------------------------
