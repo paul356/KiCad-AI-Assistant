@@ -563,7 +563,7 @@ class TestGetFootprintPadSize:
 
 
 class TestListNetsClassify:
-    def test_classify_requires_pro_file(self, tools, tmp_path):
+    def test_classify_requires_pro_file(self, tools, tmp_path, isolated_project_search):
         """When classify=True but no .kicad_pro exists, fields are None."""
         dest = tmp_path / "test.kicad_pcb"
         shutil.copy(BOARD_FIXTURE, dest)
@@ -571,8 +571,40 @@ class TestListNetsClassify:
         for n in result["nets"]:
             assert "netclass" in n
             assert "type" in n
-            # No .kicad_pro → netclass should be None
+            # Explicit fallback: no project → both fields stay None.
             assert n["netclass"] is None
+            assert n["type"] is None
+
+    def test_classify_resolves_netclass_for_nested_board(self, tools, tmp_path):
+        """A board under a differently named project resolves the root project."""
+        import json
+
+        pro = tmp_path / "aria.kicad_pro"
+        pro.write_text(
+            json.dumps(
+                {
+                    "net_settings": {
+                        "classes": [
+                            {"name": "Default", "clearance": 0.2, "track_width": 0.25},
+                            {"name": "Power", "clearance": 0.3, "track_width": 0.5},
+                        ],
+                        "netclass_patterns": [{"netclass": "Power", "pattern": "VCC"}],
+                    }
+                }
+            )
+        )
+        hardware = tmp_path / "hardware"
+        hardware.mkdir()
+        board = hardware / "main_bus.kicad_pcb"
+        shutil.copy(BOARD_FIXTURE, board)
+
+        result = _run(tools["list_nets"](pcb_path=str(board), ctx=None, classify=True))
+        nets = {n["name"]: n for n in result["nets"]}
+        assert nets["VCC"]["netclass"] == "Power"
+        assert nets["VCC"]["type"] == "power"
+        assert nets["GND"]["type"] == "ground"
+        assert nets["NET_A"]["netclass"] is None
+        assert nets["NET_A"]["type"] == "signal"
 
     def test_classify_resolves_netclass(self, tools, tmp_path):
         """With a matching .kicad_pro, nets get netclass + type."""
