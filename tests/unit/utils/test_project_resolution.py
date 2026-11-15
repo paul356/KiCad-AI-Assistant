@@ -106,3 +106,9 @@ class TestSeveralProjectsInOneDirectory:
         queried = _touch(isolated_root / "zeta.notes")
 
         assert project_resolution.find_project_file(str(queried)) == str(zeta)
+
+    def test_project_suffix_is_case_insensitive(self, isolated_root):
+        pro = _touch(isolated_root / "ARIA.KICAD_PRO")
+        sheet = _touch(isolated_root / "hardware" / "main_bus.kicad_sch")
+
+        assert project_resolution.find_project_file(str(sheet)) == str(pro)

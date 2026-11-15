@@ -258,12 +258,11 @@ class TestProjectPathFromTitle:
         sheet.write_text("(kicad_sch)")
         assert project_path_from_title(f"Schematic Editor: {sheet}") == os.path.abspath(str(pro))
 
-    def test_missing_project_returns_none(self, tmp_path, monkeypatch):
+    def test_missing_project_returns_none(self, tmp_path, isolated_project_search):
         pcb = tmp_path / "board.kicad_pcb"
         pcb.write_text("(kicad_pcb)")
-        # There is no owning project; the environment's unrelated temp
-        # projects must not leak into the result.
-        monkeypatch.setattr("kicad_plugin.context_bridge.find_project_for_path", lambda path: None)
+        # No project exists in the isolated tree; the title must not fabricate
+        # a same-stem sibling.
         assert project_path_from_title(f"PCB Editor: {pcb}") is None
 
     def test_unrelated_title_returns_none(self):

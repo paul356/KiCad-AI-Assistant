@@ -20,6 +20,42 @@ _TITLE_FRAME_RE = re.compile(r"([^\s\[]+\.kicad_(?:pcb|sch))\b")
 _PROJECT_SUFFIX = ".kicad_pro"
 
 
+def _is_project_name(name: str) -> bool:
+    """Return True when *name* has the project suffix, case-insensitively."""
+    return name.lower().endswith(_PROJECT_SUFFIX)
+
+
+def _project_candidates(directory: str) -> list[str]:
+    """Return the existing ``.kicad_pro`` files directly inside *directory*."""
+    try:
+        names = os.listdir(directory)
+    except OSError:
+        return []
+    return sorted(
+        os.path.join(directory, name)
+        for name in names
+        if _is_project_name(name) and os.path.isfile(os.path.join(directory, name))
+    )
+
+
+def _pick_candidate(candidates: list[str], queried_stem: str) -> str:
+    """Pick one project deterministically from several in one directory."""
+
+    def sort_key(project_path: str) -> tuple[int, int, str]:
+        stem = os.path.splitext(os.path.basename(project_path))[0]
+        directory = os.path.dirname(project_path)
+        has_matching_frame = os.path.isfile(
+            os.path.join(directory, f"{stem}.kicad_sch")
+        ) or os.path.isfile(os.path.join(directory, f"{stem}.kicad_pcb"))
+        return (
+            0 if has_matching_frame else 1,
+            0 if stem == queried_stem else 1,
+            os.path.basename(project_path),
+        )
+
+    return min(candidates, key=sort_key)
+
+
 def find_project_for_path(path: str) -> str | None:
     """Return the ``.kicad_pro`` that owns *path* by searching upward.
 
@@ -34,38 +70,18 @@ def find_project_for_path(path: str) -> str | None:
     """
     target = os.path.abspath(path)
 
-    if target.endswith(_PROJECT_SUFFIX):
+    if _is_project_name(target):
         return target if os.path.isfile(target) else None
 
     directory = target if os.path.isdir(target) else os.path.dirname(target)
     queried_stem = os.path.splitext(os.path.basename(target))[0]
 
     while True:
-        try:
-            names = os.listdir(directory)
-        except OSError:
-            names = []
-        candidates = sorted(
-            os.path.join(directory, name)
-            for name in names
-            if name.endswith(_PROJECT_SUFFIX) and os.path.isfile(os.path.join(directory, name))
-        )
+        candidates = _project_candidates(directory)
         if len(candidates) == 1:
             return candidates[0]
         if candidates:
-
-            def sort_key(project_path: str, search_dir: str = directory) -> tuple[int, int, str]:
-                stem = os.path.splitext(os.path.basename(project_path))[0]
-                has_matching_frame = os.path.isfile(
-                    os.path.join(search_dir, f"{stem}.kicad_sch")
-                ) or os.path.isfile(os.path.join(search_dir, f"{stem}.kicad_pcb"))
-                return (
-                    0 if has_matching_frame else 1,
-                    0 if stem == queried_stem else 1,
-                    os.path.basename(project_path),
-                )
-
-            return min(candidates, key=sort_key)
+            return _pick_candidate(candidates, queried_stem)
 
         parent = os.path.dirname(directory)
         if parent == directory:

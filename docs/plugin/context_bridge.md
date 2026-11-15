@@ -37,10 +37,10 @@ The plugin starts from the open board (`pcbnew.GetBoard().GetFileName()`) and re
 
 The old sibling-stem derivation (`<board stem>.kicad_pro` next to the board) is gone. Board and project stems may differ, and the board or a sheet may live in a subdirectory; only the directory walk finds the real project. When several `.kicad_pro` files share a directory, the resolver prefers the one whose stem has a matching `.kicad_sch`/`.kicad_pcb`, then the queried file's stem, then the lexicographically smallest filename.
 
-For the schematic editor, the plugin registers as an `EeschemaPlugin` and uses the scripting console to query the active frame; editor titles naming a `.kicad_sch`/`.kicad_pcb` are resolved with the same upward search.
+For the schematic editor, the plugin registers as an `EeschemaPlugin` and uses the scripting console to query the active frame; editor titles naming a `.kicad_sch`/`.kicad_pcb` are resolved with the same upward search. Resolution runs on every `collect_context()` / title call; nothing is cached.
 
 ### 3.2 Active schematic path
-The project's root schematic is `<project_dir>/<project_stem>.kicad_sch`. It is reported only when that file exists. Nested sheets are a normal project layout: `active_schematic` is always the project's root sheet, not the sheet currently being edited. Hierarchical sheets are discovered by the MCP server via `skip` after the root path is supplied.
+When the board supplies context, `active_schematic` is `<project_dir>/<project_stem>.kicad_sch`, reported only when that file exists. That is the conventional project root sheet, not necessarily the sheet being edited: a nested sheet is a normal layout, and a project whose root schematic has a different name yields `null`. For the schematic editor the field may also be absent. Hierarchical sheets are discovered by the MCP server via `skip` from the root path supplied as `schematic_path`.
 
 ### 3.3 Selected components
 The KiCad scripting API allows querying the current selection. On each request, the plugin calls:
@@ -86,7 +86,7 @@ The tools take explicit path arguments (`schematic_path`, `project_path`). A too
 KiCad schematics can have hierarchical sheets. The tool surface works as follows:
 
 - All editing tools operate on a single `.kicad_sch` file at a time
-- The `active_schematic` context always points to the **root** schematic
+- The `active_schematic` context points to the project's conventional root schematic when it exists; it is not necessarily the sheet currently being edited
 - The `extract_schematic_netlist` tool recursively follows sheet references and returns connectivity for the full hierarchy
 - `find_component_connections(project_path, component_ref)` searches across all sheets in the project
 - If the engineer is working on a specific subsheet, they should tell the LLM the subsheet name or path; the LLM can look up the file path from the netlist result

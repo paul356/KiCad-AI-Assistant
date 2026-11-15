@@ -5,6 +5,7 @@ import os
 import pytest
 
 from kcaa.utils import project_resolution
+from kicad_plugin import context_bridge
 
 
 @pytest.fixture()
@@ -17,13 +18,15 @@ def isolated_project_search(tmp_path, monkeypatch):
     fixture so ancestors outside the test's own tree are project-free.
     """
     root = os.path.abspath(str(tmp_path))
-    real_candidates = project_resolution._project_candidates
 
-    def scoped_candidates(directory):
-        resolved = os.path.abspath(directory)
-        if resolved == root or resolved.startswith(root + os.sep):
-            return real_candidates(directory)
-        return []
+    for module in (project_resolution, context_bridge):
+        real_candidates = module._project_candidates
 
-    monkeypatch.setattr(project_resolution, "_project_candidates", scoped_candidates)
+        def scoped_candidates(directory, _real=real_candidates):
+            resolved = os.path.abspath(directory)
+            if resolved == root or resolved.startswith(root + os.sep):
+                return _real(directory)
+            return []
+
+        monkeypatch.setattr(module, "_project_candidates", scoped_candidates)
     return tmp_path

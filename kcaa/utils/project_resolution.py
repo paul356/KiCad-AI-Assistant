@@ -20,6 +20,11 @@ import os
 PROJECT_SUFFIX = ".kicad_pro"
 
 
+def _is_project_name(name: str) -> bool:
+    """Return True when *name* has the project suffix, case-insensitively."""
+    return name.lower().endswith(PROJECT_SUFFIX)
+
+
 def _project_candidates(directory: str) -> list[str]:
     """Return the existing ``.kicad_pro`` files directly inside *directory*."""
     try:
@@ -29,7 +34,7 @@ def _project_candidates(directory: str) -> list[str]:
     return sorted(
         os.path.join(directory, name)
         for name in names
-        if name.endswith(PROJECT_SUFFIX) and os.path.isfile(os.path.join(directory, name))
+        if _is_project_name(name) and os.path.isfile(os.path.join(directory, name))
     )
 
 
@@ -81,7 +86,7 @@ def find_project_file(path: str) -> str | None:
     """
     target = os.path.abspath(path)
 
-    if target.endswith(PROJECT_SUFFIX):
+    if _is_project_name(target):
         return target if os.path.isfile(target) else None
 
     directory = target if os.path.isdir(target) else os.path.dirname(target)
