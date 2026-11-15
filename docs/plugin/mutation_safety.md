@@ -196,7 +196,7 @@ plugin data directory.
 
 ### 9.1 How the plugin publishes the open project
 
-The panel resolves the open project's `.kicad_pro` (`board.GetProject().GetProjectFilePath()` when available, otherwise an upward search from the board path). It never derives a project path from a sibling file stem, so projects whose board/sheet stem differs from the project stem publish the correct root.
+The panel resolves the open project's `.kicad_pro` by walking upward from the board path: at most one project per directory level, nearest level wins. KiCad 10's scripting API exposes no usable project-path accessor, so `board.GetProject()` is not used. The panel never derives a project path from a sibling file stem, so projects whose board/sheet stem differs from the project stem publish the correct root.
 
 `ServerManager` starts the server with `KCAA_PROJECT_STATE_FILE` pointing at
 `<kcaa data dir>/active_project.json`. The panel atomically writes that file

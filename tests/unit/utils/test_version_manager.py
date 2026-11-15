@@ -112,3 +112,30 @@ class TestSaveAndRestoreWithIncludeFiles:
 
         assert sheet.read_text() == "nested v1\n"
         assert "hardware/main_bus.kicad_sch" in result["files"]
+
+    def test_pre_restore_backup_covers_nested_sheet(self, tmp_path):
+        pro, _, sheet = _project(tmp_path)
+        archive = version_manager.save_project_version(str(pro), include_files=[str(sheet)])
+        version_id = version_manager.project_version_id(archive, str(pro))
+        sheet.write_text("nested v2\n")
+
+        result = version_manager.restore_project_version(str(pro), version_id)
+
+        with tarfile.open(result["backup_of_current"], "r:gz") as tar:
+            assert "hardware/main_bus.kicad_sch" in tar.getnames()
+        assert sheet.read_text() == "nested v1\n"
+
+        version_manager.restore_project_version(str(pro), result["backup_version_id"])
+        assert sheet.read_text() == "nested v2\n"
+
+    def test_backup_skips_archived_member_missing_from_disk(self, tmp_path):
+        pro, _, sheet = _project(tmp_path)
+        archive = version_manager.save_project_version(str(pro), include_files=[str(sheet)])
+        version_id = version_manager.project_version_id(archive, str(pro))
+        sheet.unlink()
+
+        result = version_manager.restore_project_version(str(pro), version_id)
+
+        with tarfile.open(result["backup_of_current"], "r:gz") as tar:
+            assert "hardware/main_bus.kicad_sch" not in tar.getnames()
+        assert sheet.read_text() == "nested v1\n"

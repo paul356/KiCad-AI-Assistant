@@ -22,7 +22,7 @@ Every LLM request includes the following context in the system prompt:
 
 | Field | Type | Source | Notes |
 |-------|------|--------|-------|
-| `active_project` | `string \| null` | `board.GetProject().GetProjectFilePath()`, else upward search from the board path | Absolute path to the owning `.kicad_pro` |
+| `active_project` | `string \| null` | Upward search from the board path | Absolute path to the owning `.kicad_pro` |
 | `active_schematic` | `string \| null` | Root schematic of the resolved project | Absolute path to the project's root `.kicad_sch`, if it exists |
 | `active_editor` | `"schematic" \| "pcb" \| "unknown"` | Plugin detects which KiCad editor is focused | Determines which tools the LLM should use |
 | `selected_refs` | `string[]` | Scripting API selection query | Component references currently selected in the editor; may be empty |
@@ -33,10 +33,7 @@ Every LLM request includes the following context in the system prompt:
 ## 3. How Context Is Collected
 
 ### 3.1 Project path
-The plugin starts from the open board (`pcbnew.GetBoard().GetFileName()`) and resolves the project that owns it:
-
-1. `board.GetProject().GetProjectFilePath()` when the scripting API exposes it — this is authoritative.
-2. otherwise an upward search from the board file's directory to the filesystem root for `*.kicad_pro`.
+The plugin starts from the open board (`pcbnew.GetBoard().GetFileName()`) and resolves the project that owns it by walking upward from the board file's directory to the filesystem root for `*.kicad_pro`: at most one project per directory level is chosen, and the nearest level with a project wins. KiCad 10's scripting API exposes no usable project-path accessor — `board.GetProject()` returns an opaque pointer — so the directory walk is the single resolution rule.
 
 The old sibling-stem derivation (`<board stem>.kicad_pro` next to the board) is gone. Board and project stems may differ, and the board or a sheet may live in a subdirectory; only the directory walk finds the real project. When several `.kicad_pro` files share a directory, the resolver prefers the one whose stem has a matching `.kicad_sch`/`.kicad_pcb`, then the queried file's stem, then the lexicographically smallest filename.
 

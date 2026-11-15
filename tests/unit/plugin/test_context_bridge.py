@@ -82,27 +82,21 @@ class TestCollectContextWithPcbnew:
         assert ctx["active_project"] == str(pro)
         assert ctx["active_schematic"] == str(root_sch)
 
-    def test_board_project_api_takes_precedence(self, tmp_path):
-        """The pcbnew project API wins over the upward search when available."""
-        # The upward search would find this project...
-        (tmp_path / "aria.kicad_pro").write_text("(kicad)\n")
-        (tmp_path / "aria.kicad_sch").write_text("(kicad)\n")
-        # ...but the API names a different one, which must win.
-        api_dir = tmp_path / "api"
-        api_dir.mkdir()
-        api_pro = api_dir / "api_project.kicad_pro"
-        api_sch = api_dir / "api_project.kicad_sch"
-        api_pro.write_text("(kicad)\n")
-        api_sch.write_text("(kicad)\n")
+    def test_opaque_project_pointer_still_resolves_by_upward_search(self, tmp_path):
+        """KiCad 10 exposes only an opaque PROJECT pointer, not a path.
+
+        Real pcbnew returns a SwigPyObject from ``board.GetProject()`` with
+        no path accessor, so the board's project must be found by walking
+        upward from the board file.
+        """
+        pro = tmp_path / "aria.kicad_pro"
+        root_sch = tmp_path / "aria.kicad_sch"
+        pro.write_text("(kicad)\n")
+        root_sch.write_text("(kicad)\n")
         hardware = tmp_path / "hardware"
         hardware.mkdir()
         pcb = hardware / "main_bus.kicad_pcb"
         pcb.write_text("(kicad)\n")
-
-        class _Project:
-            @staticmethod
-            def GetProjectFilePath():
-                return str(api_pro)
 
         class _Board:
             @staticmethod
@@ -111,7 +105,7 @@ class TestCollectContextWithPcbnew:
 
             @staticmethod
             def GetProject():
-                return _Project()
+                return object()  # opaque pointer, no path accessor
 
         mock_pcbnew = MagicMock()
         mock_pcbnew.GetBoard.return_value = _Board()
@@ -119,8 +113,8 @@ class TestCollectContextWithPcbnew:
         with patch("kicad_plugin.context_bridge._try_import_pcbnew", return_value=mock_pcbnew):
             ctx = collect_context()
 
-        assert ctx["active_project"] == str(api_pro)
-        assert ctx["active_schematic"] == str(api_sch)
+        assert ctx["active_project"] == str(pro)
+        assert ctx["active_schematic"] == str(root_sch)
 
     def test_active_pcb_not_set_when_filename_empty(self):
         mock_pcbnew = self._make_mock_pcbnew(pcb_path="")

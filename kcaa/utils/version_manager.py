@@ -228,13 +228,31 @@ def list_project_versions(project_file: str) -> list[dict[str, Any]]:
     return result
 
 
+def _restorable_member_names(archive_path: str) -> list[str]:
+    """Return the safe file members of *archive_path*.
+
+    Rejects the manifest, non-files, absolute paths and ``..`` traversal,
+    matching the filtering applied during extraction.
+    """
+    names: list[str] = []
+    with tarfile.open(archive_path, "r:gz") as tar:
+        for member in tar.getmembers():
+            if member.name == ".manifest.json" or not member.isfile():
+                continue
+            if os.path.isabs(member.name) or ".." in os.path.normpath(member.name).split(os.sep):
+                continue
+            names.append(member.name)
+    return names
+
+
 def restore_project_version(project_file: str, version_id: str) -> dict[str, Any]:
     """Restore the project files to a previously saved project version.
 
-    The archive's file set (schematic, PCB, project file) is extracted over
-    the current files, so a restore returns the whole project to one
-    consistent state.  Before overwriting, the current file set is itself
-    archived (so the restore is undoable via the returned backup id).
+    The archive's file set (schematic, PCB, project file and any included
+    nested files) is extracted over the current files, so a restore returns
+    the whole project to one consistent state.  Before overwriting, every
+    file in that archive that still exists on disk is itself archived (so
+    the restore is undoable via the returned backup id).
 
     :param project_file: Absolute path to the project file (.kicad_pro).
     :param version_id: The ``id`` value returned by :func:`list_project_versions`.
@@ -256,18 +274,24 @@ def restore_project_version(project_file: str, version_id: str) -> dict[str, Any
             f"Use list_project_versions() to see available versions."
         )
 
-    # Snapshot the current state first so the restore is undoable
-    backup_path = save_project_version(project_file)
-    backup_version_id = project_version_id(backup_path, project_file)
-
     restored: list[str] = []
     project_dir = os.path.dirname(project_file)
+    member_names = _restorable_member_names(archive_path)
+
+    # Snapshot the current state first so the restore is undoable.  Include
+    # every archived file that still exists, so the backup covers nested
+    # sheets the restore is about to overwrite.
+    backup_files = [
+        os.path.join(project_dir, name)
+        for name in member_names
+        if os.path.isfile(os.path.join(project_dir, name))
+    ]
+    backup_path = save_project_version(project_file, include_files=backup_files)
+    backup_version_id = project_version_id(backup_path, project_file)
+
     with tarfile.open(archive_path, "r:gz") as tar:
-        for member in tar.getmembers():
-            if member.name == ".manifest.json" or not member.isfile():
-                continue
-            if os.path.isabs(member.name) or ".." in os.path.normpath(member.name).split(os.sep):
-                continue
+        for name in member_names:
+            member = tar.getmember(name)
             fh = tar.extractfile(member)
             if fh is None:
                 continue

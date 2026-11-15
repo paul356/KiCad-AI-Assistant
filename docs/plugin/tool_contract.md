@@ -607,6 +607,14 @@ Routing is orthogonal (horizontal-vertical). If an endpoint lies on the interior
 
 **Success response:** `{"success": true, "version_id": "...", "archive_path": "...", "created": true, "files": [...]}`
 
+#### `restore_project_version(project_file, version_id)`
+
+**Purpose:** Restores every file in a saved version archive over the project tree, returning the whole project to one consistent state.
+
+**Pre-restore backup:** before extracting, the tool archives the current on-disk state of every safe file member of the selected archive (manifest, non-files, absolute paths and `..` members are ignored). This is the archive's file set — including nested sheets such as `hardware/main_bus.kicad_sch` — not just the default project trio; members that no longer exist on disk are skipped. The backup's path and version id are returned as `backup_of_current` and `backup_version_id`, so restoring that backup rolls the edited nested file back too.
+
+**Success response:** `{"success": true, "restored_from": "...", "backup_of_current": "...", "backup_version_id": "...", "files": [...]}`
+
 ---
 
 ## 4. Deferred Capabilities

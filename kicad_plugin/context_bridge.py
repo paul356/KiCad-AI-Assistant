@@ -130,7 +130,7 @@ def collect_context() -> dict[str, Any]:
             pcb_path = board.GetFileName()
             if pcb_path:
                 ctx["active_pcb"] = os.path.abspath(pcb_path)
-                pro_path = _board_project_file(board, pcb_path)
+                pro_path = find_project_for_path(pcb_path)
                 if pro_path is not None:
                     ctx["active_project"] = pro_path
                     # The root schematic is always <project stem>.kicad_sch
@@ -146,24 +146,6 @@ def collect_context() -> dict[str, Any]:
         log.debug("Could not collect PCB context: %s", e)
 
     return ctx
-
-
-def _board_project_file(board: Any, pcb_path: str) -> str | None:
-    """Return the project file for *board*, preferring KiCad's own API.
-
-    ``board.GetProject().GetProjectFilePath()`` is authoritative when the
-    scripting API exposes it (newer KiCad); otherwise fall back to the
-    upward search from the board file.
-    """
-    if hasattr(board, "GetProject"):
-        try:
-            candidate = board.GetProject().GetProjectFilePath()
-        except Exception as e:  # noqa: BLE001 -- API shape varies across KiCad versions
-            log.debug("GetProject() unavailable: %s", e)
-        else:
-            if isinstance(candidate, str) and candidate and os.path.isfile(candidate):
-                return os.path.abspath(candidate)
-    return find_project_for_path(pcb_path)
 
 
 def context_to_system_prompt_block(ctx: dict[str, Any]) -> str:
