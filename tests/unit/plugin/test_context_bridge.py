@@ -265,6 +265,22 @@ class TestProjectPathFromTitle:
         # a same-stem sibling.
         assert project_path_from_title(f"PCB Editor: {pcb}") is None
 
+    def test_project_title_is_case_insensitive(self, tmp_path):
+        upper = tmp_path / "ARIA.KICAD_PRO"
+        upper.write_text("(kicad_project)")
+        mixed = tmp_path / "Aria.Kicad_Pro"
+        mixed.write_text("(kicad_project)")
+        assert project_path_from_title(f"KiCad - {upper}") == os.path.abspath(str(upper))
+        assert project_path_from_title(f"KiCad - {mixed}") == os.path.abspath(str(mixed))
+
+    def test_frame_title_is_case_insensitive(self, tmp_path):
+        pro = tmp_path / "aria.kicad_pro"
+        pro.write_text("(kicad_project)")
+        sheet = tmp_path / "hardware" / "MAIN_BUS.KICAD_SCH"
+        sheet.parent.mkdir()
+        sheet.write_text("(kicad_sch)")
+        assert project_path_from_title(f"Schematic Editor: {sheet}") == os.path.abspath(str(pro))
+
     def test_unrelated_title_returns_none(self):
         assert project_path_from_title("Settings Dialog") is None
         assert project_path_from_title("") is None

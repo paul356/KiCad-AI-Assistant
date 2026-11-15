@@ -14,8 +14,8 @@ log = logging.getLogger(__name__)
 
 # KiCad window titles name project/board/schematic files, e.g.
 # "PCB Editor: /path/to/board.kicad_pcb [*]" or a .kicad_pro path.
-_TITLE_PROJECT_RE = re.compile(r"([^\s\[]+\.kicad_pro)\b")
-_TITLE_FRAME_RE = re.compile(r"([^\s\[]+\.kicad_(?:pcb|sch))\b")
+_TITLE_PROJECT_RE = re.compile(r"([^\s\[]+\.kicad_pro)\b", re.IGNORECASE)
+_TITLE_FRAME_RE = re.compile(r"([^\s\[]+\.kicad_(?:pcb|sch))\b", re.IGNORECASE)
 
 _PROJECT_SUFFIX = ".kicad_pro"
 
