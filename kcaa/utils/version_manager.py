@@ -199,12 +199,17 @@ def save_project_version(
             os.path.abspath(f"{prefix}.{version_id}.tar.gz")
             for version_id in (exclude_versions or ())
         }
-        all_archives = _list_project_archive_paths(project_file)
-        for old in all_archives[:-limit]:
-            if os.path.abspath(old) in excluded:
-                continue
+        remaining = _list_project_archive_paths(project_file)
+        while len(remaining) > limit:
+            victim = next(
+                (path for path in remaining if os.path.abspath(path) not in excluded),
+                None,
+            )
+            if victim is None:
+                break
             with contextlib.suppress(OSError):
-                os.remove(old)
+                os.remove(victim)
+            remaining.remove(victim)
 
     return archive_path
 
@@ -247,6 +252,8 @@ def _safe_restore_target(project_dir: str, member_name: str) -> str | None:
     prevents an archive from escaping the project tree during restore.
     """
     if os.path.isabs(member_name):
+        return None
+    if ".." in member_name.replace("\\", "/").split("/"):
         return None
     normalized = os.path.normpath(member_name)
     parts = normalized.split(os.sep)

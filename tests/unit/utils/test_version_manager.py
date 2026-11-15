@@ -189,6 +189,23 @@ class TestRestoreSafety:
         assert "aria.kicad_sch" in names
         assert "link/evil.kicad_sch" not in names
 
+    def test_restore_refuses_dotdot_member_that_normalizes_inside(self, tmp_path):
+        pro, root_sch, _ = _project(tmp_path)
+        version_id = "20260103_000000_000000"
+        _write_archive(
+            str(pro),
+            version_id,
+            {
+                "aria.kicad_sch": b"safe\n",
+                "hardware/../aria.kicad_sch": b"traversal\n",
+            },
+        )
+
+        result = version_manager.restore_project_version(str(pro), version_id)
+
+        assert result["backup_skipped"] == 1
+        assert root_sch.read_text() == "safe\n"
+
     def test_restore_handles_legacy_archive_without_manifest(self, tmp_path):
         pro, root_sch, _ = _project(tmp_path)
         version_id = "20260102_000000_000000"
@@ -222,3 +239,4 @@ class TestRestoreSafety:
         version_manager.restore_project_version(str(pro), source_id)
 
         assert os.path.isfile(source_archive)
+        assert len(version_manager.list_project_versions(str(pro))) == 10
