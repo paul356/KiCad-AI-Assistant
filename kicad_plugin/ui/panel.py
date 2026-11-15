@@ -56,6 +56,13 @@ def _take_autoroute_snapshot(board_path: str, base_url: str, call_tool) -> tuple
     abort before launching the router.  Other snapshot failures keep the
     previous behaviour: log and route without a snapshot.
     """
+    if not board_path or not os.path.isfile(board_path):
+        return "", (
+            f"Auto Route needs the board saved to disk first: "
+            f"{board_path or '(unsaved board)'}. Save the .kicad_pcb file, "
+            "then retry."
+        )
+
     from ..llm_client import _project_path_for
 
     project_path = _project_path_for(board_path)
@@ -2916,6 +2923,20 @@ if _WX_AVAILABLE:
 
             # ---- 2. Read design rules for constraint pass-through ----
             board_path = board.GetFileName()
+            if not board_path or not os.path.isfile(board_path):
+                self._append_entry(
+                    {
+                        "type": "status",
+                        "text": (
+                            "⚠ Auto Route needs the board saved to disk first: "
+                            f"{board_path or '(unsaved board)'}. Save the .kicad_pcb "
+                            "file, then retry."
+                        ),
+                        "color_hex": self._C_WARN_HEX,
+                    }
+                )
+                self._render_conversation()
+                return
             constraint_hint = ""
             if board_path and os.path.isfile(board_path):
                 try:
@@ -2994,25 +3015,22 @@ if _WX_AVAILABLE:
             ses_path = os.path.join(tmp_dir, "board.ses")
 
             # ---- Take a version snapshot via MCP tool before routing ----
-            board_path = board.GetFileName()
-            backup_path = ""
-            if board_path and os.path.isfile(board_path):
-                from ..llm_client import call_mcp_tool
+            from ..llm_client import call_mcp_tool
 
-                backup_path, snapshot_error = _take_autoroute_snapshot(
-                    board_path, self._server_mgr.base_url, call_mcp_tool
+            backup_path, snapshot_error = _take_autoroute_snapshot(
+                board_path, self._server_mgr.base_url, call_mcp_tool
+            )
+            if snapshot_error:
+                shutil.rmtree(tmp_dir, ignore_errors=True)
+                self._append_entry(
+                    {
+                        "type": "status",
+                        "text": f"⚠ {snapshot_error}",
+                        "color_hex": self._C_WARN_HEX,
+                    }
                 )
-                if snapshot_error:
-                    shutil.rmtree(tmp_dir, ignore_errors=True)
-                    self._append_entry(
-                        {
-                            "type": "status",
-                            "text": f"⚠ {snapshot_error}",
-                            "color_hex": self._C_WARN_HEX,
-                        }
-                    )
-                    self._render_conversation()
-                    return
+                self._render_conversation()
+                return
 
             try:
                 _pcbnew.ExportSpecctraDSN(board, dsn_path)

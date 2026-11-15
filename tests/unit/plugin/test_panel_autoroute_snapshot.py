@@ -49,3 +49,19 @@ def test_no_project_aborts_before_snapshot_or_routing(tmp_path, isolated_project
     assert "Save" in error
     assert calls == []  # no snapshot call, so the router is never launched
     assert not (tmp_path / ".versions").exists()
+
+
+def test_unsaved_board_aborts_before_snapshot_or_routing(tmp_path):
+    calls = []
+
+    def call_tool(base_url, name, args):
+        calls.append((base_url, name, args))
+        return {"success": True}
+
+    for board_path in ("", str(tmp_path / "not_saved.kicad_pcb")):
+        backup_path, error = _take_autoroute_snapshot(board_path, "http://mcp", call_tool)
+
+        assert backup_path == ""
+        assert error is not None
+        assert "Save the .kicad_pcb" in error
+        assert calls == []
