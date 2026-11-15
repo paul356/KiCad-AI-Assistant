@@ -177,7 +177,6 @@ def _build_zone_node(
     zone_type: str,
     layer: str,
     polygon_pts: list[dict[str, float]],
-    net_id: int | None,
     net_name: str,
     hatch_style: str,
     hatch_pitch: float,
@@ -190,7 +189,6 @@ def _build_zone_node(
     keepout_vias: str,
     keepout_copperpour: str,
     keepout_footprints: str,
-    keepout_text: str,
 ) -> list[Any]:
     """Build a top-level KiCad ``(zone ...)`` node."""
     zone_node: list[Any] = [
@@ -203,20 +201,20 @@ def _build_zone_node(
     if zone_type == "copper_pour":
         # KiCad 10 writes a copper zone's net as a name, with no net_name node.
         zone_node.insert(1, [sexpdata.Symbol("net"), net_name])
-    else:
-        # Keepouts keep the legacy pair: (net 0) plus net_name.
-        zone_node.insert(1, [sexpdata.Symbol("net"), net_id])
-        zone_node.insert(2, [sexpdata.Symbol("net_name"), net_name])
 
     if zone_type == "keepout":
+        # KiCad 10 rule areas carry no net node at all, and exactly these five
+        # rules in this order. This tool always allows pads, matching KiCad's
+        # rule-area default (10.x can write ``pads not_allowed``, but exposing
+        # that flag is out of scope). There is no ``text`` rule in the format.
         zone_node.append(
             [
                 sexpdata.Symbol("keepout"),
                 [sexpdata.Symbol("tracks"), sexpdata.Symbol(keepout_tracks)],
                 [sexpdata.Symbol("vias"), sexpdata.Symbol(keepout_vias)],
+                [sexpdata.Symbol("pads"), sexpdata.Symbol("allowed")],
                 [sexpdata.Symbol("copperpour"), sexpdata.Symbol(keepout_copperpour)],
                 [sexpdata.Symbol("footprints"), sexpdata.Symbol(keepout_footprints)],
-                [sexpdata.Symbol("text"), sexpdata.Symbol(keepout_text)],
             ]
         )
     else:
@@ -306,13 +304,18 @@ def register_pcb_zone_tools(mcp: FastMCP) -> None:
         keepout_vias: str = "not_allowed",
         keepout_copperpour: str = "not_allowed",
         keepout_footprints: str = "allowed",
-        keepout_text: str = "allowed",
     ) -> dict[str, Any]:
         """Add a copper-pour zone or keepout zone to a KiCad PCB file.
 
         For ``zone_type="copper_pour"``, ``net_name`` is required and must match
         an existing board net. For ``zone_type="keepout"``, ``net_name`` is
-        ignored and the zone is created on net 0.
+        ignored: a KiCad 10 rule area is written with no net node.
+
+        A keepout's rules default to ``"not_allowed"`` for ``tracks``,
+        ``vias`` and ``copperpour``, and ``"allowed"`` for ``footprints``.
+        Pads are always allowed by this tool, matching KiCad's rule-area
+        default. The format has no ``text`` rule, so there is no parameter for
+        it.
 
         Polygon points are in board coordinates (mm, +X right, +Y down) and are
         used as the zone outline in the given order. The polygon must contain at
@@ -354,7 +357,6 @@ def register_pcb_zone_tools(mcp: FastMCP) -> None:
             zone_type=zone_type,
             layer=layer,
             polygon_pts=polygon_pts,
-            net_id=resolved_net_id,
             net_name=resolved_net_name,
             hatch_style=hatch_style,
             hatch_pitch=hatch_pitch,
@@ -367,7 +369,6 @@ def register_pcb_zone_tools(mcp: FastMCP) -> None:
             keepout_vias=keepout_vias,
             keepout_copperpour=keepout_copperpour,
             keepout_footprints=keepout_footprints,
-            keepout_text=keepout_text,
         )
         data.append(zone_node)
 
