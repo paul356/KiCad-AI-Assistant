@@ -18,14 +18,29 @@ def _project(tmp_path):
     return pro, root_sch, nested
 
 
-def test_subdirectory_sheet_reports_owning_project_and_root_schematic(tmp_path):
+def test_subdirectory_sheet_operates_on_the_named_sheet(tmp_path):
     pro, root_sch, nested = _project(tmp_path)
 
     files = get_project_files(str(nested))
 
     assert files["project"] == str(pro)
-    assert files["schematic"] == str(root_sch)
-    assert files["schematic"] != str(nested)
+    assert files["schematic"] == str(nested)
+    assert get_project_files(str(pro))["schematic"] == str(root_sch)
+
+
+def test_subdirectory_board_operates_on_the_named_board(tmp_path):
+    pro, _root_sch, _nested = _project(tmp_path)
+    root_board = tmp_path / "aria.kicad_pcb"
+    root_board.write_text("(kicad_pcb)\n")
+    hardware = tmp_path / "hardware"
+    board = hardware / "main_bus.kicad_pcb"
+    board.write_text("(kicad_pcb)\n")
+
+    files = get_project_files(str(board))
+
+    assert files["project"] == str(pro)
+    assert files["pcb"] == str(board)
+    assert get_project_files(str(pro))["pcb"] == str(root_board)
 
 
 def test_no_project_returns_only_the_input_as_project(tmp_path, isolated_project_search):

@@ -12,8 +12,15 @@ from kcaa.utils.project_resolution import find_project_file, project_name
 def get_project_files(project_path: str) -> dict[str, str]:
     """Get all files related to a KiCad project.
 
+    The owning project is resolved by walking upward from *project_path*.
+    ``files["project"]`` is that resolved ``.kicad_pro`` and the board /
+    schematic entries default to the project-root files.  When
+    *project_path* itself is an existing ``.kicad_pcb`` or ``.kicad_sch``,
+    it overrides the matching key, so callers act on the file they named
+    instead of silently switching to the root file.
+
     Args:
-        project_path: Path to the .kicad_pro file
+        project_path: Path to a project file or any file inside the project.
 
     Returns:
         Dictionary mapping file types to file paths
@@ -39,6 +46,14 @@ def get_project_files(project_path: str) -> dict[str, str]:
         file_path = os.path.join(project_dir, f"{project_stem}{extension}")
         if os.path.exists(file_path):
             files[file_type] = file_path
+
+    # Operate on the named board/schematic, not a same-extension root file.
+    if os.path.isfile(project_path):
+        suffix = os.path.splitext(project_path)[1].lower()
+        if suffix == ".kicad_pcb":
+            files["pcb"] = project_path
+        elif suffix == ".kicad_sch":
+            files["schematic"] = project_path
 
     # Check for data files
     try:
