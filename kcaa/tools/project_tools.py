@@ -84,16 +84,17 @@ def register_project_tools(
         if not os.path.exists(project_path):
             return {"error": f"Project not found: {project_path}"}
 
-        project_dir = os.path.dirname(project_path)
         project_label = project_name(project_path) or os.path.basename(project_path)
 
         # Get related files
         files = get_project_files(project_path)
+        project_file = files.get("project") or project_path
+        project_dir = os.path.dirname(project_file)
 
         # KiCad stores project metadata under the ``meta`` key of the
         # .kicad_pro JSON (``{filename, version}``); surface it as-is.
         metadata = {}
-        project_data = load_project_json(project_path)
+        project_data = load_project_json(project_file)
         if project_data and "meta" in project_data:
             metadata = project_data["meta"]
 
