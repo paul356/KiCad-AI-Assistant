@@ -3,7 +3,10 @@
 This is a lint for the historical spelling shapes of manual path
 construction, not a sandbox.  Fragment assembly that never produces a
 literal ending in ``.kicad_pro`` (for example ``".kicad_" + "pro"`` or
-``"".join(["x", ".kicad_", "pro"])``) is outside its coverage.
+``"".join(["x", ".kicad_", "pro"])``) is outside its coverage.  Constants
+such as ``SUFFIX = ".kicad_pro"`` are allowed as bare assignment values,
+and any later use of such a constant in a concatenation is likewise
+outside the coverage; this is the inherent trade-off of a lint.
 """
 
 import ast
