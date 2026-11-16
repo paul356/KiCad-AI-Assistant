@@ -87,11 +87,40 @@ def _literal_text(token_string: str) -> str | None:
     try:
         value = ast.literal_eval(token_string)
     except (SyntaxError, ValueError):
-        # f-strings are not literal-eval-able; strip the prefix and quotes so
-        # f"{stem}.kicad_pro" is still inspected.
-        match = re.match(r"(?is)^[rubf]*(?:'''|\"\"\"|'|\")(.*)(?:'''|\"\"\"|'|\")$", token_string)
-        return match.group(1) if match else None
+        return None
     return value if isinstance(value, str) else None
+
+
+def _is_fstring_token(token_string: str) -> bool:
+    match = re.match(r"(?i)^([rubf]*)", token_string)
+    return bool(match and "f" in match.group(1).lower())
+
+
+def _ast_suffix_violations(tree: ast.AST) -> list[tuple[int, str]]:
+    """Return f-string / percent-format suffix violations from AST alone.
+
+    PEP 701 (Python 3.12+) tokenizes f-strings as FSTRING_* tokens, so the
+    AST is the authoritative source for them on every interpreter version.
+    """
+    violations: list[tuple[int, str]] = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.JoinedStr) and node.values:
+            last = node.values[-1]
+            if (
+                isinstance(last, ast.Constant)
+                and isinstance(last.value, str)
+                and last.value.lower().endswith(".kicad_pro")
+            ):
+                violations.append((node.lineno, last.value))
+        if (
+            isinstance(node, ast.BinOp)
+            and isinstance(node.op, ast.Mod)
+            and isinstance(node.left, ast.Constant)
+            and isinstance(node.left.value, str)
+            and node.left.value.lower().endswith(".kicad_pro")
+        ):
+            violations.append((node.lineno, node.left.value))
+    return violations
 
 
 def _display_path(path: Path) -> str:
@@ -106,18 +135,33 @@ def _literal_suffix_violations(path: Path, text: str) -> list[str]:
     docstrings = _docstring_lines(tree)
     bare_positions = _bare_literal_positions(tree)
     violations: list[str] = []
+    seen: set[tuple[int, str]] = set()
+
+    def add(line: int, literal: str) -> None:
+        key = (line, literal)
+        if key in seen:
+            return
+        seen.add(key)
+        violations.append(
+            f"{_display_path(path)}:{line}: string literal ends with .kicad_pro: {literal!r}"
+        )
+
     for token in tokenize.generate_tokens(io.StringIO(text).readline):
         if token.type != tokenize.STRING or token.start[0] in docstrings:
+            continue
+        if _is_fstring_token(token.string):
             continue
         literal = _literal_text(token.string)
         if literal is None or not literal.lower().endswith(".kicad_pro"):
             continue
         if literal.lower() == ".kicad_pro" and token.start in bare_positions:
             continue
-        violations.append(
-            f"{_display_path(path)}:{token.start[0]}: "
-            f"string literal ends with .kicad_pro: {literal!r}"
-        )
+        add(token.start[0], literal)
+
+    for line, literal in _ast_suffix_violations(tree):
+        add(line, literal)
+
+    violations.sort(key=lambda item: int(re.search(r":(\d+): ", item).group(1)))
     return violations
 
 
@@ -177,3 +221,26 @@ def test_literal_scan_allows_bare_extension_literals(tmp_path):
     module.write_text(text)
 
     assert _literal_suffix_violations(module, text) == []
+
+
+def test_fstring_variants_are_flagged(tmp_path):
+    module = tmp_path / "sample.py"
+    text = """def build(stem, inner):
+    nested = f"{stem}-{f'{inner}.kicad_pro'}"
+    middle = f"name-{stem}-tail.kicad_pro"
+    upper = f"name-{stem}.KICAD_PRO"
+    safe = f"prefix .kicad_pro suffix"
+    return nested, middle, upper, safe
+"""
+    module.write_text(text)
+
+    violations = _literal_suffix_violations(module, text)
+    lines = [int(re.search(r":(\d+): ", item).group(1)) for item in violations]
+
+    assert lines == [2, 3, 4]
+
+
+def test_ast_scan_detects_joined_str_without_tokenize():
+    tree = ast.parse('value = f"{stem}.kicad_pro"\n')
+
+    assert _ast_suffix_violations(tree) == [(1, ".kicad_pro")]
