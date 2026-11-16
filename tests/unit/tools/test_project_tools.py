@@ -77,6 +77,18 @@ class TestGetProjectStructure:
         assert result["files"]["pcb"].endswith("demo.kicad_pcb")
         assert result["metadata"] == {"filename": "demo.kicad_pro", "version": 1}
 
+    def test_non_project_input_uses_basename_as_display_name(
+        self, tools, tmp_path, isolated_project_search
+    ):
+        """A non-project path still yields a non-empty, honest display name."""
+        orphan = tmp_path / "orphan_dir"
+        orphan.mkdir()
+
+        result = self._call(tools, str(orphan))
+
+        assert result["name"] == "orphan_dir"
+        assert result["name"] != ""
+
     def test_sheet_hierarchy_follows_sheetfile_refs(self, tools, tmp_project):
         result = self._call(tools, str(tmp_project))
         assert len(result["sheets"]) == 1

@@ -85,7 +85,7 @@ def register_project_tools(
             return {"error": f"Project not found: {project_path}"}
 
         project_dir = os.path.dirname(project_path)
-        project_label = project_name(project_path) or ""
+        project_label = project_name(project_path) or os.path.basename(project_path)
 
         # Get related files
         files = get_project_files(project_path)

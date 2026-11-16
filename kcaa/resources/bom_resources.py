@@ -54,7 +54,7 @@ def register_bom_resources(mcp: FastMCP) -> None:
             return f"# BOM Report\n\nNo BOM files found for project: {os.path.basename(project_path)}.\n\nExport a BOM from KiCad first, or use the `export_bom_csv` tool to generate one."
 
         # Format as Markdown report
-        project_label = project_name(project_path) or ""
+        project_label = project_name(project_path) or os.path.basename(project_path)
 
         report = f"# Bill of Materials for {project_label}\n\n"
 
@@ -261,7 +261,10 @@ def register_bom_resources(mcp: FastMCP) -> None:
 
         try:
             # Collect data from all BOM files
-            result = {"project": project_name(project_path) or "", "bom_files": {}}
+            result = {
+                "project": project_name(project_path) or os.path.basename(project_path),
+                "bom_files": {},
+            }
 
             for file_type, file_path in bom_files.items():
                 # If it's already JSON, parse it directly

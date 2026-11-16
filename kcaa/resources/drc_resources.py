@@ -54,7 +54,7 @@ def register_drc_resources(mcp: FastMCP) -> None:
             return f"# DRC Check Failed\n\nError: {error_message}"
 
         # Format results as Markdown
-        project_label = project_name(project_path) or ""
+        project_label = project_name(project_path) or os.path.basename(project_path)
         pcb_name = os.path.basename(pcb_file)
 
         report = f"# Design Rule Check Report for {project_label}\n\n"

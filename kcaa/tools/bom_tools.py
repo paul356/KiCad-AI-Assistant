@@ -205,7 +205,7 @@ def register_bom_tools(mcp: FastMCP) -> None:
 
         schematic_file = files["schematic"]
         project_dir = os.path.dirname(project_path)
-        project_label = project_name(project_path) or ""
+        project_label = project_name(project_path) or os.path.basename(project_path)
 
         if ctx:
             await ctx.report_progress(20, 100)
