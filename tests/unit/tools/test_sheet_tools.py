@@ -91,6 +91,31 @@ class TestAddSheetSymbol:
         assert result["position"]["y"] == pytest.approx(candidate["y"])
         assert result["note"] == "Position adjusted to nearest free area."
 
+    def test_instances_use_owning_project_name(self, tools, tmp_path):
+        """A nested sheet records the root project's name, not its own stem."""
+        (tmp_path / "aria.kicad_pro").write_text("{}")
+        hardware = tmp_path / "hardware"
+        hardware.mkdir()
+        schematic = hardware / "main_bus.kicad_sch"
+        shutil.copy(SCHEMATIC_PATH, schematic)
+
+        result = asyncio.run(
+            tools["add_sheet_symbol"](
+                schematic_path=str(schematic),
+                sheet_name="Child",
+                sheet_file="child.kicad_sch",
+                x=20,
+                y=20,
+                width=25.4,
+                height=25.4,
+            )
+        )
+
+        assert result["success"] is True, result
+        text = schematic.read_text()
+        assert '(project "aria"' in text
+        assert '(project "main_bus"' not in text
+
 
 class TestUpdateSheetSymbol:
     """Tests for update_sheet_symbol auto-placement."""

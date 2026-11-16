@@ -16,6 +16,7 @@ import uuid
 
 from fastmcp import Context, FastMCP
 
+from kcaa.utils.project_resolution import project_name
 from kcaa.utils.skip_compat import safe_schematic
 
 log = logging.getLogger(__name__)
@@ -626,13 +627,14 @@ def _do_add_sheet_symbol(
             pins_created += 1
 
     # Add instances block
-    # Derive project name from schematic filename
-    project_name = os.path.splitext(os.path.basename(schematic_path))[0]
+    project_stem = (
+        project_name(schematic_path) or os.path.splitext(os.path.basename(schematic_path))[0]
+    )
     instances_entry = [
         sexpdata.Symbol("instances"),
         [
             sexpdata.Symbol("project"),
-            project_name,
+            project_stem,
             [
                 sexpdata.Symbol("path"),
                 f"/{sheet_uuid}",
