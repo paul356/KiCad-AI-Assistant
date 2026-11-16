@@ -12,6 +12,7 @@ from fastmcp import FastMCP
 from kcaa.tools.sheet_tools import _build_sheet_tree
 from kcaa.utils.file_utils import get_project_files, load_project_json
 from kcaa.utils.kicad_utils import find_kicad_projects, open_kicad_project
+from kcaa.utils.project_resolution import project_name
 
 
 def _sheet_tree(root_schematic: str) -> dict[str, Any]:
@@ -84,7 +85,7 @@ def register_project_tools(
             return {"error": f"Project not found: {project_path}"}
 
         project_dir = os.path.dirname(project_path)
-        project_name = os.path.basename(project_path)[:-10]  # Remove .kicad_pro extension
+        project_label = project_name(project_path) or ""
 
         # Get related files
         files = get_project_files(project_path)
@@ -106,7 +107,7 @@ def register_project_tools(
         fp_lib_table = os.path.join(project_dir, "fp-lib-table")
 
         return {
-            "name": project_name,
+            "name": project_label,
             "path": project_path,
             "directory": project_dir,
             "files": files,

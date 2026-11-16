@@ -8,6 +8,7 @@ from fastmcp import FastMCP
 
 from kcaa.utils.file_utils import get_project_files
 from kcaa.utils.ipc_drc import run_drc_via_ipc
+from kcaa.utils.project_resolution import project_name
 
 
 def register_drc_resources(mcp: FastMCP) -> None:
@@ -53,10 +54,10 @@ def register_drc_resources(mcp: FastMCP) -> None:
             return f"# DRC Check Failed\n\nError: {error_message}"
 
         # Format results as Markdown
-        project_name = os.path.basename(project_path)[:-10]  # Remove .kicad_pro
+        project_label = project_name(project_path) or ""
         pcb_name = os.path.basename(pcb_file)
 
-        report = f"# Design Rule Check Report for {project_name}\n\n"
+        report = f"# Design Rule Check Report for {project_label}\n\n"
         report += f"PCB file: `{pcb_name}`\n\n"
 
         # Add summary

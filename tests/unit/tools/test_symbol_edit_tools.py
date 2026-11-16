@@ -3090,11 +3090,8 @@ class TestNextReferenceCrossFile:
 
     def test_locators_resolve_nested_sheet_to_project_root(self, tmp_path):
         """Nested sheet with a different stem maps to the owning project."""
-        from kcaa.tools.symbol_edit_tools import (
-            _find_project_dir,
-            _find_project_name,
-            _find_root_schematic,
-        )
+        from kcaa.tools.symbol_edit_tools import _find_project_dir, _find_root_schematic
+        from kcaa.utils.project_resolution import project_name
 
         pro = tmp_path / "aria.kicad_pro"
         pro.write_text("{}")
@@ -3106,7 +3103,7 @@ class TestNextReferenceCrossFile:
         nested.write_text("(kicad_sch)\n")
 
         assert _find_project_dir(str(nested)) == tmp_path
-        assert _find_project_name(str(nested)) == "aria"
+        assert project_name(str(nested)) == "aria"
         assert _find_root_schematic(str(nested)) == str(root_sch)
 
     def test_collect_project_references(self, project_dir):

@@ -2995,7 +2995,7 @@ def test_pns_multi_layer_unreachable_via_pairs(tmp_path: Path) -> None:
 
 
 def test_pns_multi_layer_missing_pro_rejects_unvalidated_vias(
-    tmp_path: Path,
+    tmp_path: Path, isolated_project_search
 ) -> None:
     """Routing a PNS pair without a .kicad_pro must fail loudly: the
     route cannot silently place vias without netclass/DRC data.  Width

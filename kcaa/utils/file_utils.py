@@ -6,7 +6,7 @@ import json
 import os
 from typing import Any
 
-from kcaa.utils.kicad_utils import get_project_name_from_path
+from kcaa.utils.project_resolution import project_name
 
 
 def get_project_files(project_path: str) -> dict[str, str]:
@@ -21,7 +21,7 @@ def get_project_files(project_path: str) -> dict[str, str]:
     from kcaa.utils.config import config
 
     project_dir = os.path.dirname(project_path)
-    project_name = get_project_name_from_path(project_path)
+    project_stem = project_name(project_path) or ""
 
     files = {}
 
@@ -32,7 +32,7 @@ def get_project_files(project_path: str) -> dict[str, str]:
             files[file_type] = project_path
             continue
 
-        file_path = os.path.join(project_dir, f"{project_name}{extension}")
+        file_path = os.path.join(project_dir, f"{project_stem}{extension}")
         if os.path.exists(file_path):
             files[file_type] = file_path
 
@@ -40,9 +40,9 @@ def get_project_files(project_path: str) -> dict[str, str]:
     try:
         for ext in config.data_extensions:
             for file in os.listdir(project_dir):
-                if file.startswith(project_name) and file.endswith(ext):
+                if file.startswith(project_stem) and file.endswith(ext):
                     # Extract the type from filename (e.g., project_name-bom.csv -> bom)
-                    file_type = file[len(project_name) :].strip("-_")
+                    file_type = file[len(project_stem) :].strip("-_")
                     file_type = file_type.split(".")[0]
                     if not file_type:
                         file_type = ext[1:]  # Use extension if no specific type

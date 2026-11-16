@@ -12,6 +12,7 @@ import pandas as pd
 
 from kcaa.utils.config import config
 from kcaa.utils.file_utils import get_project_files
+from kcaa.utils.project_resolution import project_name
 
 
 def register_bom_tools(mcp: FastMCP) -> None:
@@ -204,7 +205,7 @@ def register_bom_tools(mcp: FastMCP) -> None:
 
         schematic_file = files["schematic"]
         project_dir = os.path.dirname(project_path)
-        project_name = os.path.basename(project_path)[:-10]  # Remove .kicad_pro extension
+        project_label = project_name(project_path) or ""
 
         if ctx:
             await ctx.report_progress(20, 100)
@@ -220,7 +221,7 @@ def register_bom_tools(mcp: FastMCP) -> None:
                 if ctx:
                     ctx.info("Attempting to export BOM using KiCad Python modules...")
                 export_result = await export_bom_with_python(
-                    schematic_file, project_dir, project_name, ctx
+                    schematic_file, project_dir, project_label, ctx
                 )
             except Exception as e:
                 print(f"Error exporting BOM with Python modules: {str(e)}", exc_info=True)
@@ -234,7 +235,7 @@ def register_bom_tools(mcp: FastMCP) -> None:
                 if ctx:
                     ctx.info("Attempting to export BOM using command-line tools...")
                 export_result = await export_bom_with_cli(
-                    schematic_file, project_dir, project_name, ctx
+                    schematic_file, project_dir, project_label, ctx
                 )
             except Exception as e:
                 print(f"Error exporting BOM with CLI: {str(e)}", exc_info=True)

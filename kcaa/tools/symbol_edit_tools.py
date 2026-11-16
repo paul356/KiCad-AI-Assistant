@@ -25,7 +25,7 @@ from kcaa.tools.symbol_tools import _not_found_scope, _scope_text
 from kcaa.utils.config import (
     config,
 )
-from kcaa.utils.project_resolution import find_project_file
+from kcaa.utils.project_resolution import find_project_file, project_name
 from kcaa.utils.schematic_sexp_utils import save_schematic
 from kcaa.utils.skip_compat import safe_schematic
 from kcaa.utils.sym_lib_table_utils import (
@@ -1052,7 +1052,7 @@ def _do_add_symbol(
                 break
         reference = _next_reference(sch, prefix, schematic_path=schematic_path)
 
-        project_name = _find_project_name(schematic_path)
+        project = project_name(schematic_path) or "project"
 
         # Collect existing wires and adjust placement if any pin would land
         # on a wire interior or endpoint.
@@ -1084,7 +1084,7 @@ def _do_add_symbol(
                 reference,
                 effective_value,
                 sch_uuid,
-                project_name,
+                project,
                 lib_sym_raw,
                 fields_autoplaced=fields_autoplaced,
             )
@@ -1141,15 +1141,6 @@ def _placed_world_bbox(
         world_bbs.append(lib_bbox_to_world(lib_bb, sx, sy, int(rot), mirror))
     merged = union_bboxes(world_bbs)
     return merged.to_dict() if merged is not None else None
-
-
-def _find_project_name(schematic_path: str) -> str:
-    """
-    Find the KiCad project name by locating the owning .kicad_pro file.
-    Returns the file stem, or "project" if nothing is found.
-    """
-    project_file = find_project_file(schematic_path)
-    return Path(project_file).stem if project_file is not None else "project"
 
 
 def _find_project_dir(schematic_path: str) -> Path | None:

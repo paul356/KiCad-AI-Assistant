@@ -15,6 +15,8 @@ from typing import Any
 
 import sexpdata
 
+from kcaa.utils.project_resolution import find_project_file
+
 log = logging.getLogger(__name__)
 
 
@@ -172,7 +174,15 @@ def get_effective_design_rules_from_file(pcb_file: str) -> dict[str, Any]:
     result: dict[str, Any] = {"success": True}
     notes: list[str] = []
 
-    pro_file = pcb_file.replace(".kicad_pcb", ".kicad_pro")
+    pro_file = find_project_file(pcb_file)
+    if pro_file is None:
+        return {
+            "success": False,
+            "error": (
+                f"No .kicad_pro project file found for {pcb_file!r}; "
+                "create or save a project alongside the board"
+            ),
+        }
 
     # 1. Board constraints from .kicad_pro JSON
     try:

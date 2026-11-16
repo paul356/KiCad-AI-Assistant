@@ -66,7 +66,14 @@ from kcaa.tools.pcb_routing_tools import (  # noqa: E402
     _via_to_sexp,
 )
 from kcaa.utils.pcb_sexp_utils import load_pcb, save_pcb  # noqa: E402
+from kcaa.utils.project_resolution import find_project_file  # noqa: E402
 from kcaa.utils.sexp_utils import sym_str as _sym  # noqa: E402
+
+
+def project_hint(pcb_path: str) -> str | None:
+    """Return the owning project file for *pcb_path* (upward search)."""
+    return find_project_file(pcb_path)
+
 
 DEFAULT_PCB = os.path.join(
     _REPO_ROOT, "tests", "integration", "fixtures", "test_routing_board.kicad_pcb"
@@ -1079,12 +1086,10 @@ def main(argv: list[str] | None = None) -> int:
     if not os.path.exists(args.pcb):
         print(f"error: PCB not found: {args.pcb}", file=sys.stderr)
         return 2
-    pro_hint = os.path.join(
-        os.path.dirname(args.pcb), os.path.basename(args.pcb)[:-10] + ".kicad_pro"
-    )
-    if not os.path.exists(pro_hint):
+    pro_hint = project_hint(args.pcb)
+    if pro_hint is None:
         print(
-            "warning: no sibling .kicad_pro found; router will fail width/clearance lookup",
+            "warning: no owning .kicad_pro found; router will fail width/clearance lookup",
             file=sys.stderr,
         )
 

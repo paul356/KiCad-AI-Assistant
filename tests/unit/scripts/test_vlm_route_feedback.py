@@ -388,3 +388,15 @@ def test_draw_footprint_body_thru_hole_spans_all_layers() -> None:
         ax = _RecordingAxes()
         vrf._draw_footprint_body(ax, fp, panel, ["F.Cu", "In1.Cu"])
         assert len(ax.lines) == 4
+
+
+def test_project_hint_finds_root_project_for_nested_board(tmp_path: Path) -> None:
+    """A board in a subdirectory resolves the root project, not a sibling."""
+    pro = tmp_path / "aria.kicad_pro"
+    pro.write_text("{}\n")
+    hardware = tmp_path / "hardware"
+    hardware.mkdir()
+    board = hardware / "main.kicad_pcb"
+    board.write_text("(kicad_pcb)\n")
+
+    assert vrf.project_hint(str(board)) == str(pro)
