@@ -119,8 +119,9 @@ async def generate_thumbnail_with_cli(pcb_file: str, ctx: Context | None):
 
         # --- Determine Output Path ---
         project_dir = os.path.dirname(pcb_file)
-        project_name = os.path.splitext(os.path.basename(pcb_file))[0]
-        output_file = os.path.join(project_dir, f"{project_name}_thumbnail.svg")
+        # Output filename uses the board stem, not the project name.
+        board_stem = os.path.splitext(os.path.basename(pcb_file))[0]
+        output_file = os.path.join(project_dir, f"{board_stem}_thumbnail.svg")
         # ---------------------------
 
         # Check for required command-line tools based on OS
