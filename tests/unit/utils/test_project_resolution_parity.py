@@ -4,7 +4,7 @@ import os
 import random
 
 from kcaa.utils import project_resolution
-from kicad_plugin import context_bridge
+from kicad_plugin import project_resolution as plugin_project_resolution
 
 
 def _build_random_tree(root, seed=0x315):
@@ -48,5 +48,5 @@ def test_plugin_mirror_matches_core_on_random_trees(tmp_path, isolated_project_s
 
     for probe in probes:
         expected = project_resolution.find_project_file(str(probe))
-        actual = context_bridge.find_project_for_path(str(probe))
+        actual = plugin_project_resolution.find_project_file(str(probe))
         assert actual == expected, f"parity mismatch for {os.fspath(probe)!r}"

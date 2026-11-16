@@ -113,3 +113,17 @@ def find_project_root(path: str) -> str | None:
     """
     project_file = find_project_file(path)
     return os.path.dirname(project_file) if project_file is not None else None
+
+
+def project_name(path: str) -> str | None:
+    """Return the owning project's stem for *path*, or None.
+
+    *path* is resolved with :func:`find_project_file`, so it may be a
+    schematic, a board, an existing ``.kicad_pro`` or any other file inside
+    the project directory.  This is the single project-name derivation in the
+    codebase; callers that need a display fallback add it locally.
+    """
+    project_file = find_project_file(path)
+    if project_file is None:
+        return None
+    return os.path.splitext(os.path.basename(project_file))[0]

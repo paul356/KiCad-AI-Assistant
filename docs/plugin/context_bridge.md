@@ -39,6 +39,8 @@ The old sibling-stem derivation (`<board stem>.kicad_pro` next to the board) is 
 
 For the schematic editor, the plugin registers as an `EeschemaPlugin` and uses the scripting console to query the active frame; editor titles naming a `.kicad_sch`/`.kicad_pcb` are resolved with the same upward search. Resolution runs on every `collect_context()` / title call; nothing is cached.
 
+The plugin cannot import `kcaa`, so it ships `kicad_plugin/project_resolution.py`, a byte-for-byte copy of `kcaa/utils/project_resolution.py`. Regenerate it with `python scripts/sync_project_resolution.py`; a vendored-copy test and the release packaging step both fail on drift.
+
 ### 3.2 Active schematic path
 When the board supplies context, `active_schematic` is `<project_dir>/<project_stem>.kicad_sch`, reported only when that file exists. That is the conventional project root sheet, not necessarily the sheet being edited: a nested sheet is a normal layout, and a project whose root schematic has a different name yields `null`. For the schematic editor the field may also be absent. Hierarchical sheets are discovered by the MCP server via `skip` from the root path supplied as `schematic_path`.
 

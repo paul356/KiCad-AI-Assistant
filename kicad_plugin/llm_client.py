@@ -26,7 +26,7 @@ import threading
 import time
 from typing import Any
 
-from .context_bridge import find_project_for_path
+from .project_resolution import find_project_file
 from .tool_registry import TOOL_POLICIES, get_missing_tool_policies, get_tool_policy
 
 # Notice colour for wait progress; single source of truth is ui/colors.py
@@ -43,7 +43,7 @@ def _project_path_for(file_path: str) -> str | None:
     file; the project stem may differ from the edited file's stem and the
     file may live in a subdirectory.  Never fabricates a sibling path.
     """
-    return find_project_for_path(file_path)
+    return find_project_file(file_path)
 
 
 def _searched_directories(file_path: str) -> list[str]:

@@ -10,83 +10,14 @@ import os
 import re
 from typing import Any
 
+from .project_resolution import find_project_file
+
 log = logging.getLogger(__name__)
 
 # KiCad window titles name project/board/schematic files, e.g.
 # "PCB Editor: /path/to/board.kicad_pcb [*]" or a .kicad_pro path.
 _TITLE_PROJECT_RE = re.compile(r"([^\s\[]+\.kicad_pro)\b", re.IGNORECASE)
 _TITLE_FRAME_RE = re.compile(r"([^\s\[]+\.kicad_(?:pcb|sch))\b", re.IGNORECASE)
-
-_PROJECT_SUFFIX = ".kicad_pro"
-
-
-def _is_project_name(name: str) -> bool:
-    """Return True when *name* has the project suffix, case-insensitively."""
-    return name.lower().endswith(_PROJECT_SUFFIX)
-
-
-def _project_candidates(directory: str) -> list[str]:
-    """Return the existing ``.kicad_pro`` files directly inside *directory*."""
-    try:
-        names = os.listdir(directory)
-    except OSError:
-        return []
-    return sorted(
-        os.path.join(directory, name)
-        for name in names
-        if _is_project_name(name) and os.path.isfile(os.path.join(directory, name))
-    )
-
-
-def _pick_candidate(candidates: list[str], queried_stem: str) -> str:
-    """Pick one project deterministically from several in one directory."""
-
-    def sort_key(project_path: str) -> tuple[int, int, str]:
-        stem = os.path.splitext(os.path.basename(project_path))[0]
-        directory = os.path.dirname(project_path)
-        has_matching_frame = os.path.isfile(
-            os.path.join(directory, f"{stem}.kicad_sch")
-        ) or os.path.isfile(os.path.join(directory, f"{stem}.kicad_pcb"))
-        return (
-            0 if has_matching_frame else 1,
-            0 if stem == queried_stem else 1,
-            os.path.basename(project_path),
-        )
-
-    return min(candidates, key=sort_key)
-
-
-def find_project_for_path(path: str) -> str | None:
-    """Return the ``.kicad_pro`` that owns *path* by searching upward.
-
-    This mirrors :func:`kcaa.utils.project_resolution.find_project_file`;
-    the plugin cannot import ``kcaa`` because it runs inside KiCad's
-    Python, so the rule is duplicated here.  A ``.kicad_pro`` argument is
-    returned when it exists.  Other paths walk from their directory up to
-    the filesystem root; the first directory with a project wins.  Several
-    projects in one directory are resolved deterministically: prefer the
-    one whose stem has a matching ``.kicad_sch``/``.kicad_pcb``, then the
-    queried stem, then the lexicographically smallest filename.
-    """
-    target = os.path.abspath(path)
-
-    if _is_project_name(target):
-        return target if os.path.isfile(target) else None
-
-    directory = target if os.path.isdir(target) else os.path.dirname(target)
-    queried_stem = os.path.splitext(os.path.basename(target))[0]
-
-    while True:
-        candidates = _project_candidates(directory)
-        if len(candidates) == 1:
-            return candidates[0]
-        if candidates:
-            return _pick_candidate(candidates, queried_stem)
-
-        parent = os.path.dirname(directory)
-        if parent == directory:
-            return None
-        directory = parent
 
 
 def project_path_from_title(title: str) -> str | None:
@@ -103,7 +34,7 @@ def project_path_from_title(title: str) -> str | None:
     m = _TITLE_FRAME_RE.search(title)
     if not m:
         return None
-    return find_project_for_path(m.group(1))
+    return find_project_file(m.group(1))
 
 
 def _try_import_pcbnew():
@@ -146,7 +77,7 @@ def collect_context() -> dict[str, Any]:
             pcb_path = board.GetFileName()
             if pcb_path:
                 ctx["active_pcb"] = os.path.abspath(pcb_path)
-                pro_path = find_project_for_path(pcb_path)
+                pro_path = find_project_file(pcb_path)
                 if pro_path is not None:
                     ctx["active_project"] = pro_path
                     # The root schematic is always <project stem>.kicad_sch

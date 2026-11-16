@@ -5,7 +5,7 @@ import os
 import pytest
 
 from kcaa.utils import project_resolution
-from kicad_plugin import context_bridge
+from kicad_plugin import project_resolution as plugin_project_resolution
 
 
 @pytest.fixture()
@@ -19,7 +19,7 @@ def isolated_project_search(tmp_path, monkeypatch):
     """
     root = os.path.abspath(str(tmp_path))
 
-    for module in (project_resolution, context_bridge):
+    for module in (project_resolution, plugin_project_resolution):
         real_candidates = module._project_candidates
 
         def scoped_candidates(directory, _real=real_candidates):

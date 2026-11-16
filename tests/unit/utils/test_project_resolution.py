@@ -112,3 +112,30 @@ class TestSeveralProjectsInOneDirectory:
         sheet = _touch(isolated_root / "hardware" / "main_bus.kicad_sch")
 
         assert project_resolution.find_project_file(str(sheet)) == str(pro)
+
+
+class TestProjectName:
+    def test_subdirectory_sheet_resolves_root_project_name(self, isolated_root):
+        _touch(isolated_root / "aria.kicad_pro")
+        sheet = _touch(isolated_root / "hardware" / "main_bus.kicad_sch")
+
+        assert project_resolution.project_name(str(sheet)) == "aria"
+
+    def test_project_file_argument_returns_its_stem(self, isolated_root):
+        pro = _touch(isolated_root / "ARIA.KICAD_PRO")
+
+        assert project_resolution.project_name(str(pro)) == "ARIA"
+
+    def test_no_project_returns_none(self, isolated_root):
+        sheet = _touch(isolated_root / "hardware" / "orphan.kicad_sch")
+
+        assert project_resolution.project_name(str(sheet)) is None
+
+    def test_matches_find_project_file_tie_break(self, isolated_root):
+        _touch(isolated_root / "alpha.kicad_pro")
+        zeta = _touch(isolated_root / "zeta.kicad_pro")
+        _touch(isolated_root / "zeta.kicad_sch")
+        sheet = _touch(isolated_root / "hardware" / "main_bus.kicad_sch")
+
+        assert project_resolution.find_project_file(str(sheet)) == str(zeta)
+        assert project_resolution.project_name(str(sheet)) == "zeta"

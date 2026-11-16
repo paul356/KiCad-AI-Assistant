@@ -8193,7 +8193,7 @@ class TestProjectResolutionBeforeEdit:
         sheet = tmp_path / "hardware" / "main_bus.kicad_sch"
         sheet.parent.mkdir()
         sheet.write_text("(kicad_sch)\n")
-        monkeypatch.setattr(llm_client, "find_project_for_path", lambda path: None)
+        monkeypatch.setattr(llm_client, "find_project_file", lambda path: None)
         client = _make_client()
         tool_response = {
             "finish_reason": "tool_calls",
