@@ -251,3 +251,19 @@ def test_readmes_only_reference_old_folder_name_historically(readme: str) -> Non
         if "kicad_ai_plugin" not in line:
             continue
         assert any(marker in line for marker in historical_markers)
+
+
+def test_main_checks_vendored_project_resolution_before_building(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls = []
+
+    def _run(argv, **_kwargs):
+        calls.append(argv)
+
+    monkeypatch.setattr(builder.subprocess, "run", _run)
+    output = tmp_path / "legacy.zip"
+
+    assert builder.main(["legacy", "-o", str(output)]) == 0
+    assert calls and calls[0][-1] == "--check"
+    assert output.is_file()
