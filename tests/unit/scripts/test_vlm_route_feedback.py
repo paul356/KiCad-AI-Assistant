@@ -390,13 +390,30 @@ def test_draw_footprint_body_thru_hole_spans_all_layers() -> None:
         assert len(ax.lines) == 4
 
 
-def test_project_hint_finds_root_project_for_nested_board(tmp_path: Path) -> None:
-    """A board in a subdirectory resolves the root project, not a sibling."""
+def test_main_uses_owning_project_for_nested_board(tmp_path: Path, monkeypatch) -> None:
+    """main() resolves the owning project, not a sibling next to the board."""
     pro = tmp_path / "aria.kicad_pro"
     pro.write_text("{}\n")
     hardware = tmp_path / "hardware"
     hardware.mkdir()
     board = hardware / "main.kicad_pcb"
     board.write_text("(kicad_pcb)\n")
+    resolved = []
+    monkeypatch.setattr(vrf, "find_project_file", lambda path: resolved.append(path) or str(pro))
+    monkeypatch.setattr(vrf, "run_experiment", lambda *args, **kwargs: {})
 
-    assert vrf.project_hint(str(board)) == str(pro)
+    assert (
+        vrf.main(
+            [
+                "--pcb",
+                str(board),
+                "--dry-run",
+                "--rounds",
+                "1",
+                "--work-dir",
+                str(tmp_path / "work"),
+            ]
+        )
+        == 0
+    )
+    assert resolved == [str(board)]

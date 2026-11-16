@@ -164,6 +164,10 @@ def get_effective_design_rules_from_file(pcb_file: str) -> dict[str, Any]:
     All three layers are checked independently during DRC — violating
     any one of them triggers an error.
 
+    The owning project is resolved by walking upward from the board path, so
+    the returned rules may come from an ancestor project when the board sits
+    below the project root.
+
     Args:
         pcb_file: Absolute path to the ``.kicad_pcb`` file.
 

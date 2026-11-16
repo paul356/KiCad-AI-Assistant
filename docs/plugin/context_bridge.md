@@ -37,6 +37,8 @@ The plugin starts from the open board (`pcbnew.GetBoard().GetFileName()`) and re
 
 The old sibling-stem derivation (`<board stem>.kicad_pro` next to the board) is gone. Board and project stems may differ, and the board or a sheet may live in a subdirectory; only the directory walk finds the real project. When several `.kicad_pro` files share a directory, the resolver prefers the one whose stem has a matching `.kicad_sch`/`.kicad_pcb`, then the queried file's stem, then the lexicographically smallest filename.
 
+Known limitation: an unrelated `.kicad_pro` in an ancestor directory is adopted when it is the nearest project (nearest level wins); nested trees are expected to belong to the project above them.
+
 For the schematic editor, the plugin registers as an `EeschemaPlugin` and uses the scripting console to query the active frame; editor titles naming a `.kicad_sch`/`.kicad_pcb` are resolved with the same upward search. Resolution runs on every `collect_context()` / title call; nothing is cached.
 
 The plugin cannot import `kcaa`, so it ships `kicad_plugin/project_resolution.py`, a byte-for-byte copy of `kcaa/utils/project_resolution.py`. Regenerate it with `python scripts/sync_project_resolution.py`; a vendored-copy test and the release packaging step both fail on drift.

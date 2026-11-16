@@ -42,7 +42,6 @@ class TestFindProjectFile:
         sheet = _touch(isolated_root / "hardware" / "main_bus.kicad_sch")
 
         assert project_resolution.find_project_file(str(sheet)) == str(pro)
-        assert project_resolution.find_project_root(str(sheet)) == str(isolated_root)
 
     def test_board_stem_differs_from_project_stem(self, isolated_root):
         pro = _touch(isolated_root / "aria.kicad_pro")
@@ -60,7 +59,6 @@ class TestFindProjectFile:
         pro = _touch(isolated_root / "aria.kicad_pro")
 
         assert project_resolution.find_project_file(str(pro)) == str(pro)
-        assert project_resolution.find_project_root(str(pro)) == str(isolated_root)
 
     def test_path_is_missing_project_file(self, isolated_root):
         """A .kicad_pro argument is never resolved by searching upward."""
@@ -72,7 +70,6 @@ class TestFindProjectFile:
         target = isolated_root / "hardware" / "not_created.kicad_sch"
 
         assert project_resolution.find_project_file(str(target)) is None
-        assert project_resolution.find_project_root(str(target)) is None
 
     def test_directory_argument_searches_from_there(self, isolated_root):
         pro = _touch(isolated_root / "aria.kicad_pro")

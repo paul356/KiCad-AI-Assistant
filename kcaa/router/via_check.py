@@ -174,7 +174,7 @@ def _resolve_netclass_rules(
     """
     pro_path = find_project_file(pcb_path)
     if pro_path is None:
-        return f"no .kicad_pro found next to {pcb_path!r} (cannot resolve netclass rules)"
+        return f"no .kicad_pro found in or above {pcb_path!r} (cannot resolve netclass rules)"
     try:
         with open(pro_path, encoding="utf-8") as f:
             data = json.load(f)

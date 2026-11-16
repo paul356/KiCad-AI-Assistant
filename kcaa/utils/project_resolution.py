@@ -11,6 +11,10 @@ ancestors.
 This module is deliberately pure filesystem code (``os.path`` only, no
 KiCad imports, no logging) so both the MCP server and lightweight callers
 can use it without side effects.
+
+It is vendored byte-for-byte to ``kicad_plugin/project_resolution.py`` for
+the KiCad-embedded interpreter.  Edit this file, then run
+``python scripts/sync_project_resolution.py``.
 """
 
 from __future__ import annotations
@@ -103,16 +107,6 @@ def find_project_file(path: str) -> str | None:
         if parent == directory:
             return None
         directory = parent
-
-
-def find_project_root(path: str) -> str | None:
-    """Return the directory containing the project that owns *path*, or None.
-
-    This is :func:`find_project_file` followed by taking its directory, so
-    it inherits the same upward search and deterministic tie-breaking.
-    """
-    project_file = find_project_file(path)
-    return os.path.dirname(project_file) if project_file is not None else None
 
 
 def project_name(path: str) -> str | None:

@@ -104,7 +104,7 @@ class RouteFailure(RuntimeError):
 
 
 class ProFileMissing(RuntimeError):
-    """No ``.kicad_pro`` found next to the ``.kicad_pcb``.
+    """No ``.kicad_pro`` found in or above the ``.kicad_pcb``.
 
     The router needs the project file to look up netclass settings for
     width/clearance. Either create the project file in KiCad, or pass
@@ -4369,7 +4369,7 @@ def _default_track_width(pcb_path: str, net: str) -> float:
     ``track_width``.
 
     Raises:
-        ProFileMissing: No ``.kicad_pro`` next to ``pcb_path`` -- pass
+        ProFileMissing: No ``.kicad_pro`` in or above ``pcb_path`` -- pass
             ``RouteRequest(width=...)`` explicitly to skip DRC lookup.
         ProFileMalformed: The ``.kicad_pro`` exists but cannot be parsed or
             lacks the expected structure.
@@ -4409,7 +4409,6 @@ def _default_clearance(pcb_path: str, net: str | None = None) -> float:
     the Default net class clearance (0.2 mm fallback).
 
     Raises:
-        ProFileMissing: No ``.kicad_pro`` next to ``pcb_path``.
         DesignRulesUnavailable: Rules cannot be read; ``min_clearance`` is
             not set.
     """
