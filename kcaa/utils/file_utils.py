@@ -6,7 +6,7 @@ import json
 import os
 from typing import Any
 
-from kcaa.utils.project_resolution import project_name
+from kcaa.utils.project_resolution import find_project_file, project_name
 
 
 def get_project_files(project_path: str) -> dict[str, str]:
@@ -20,16 +20,20 @@ def get_project_files(project_path: str) -> dict[str, str]:
     """
     from kcaa.utils.config import config
 
-    project_dir = os.path.dirname(project_path)
-    project_stem = project_name(project_path) or ""
+    pro = find_project_file(project_path)
+    base = pro or project_path
+    project_dir = os.path.dirname(base)
+    project_stem = project_name(base)
+    if not project_stem:
+        return {"project": base}
 
     files = {}
 
     # Check for standard KiCad files
     for file_type, extension in config.kicad_extensions.items():
         if file_type == "project":
-            # We already have the project file
-            files[file_type] = project_path
+            # Report the resolved project file, not an arbitrary input file.
+            files[file_type] = base
             continue
 
         file_path = os.path.join(project_dir, f"{project_stem}{extension}")
