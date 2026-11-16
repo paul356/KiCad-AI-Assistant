@@ -3440,3 +3440,29 @@ class TestCheckReferenceConflicts:
             )
         )
         assert "error" in result
+
+
+class TestAddSymbolOrphanProjectFallback:
+    def test_orphan_schematic_uses_filename_stem_for_instances(
+        self, tools, tmp_path, isolated_project_search
+    ):
+        schematic = tmp_path / "orphan.kicad_sch"
+        shutil.copy(SCHEMATIC_PATH, schematic)
+        before = schematic.read_text().count('(project "project"')
+        mgr = _make_mock_manager()
+
+        with patch("kcaa.tools.symbol_edit_tools._get_index_manager", return_value=mgr):
+            result = asyncio.run(
+                tools["add_symbol_to_schematic"](
+                    schematic_path=str(schematic),
+                    library_name=_LIB_NAME,
+                    symbol_name=_SYM_NAME,
+                    x=50.0,
+                    y=50.0,
+                )
+            )
+
+        assert result.get("success") is True, result
+        text = schematic.read_text()
+        assert '(project "orphan"' in text
+        assert text.count('(project "project"') == before

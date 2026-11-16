@@ -1052,7 +1052,9 @@ def _do_add_symbol(
                 break
         reference = _next_reference(sch, prefix, schematic_path=schematic_path)
 
-        project = project_name(schematic_path) or "project"
+        project = (
+            project_name(schematic_path) or os.path.splitext(os.path.basename(schematic_path))[0]
+        )
 
         # Collect existing wires and adjust placement if any pin would land
         # on a wire interior or endpoint.
