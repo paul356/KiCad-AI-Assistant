@@ -29,12 +29,18 @@ def _is_project_name(name: str) -> bool:
     return name.lower().endswith(PROJECT_SUFFIX)
 
 
-def _project_candidates(directory: str) -> list[str]:
-    """Return the existing ``.kicad_pro`` files directly inside *directory*."""
+def _project_candidates(directory: str) -> list[str] | None:
+    """Return the existing ``.kicad_pro`` files directly inside *directory*.
+
+    None means the directory could not be read.  Callers stop their upward
+    walk instead of treating an unreadable directory as "no project here":
+    otherwise an ancestor project would be mistaken for the owner of a file
+    whose own directory is temporarily inaccessible.
+    """
     try:
         names = os.listdir(directory)
     except OSError:
-        return []
+        return None
     return sorted(
         os.path.join(directory, name)
         for name in names
@@ -86,7 +92,9 @@ def find_project_file(path: str) -> str | None:
     2. then a project whose stem equals the queried file's stem;
     3. then the lexicographically smallest filename.
 
-    The returned path always exists; ``None`` means no project was found.
+    The returned path always exists; ``None`` means no project was found, or
+    an ancestor directory could not be read (the walk stops rather than
+    silently adopting a higher project).
     """
     target = os.path.abspath(path)
 
@@ -98,6 +106,8 @@ def find_project_file(path: str) -> str | None:
 
     while True:
         candidates = _project_candidates(directory)
+        if candidates is None:
+            return None
         if len(candidates) == 1:
             return candidates[0]
         if candidates:

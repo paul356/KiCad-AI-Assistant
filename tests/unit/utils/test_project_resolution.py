@@ -104,6 +104,22 @@ class TestSeveralProjectsInOneDirectory:
 
         assert project_resolution.find_project_file(str(queried)) == str(zeta)
 
+    def test_unreadable_directory_stops_the_upward_search(self, isolated_root, monkeypatch):
+        _touch(isolated_root / "aria.kicad_pro")
+        blocked = isolated_root / "blocked"
+        blocked.mkdir()
+        sheet = _touch(blocked / "sub" / "sheet.kicad_sch")
+        real_listdir = os.listdir
+
+        def unreadable(path):
+            if os.path.abspath(path) == str(blocked):
+                raise PermissionError(13, "permission denied")
+            return real_listdir(path)
+
+        monkeypatch.setattr(project_resolution.os, "listdir", unreadable)
+
+        assert project_resolution.find_project_file(str(sheet)) is None
+
     def test_project_suffix_is_case_insensitive(self, isolated_root):
         pro = _touch(isolated_root / "ARIA.KICAD_PRO")
         sheet = _touch(isolated_root / "hardware" / "main_bus.kicad_sch")
