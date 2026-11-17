@@ -57,7 +57,7 @@
 
 A typical LLM editing session follows this pattern:
 
-1. **Read current state** — call `extract_schematic_netlist` with the `active_schematic` path from the plugin context. Inspect `analysis.components`, `analysis.power_nets`, and `analysis.signal_nets` to understand what is already present.
+1. **Read current state** — call `extract_schematic_netlist` with the schematic path from the `## Active KiCad Context` block. Inspect `analysis.components`, `analysis.power_nets`, and `analysis.signal_nets` to understand what is already present.
 2. **Find symbols** — if adding a new component, call `search_library_symbols` first to obtain the exact `library_name` and `name` values required by `add_symbol_to_schematic`. Never guess library names.
 3. **Place / edit / connect** — use the symbol-editing and wire-editing tools to make changes. After placing a symbol, call `extract_schematic_netlist` to get the new pin positions before routing wires.
 4. **Verify** — call `extract_schematic_netlist` again after all edits. Confirm expected nets exist in `analysis.signal_nets` or `analysis.power_nets` and that `analysis.floating_nets` is empty.
@@ -637,18 +637,37 @@ Routing is orthogonal (horizontal-vertical). If an endpoint lies on the interior
 
 ## 5. Context Passed by the Plugin
 
-The plugin inserts a context object into every MCP request:
+The plugin renders the canonical project record (see
+[project_state.md](project_state.md)) into the system prompt:
 
-```json
-{
-  "active_project": "/path/to/project.kicad_pro",
-  "active_schematic": "/path/to/schematic.kicad_sch",
-  "active_editor": "schematic",
-  "selected_refs": ["R1", "C3"]
-}
+```
+## Active KiCad Context
+Project root: /path/to/project
+Project file: /path/to/project/project.kicad_pro
+Schematic files:
+- project.kicad_sch
+- hardware/main_bus.kicad_sch
+PCB files:
+- hardware/main.kicad_pcb
 ```
 
-The LLM **must** use `active_schematic` as the `schematic_path` argument for all editing and inspection tools unless the engineer explicitly specifies a different file. `selected_refs` contains the reference designators currently selected in the KiCad editor and can be used to infer which components the engineer wants to modify.
+The block names no "current" file: the state tracks the project, not editor
+focus. Pass one of the listed `schematic_files`/`pcb_files` as the explicit
+path argument; the LLM must ask the engineer which file to edit when the
+decision is ambiguous. When the record is missing or invalid the whole block
+is omitted.
+
+### 5.1 Project resolution failures
+
+Project-relative paths are resolved from the same record:
+
+- a path inside `project_root` resolves to the record's `profile_file`;
+- a path outside the current project is refused with an error naming the
+  active `<project_root>` — another project's `.kicad_pro` is never adopted;
+- when the record's `profile_file` has gone stale, the upward search may
+  supply a replacement only from the same `project_root`;
+- with no valid record, the pre-edit snapshot falls back to the upward
+  search and reports the directories it searched when nothing is found.
 
 ---
 

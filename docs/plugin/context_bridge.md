@@ -2,135 +2,80 @@
 
 ## 1. Purpose
 
-The context bridge defines the minimum information the KiCad plugin collects from the active KiCad session and passes to the MCP server on every tool call. Without this, the MCP server has no reliable way to locate the correct schematic file, and the LLM cannot make contextually accurate edits.
+The context bridge turns the plugin's canonical project state into the text
+block injected into every LLM request. Collection happens in
+`kicad_plugin/project_state.py` (see [project_state.md](project_state.md));
+`kicad_plugin/context_bridge.py` is a pure formatter. It never imports
+`pcbnew`, never reads window titles and keeps no cache.
 
----
+## 2. Input
 
-## 2. Context Object
-
-Every LLM request includes the following context in the system prompt:
+The formatter receives the validated schema-v2 record:
 
 ```json
 {
-  "active_project": "/path/to/project.kicad_pro",
-  "active_schematic": "/path/to/schematic.kicad_sch",
-  "active_editor": "schematic",
-  "selected_refs": ["R1", "C3"],
-  "active_sheet": null
+  "version": 2,
+  "written_at": "2026-11-17T09:12:33Z",
+  "project_root": "/path/to/project",
+  "profile_file": "project.kicad_pro",
+  "pcb_files": ["hardware/main.kicad_pcb"],
+  "schematic_files": ["project.kicad_sch", "hardware/main_bus.kicad_sch"]
 }
 ```
 
-| Field | Type | Source | Notes |
-|-------|------|--------|-------|
-| `active_project` | `string \| null` | Upward search from the board path | Absolute path to the owning `.kicad_pro` |
-| `active_schematic` | `string \| null` | Root schematic of the resolved project | Absolute path to the project's root `.kicad_sch`, if it exists |
-| `active_editor` | `"schematic" \| "pcb" \| "unknown"` | Plugin detects which KiCad editor is focused | Determines which tools the LLM should use |
-| `selected_refs` | `string[]` | Scripting API selection query | Component references currently selected in the editor; may be empty |
-| `active_sheet` | `string \| null` | Sheet path in hierarchical schematics | `null` for flat schematics; `"/"` for root; `"/Sheet1"` for subsheets |
-
----
-
-## 3. How Context Is Collected
-
-### 3.1 Project path
-The plugin starts from the open board (`pcbnew.GetBoard().GetFileName()`) and resolves the project that owns it by walking upward from the board file's directory to the filesystem root for `*.kicad_pro`: at most one project per directory level is chosen, and the nearest level with a project wins. KiCad 10's scripting API exposes no usable project-path accessor — `board.GetProject()` returns an opaque pointer — so the directory walk is the single resolution rule.
-
-The old sibling-stem derivation (`<board stem>.kicad_pro` next to the board) is gone. Board and project stems may differ, and the board or a sheet may live in a subdirectory; only the directory walk finds the real project. When several `.kicad_pro` files share a directory, the resolver prefers the one whose stem has a matching `.kicad_sch`/`.kicad_pcb`, then the queried file's stem, then the lexicographically smallest filename.
-
-Known limitation: an unrelated `.kicad_pro` in an ancestor directory is adopted when it is the nearest project (nearest level wins); nested trees are expected to belong to the project above them.
-
-For the schematic editor, the plugin registers as an `EeschemaPlugin` and uses the scripting console to query the active frame; editor titles naming a `.kicad_sch`/`.kicad_pcb` are resolved with the same upward search. Resolution runs on every `collect_context()` / title call; nothing is cached.
-
-The plugin cannot import `kcaa`, so it ships `kicad_plugin/project_resolution.py`, a byte-for-byte copy of `kcaa/utils/project_resolution.py`. Regenerate it with `python scripts/sync_project_resolution.py`; a vendored-copy test and the release packaging step both fail on drift.
-
-### 3.2 Active schematic path
-When the board supplies context, `active_schematic` is `<project_dir>/<project_stem>.kicad_sch`, reported only when that file exists. That is the conventional project root sheet, not necessarily the sheet being edited: a nested sheet is a normal layout, and a project whose root schematic has a different name yields `null`. For the schematic editor the field may also be absent. Hierarchical sheets are discovered by the MCP server via `skip` from the root path supplied as `schematic_path`.
-
-### 3.3 Selected components
-The KiCad scripting API allows querying the current selection. On each request, the plugin calls:
-
-```python
-selected = [item.GetReference() for item in selection if hasattr(item, 'GetReference')]
-```
-
-If the scripting API is not available, `selected_refs` is an empty list.
-
-### 3.4 Active editor detection
-The plugin checks which KiCad frame is active and sets `active_editor` to `"schematic"` or `"pcb"`. This is used to filter which tool groups the LLM is told about.
-
----
-
-## 4. How Context Is Passed to the LLM
-
-The plugin inserts a context block into the system prompt before every request:
+## 3. Output
 
 ```
-You are a KiCad schematic assistant. The engineer is working in the schematic editor.
-
-Active project: /path/to/project.kicad_pro
-Active schematic: /path/to/schematic.kicad_sch
-Selected components: R1, C3
-
-When editing the schematic, use /path/to/schematic.kicad_sch as the schematic_path
-argument for all editing tools unless the engineer specifies a different file.
+## Active KiCad Context
+Project root: /path/to/project
+Project file: /path/to/project/project.kicad_pro
+Schematic files:
+- project.kicad_sch
+- hardware/main_bus.kicad_sch
+PCB files:
+- hardware/main.kicad_pcb
 ```
 
-The full context JSON is also available as a `context` field if the LLM needs to reference it programmatically.
+The block names the project and the files that belong to it. It deliberately
+does **not** name a "current" file: the state tracks the project, not which
+editor has focus, and the plugin does not infer that the only schematic is
+the one being edited.
 
----
+## 4. Invalid State
+
+When the record is missing, corrupt, `null`, or fails schema validation, the
+formatter returns an empty string. The request carries no context block at
+all — there is no `Active project: (none)` placeholder.
 
 ## 5. How Context Reaches MCP Tool Calls
 
-The tools take explicit path arguments (`schematic_path`, `project_path`). A tool call searches global libraries unless the caller passes `project_path`; nothing is filled in on the way, so each call means exactly what its arguments say. Because of that, the system prompt and the symbol/footprint skills tell the assistant to pass the active project path (shown as `Active project` in the context) whenever it works inside a project. Omitting `project_path` therefore means global libraries only — it will not find project-local libraries — and another project's libraries are never searched.
-
----
+The tools take explicit path arguments (`schematic_path`, `project_path`). A
+tool call searches global libraries unless the caller passes `project_path`;
+nothing is filled in on the way, so each call means exactly what its
+arguments say. Because of that, the system prompt and the symbol/footprint
+skills tell the assistant to pass the active project path shown in this block
+whenever it works inside a project. Omitting `project_path` therefore means
+global libraries only — it will not find project-local libraries — and
+another project's libraries are never searched.
 
 ## 6. Multi-Sheet Schematics
 
-KiCad schematics can have hierarchical sheets. The tool surface works as follows:
-
-- All editing tools operate on a single `.kicad_sch` file at a time
-- The `active_schematic` context points to the project's conventional root schematic when it exists; it is not necessarily the sheet currently being edited
-- The `extract_schematic_netlist` tool recursively follows sheet references and returns connectivity for the full hierarchy
-- `find_component_connections(project_path, component_ref)` searches across all sheets in the project
-- If the engineer is working on a specific subsheet, they should tell the LLM the subsheet name or path; the LLM can look up the file path from the netlist result
+- All editing tools operate on a single `.kicad_sch` file at a time.
+- `schematic_files` lists every sheet file discovered under the project root;
+  the engineer or the netlist tools identify which one to edit.
+- `extract_schematic_netlist` recursively follows sheet references and returns
+  connectivity for the full hierarchy.
+- `find_component_connections(project_path, component_ref)` searches across
+  all sheets in the project.
+- If the engineer is working on a specific subsheet, they should tell the LLM
+  the subsheet name or path; the LLM can look up the file path from the
+  netlist result.
 
 ### Sheet path convention
-KiCad uses a sheet path like `/Sheet1/U1` to identify components in hierarchical designs. The netlist tools return these paths. When the LLM needs to edit a component in a subsheet, it should:
-1. Look up the `.kicad_sch` file for that sheet from the `extract_schematic_netlist` result — sub-sheets appear as `type="sheet"` components carrying their file paths
+KiCad uses a sheet path like `/Sheet1/U1` to identify components in
+hierarchical designs. The netlist tools return these paths. When the LLM
+needs to edit a component in a subsheet, it should:
+1. Look up the `.kicad_sch` file for that sheet from the
+   `extract_schematic_netlist` result — sub-sheets appear as `type="sheet"`
+   components carrying their file paths
 2. Use that file as `schematic_path` for editing tools
-
----
-
-## 7. Context When No Project Is Open
-
-If the plugin cannot determine the active project (e.g., KiCad is open but no project is loaded):
-- `active_project` and `active_schematic` are `null`
-- The plugin shows a notice: "No active project detected. Open a project to use the assistant."
-- Tool calls are blocked until context is available
-
----
-
-## 8. Future Extension: PCB Context
-
-When PCB editing support is added, the context object will extend to include:
-
-```json
-{
-  "active_pcb": "/path/to/board.kicad_pcb",
-  "active_editor": "pcb",
-  "selected_refs": ["U1"],
-  "pcb_layers": ["F.Cu", "B.Cu"]
-}
-```
-
-The system prompt will switch to PCB-focused instructions and expose PCB tool groups. No changes to the context bridge protocol are required; the existing fields remain and new fields are added.
-
----
-
-## 9. Replacing Directory-Scan Assumptions
-
-The current MCP server uses `KICAD_SEARCH_PATHS` to scan for projects. In the plugin-facing profile:
-- `KICAD_SEARCH_PATHS` is not used for tool calls; paths come from the plugin context instead
-- `list_projects` and `get_project_structure` are deferred; the plugin provides project identity directly
-- Symbol library discovery still uses `KICAD_USER_DIR` and `KICAD_SEARCH_PATHS` for the symbol index, which is acceptable (the symbol index is read-only discovery, not project-specific)

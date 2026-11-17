@@ -27,8 +27,9 @@ inside the active project directory.
 
 ### KiCad Plugin (Python, runs inside KiCad)
 - Renders the chat panel, tool-call log, and approve/reject controls inside a `wx`-based panel.
-- Reads context from KiCad's scripting API on each request: active project path, active schematic
-  path, active editor type (`SCH_EDIT_FRAME` vs `PCB_EDIT_FRAME`), and current selection.
+- Publishes one canonical project record (project root, project file, PCB and
+  schematic manifests) and renders it into each request's context block. Only
+  the watch's write path probes KiCad's board; readers use the record.
 - Spawns the MCP server subprocess and monitors it via a background thread.
 - After each LLM turn, calls `SCH_EDIT_FRAME.LoadSchematic()` (or equivalent) to reload any files
   the server modified.
@@ -103,7 +104,8 @@ plugin surfaces an error banner with a **Restart** button that re-runs the start
 ## 4. Agentic Loop
 
 1. Engineer submits a request in the chat panel.
-2. Plugin reads current KiCad context (project path, open schematic, selection).
+2. Plugin renders the canonical project record into the context block (no editor
+   probe on the request path).
 3. Plugin calls `LLMClient.run_turn(context, history, tools)`.
 4. Client sends the full message to the LLM API.
 5. If the response contains tool calls:

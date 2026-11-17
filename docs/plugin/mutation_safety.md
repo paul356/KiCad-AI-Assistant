@@ -196,41 +196,57 @@ plugin data directory.
 
 ### 9.1 How the plugin publishes the open project
 
-The panel resolves the open project's `.kicad_pro` by walking upward from the board path: at most one project per directory level, nearest level wins. KiCad 10's scripting API exposes no usable project-path accessor, so `board.GetProject()` is not used. The panel never derives a project path from a sibling file stem, so projects whose board/sheet stem differs from the project stem publish the correct root.
+The panel probes the open board (`pcbnew.GetBoard().GetFileName()`) and
+resolves the owning `.kicad_pro` by walking upward: at most one project per
+directory level, nearest level wins. KiCad 10's scripting API exposes no
+usable project-path accessor, so `board.GetProject()` is not used. The panel
+never derives a project path from a sibling file stem.
 
 `ServerManager` starts the server with `KCAA_PROJECT_STATE_FILE` pointing at
-`<kcaa data dir>/active_project.json`. The panel atomically writes that file
-(temp file + `os.replace`) whenever it knows the active project:
+`<kcaa data dir>/project_state.json`. The panel atomically writes the schema
+v2 record (temp file + `os.replace`) on the first successful probe and
+whenever the project or its file manifest changes:
 
 ```json
-{"project_root": "/home/user/MyProject"}
+{
+  "version": 2,
+  "written_at": "2026-11-17T09:12:33Z",
+  "project_root": "/home/user/MyProject",
+  "profile_file": "MyProject.kicad_pro",
+  "pcb_files": ["MyProject.kicad_pcb"],
+  "schematic_files": ["MyProject.kicad_sch"]
+}
 ```
 
-With no project open (two consecutive empty probes after the project closes)
-it writes `{"project_root": null}`. The server re-reads the (tiny) file on
-every path validation and re-points the project root **in place** when the
-value changed — switching projects needs no server restart and no panel
-teardown. A missing, unreadable or malformed state file keeps the current
-root; the file is written by the plugin, never by the model.
+The writer never emits `null` or an empty string. The server re-reads the
+(tiny) file on every path validation and re-points the project root **in
+place** when it changes — switching projects needs no server restart and no
+panel teardown. A missing, unreadable, malformed, `null`, old-schema or
+otherwise invalid record **clears** the project root, leaving only the static
+KiCad roots; the file is written by the plugin, never by the model. See
+[project_state.md](project_state.md) for the full contract.
 
 ### 9.2 Empty project root is normal
 
-An empty project root (no state file, or `null`) is a normal state: matching
-then falls back to the KiCad directory roots. Server-generated temp files are
-written to a private `0o700` directory under the kcaa data directory — never
-into the project or a KiCad library directory — so they keep working with no
-project at all.
+An empty project root (no state file, or an invalid record) is a normal
+state: matching then falls back to the KiCad directory roots. Server-generated
+temp files are written to a private `0o700` directory under the kcaa data
+directory — never into the project or a KiCad library directory — so they
+keep working with no project at all.
 
 ### 9.3 Pre-edit project snapshot
 
 Before an auto-snapshot mutation the plugin resolves the owning `.kicad_pro`
-with the same upward search used for the context block and calls
-`save_project_version` with that project file plus
-`include_files=[<file being edited>]`. The snapshot therefore targets the
-resolved project — never a fabricated sibling — and always contains the
-nested sheet or board about to be modified. If no `.kicad_pro` exists anywhere
-above the file, the tool call fails before the document is touched; the
-snapshot is not skipped silently.
+from the canonical state record: a path inside the published `project_root`
+uses its `profile_file`; a path outside that root is refused with an error
+naming the active project. When the record's `profile_file` has gone stale,
+the upward search may supply a replacement only from the same
+`project_root`; with no valid record the upward search decides. The snapshot
+call receives that project file plus `include_files=[<file being edited>]`.
+The snapshot therefore targets the resolved project — never a fabricated
+sibling — and always contains the nested sheet or board about to be modified.
+When no project can be resolved, the tool call fails before the document is
+touched; the snapshot is not skipped silently.
 
 Snapshot state is keyed by **(project, file) per turn**: editing file A and
 then file B in the same project within one turn produces two archives, each
