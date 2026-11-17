@@ -90,20 +90,29 @@ def _snapshot_include_files(
     """Return the absolute files a pre-edit snapshot must cover.
 
     The canonical project record lists every board and sheet under
-    ``project_root``.  When it names the same root as *project_file*, those
-    files are returned so one archive holds the whole project; *touched* is
-    always appended for the file about to change.  A missing, invalid or
-    empty record degrades to *touched* alone, leaving the default trio
-    (``.kicad_pro`` + same-stem root sch/pcb) exactly as before.
+    ``project_root``; when it agrees with *project_file*'s directory those
+    files are returned so one archive holds the whole project.  *touched* is
+    always appended and duplicates are dropped in insertion order.
+
+    Raises :class:`ProjectSnapshotUnavailable` instead of degrading to
+    *touched* whenever the record is missing, describes another root, or
+    the project file has disappeared.
     """
-    files: list[str] = []
     record = project_state.read_state(state_file)
-    if record is not None and os.path.realpath(record["project_root"]) == os.path.realpath(
-        os.path.dirname(project_file)
-    ):
-        root = record["project_root"]
-        by_kind = record["pcb_files"] + record["schematic_files"]
-        files.extend(os.path.join(root, rel) for rel in by_kind)
+    if record is None:
+        raise ProjectSnapshotUnavailable(
+            "No valid project state is published; reopen the plugin panel and retry."
+        )
+    root = record["project_root"]
+    if os.path.realpath(os.path.dirname(os.path.abspath(project_file))) != os.path.realpath(root):
+        raise ProjectSnapshotUnavailable(
+            "The project state and the resolved project disagree; reopen the panel and retry."
+        )
+    if not os.path.isfile(project_file):
+        raise ProjectSnapshotUnavailable(
+            f"The project file <{project_file}> no longer exists; reopen the panel and retry."
+        )
+    files = [os.path.join(root, rel) for rel in record["pcb_files"] + record["schematic_files"]]
     files.append(os.path.abspath(touched))
     return list(dict.fromkeys(files))
 
@@ -3173,9 +3182,18 @@ class LLMClient:
                         save_result.get("error", "unknown error"),
                     )
 
+                try:
+                    include_files = _snapshot_include_files(project_path, path, self._state_file)
+                except ProjectSnapshotUnavailable as exc:
+                    # A degraded archive silently drops project files the edit
+                    # may touch; fail before the edit tool runs instead.
+                    return self._failure_carrying_markers(
+                        {},
+                        f"Failed to save project version before {tool_name}: {exc}",
+                    )
                 snapshot_args = {
                     "project_file": project_path,
-                    "include_files": _snapshot_include_files(project_path, path, self._state_file),
+                    "include_files": include_files,
                 }
                 snapshot_result = self._call_mcp_tool_guarded(
                     "save_project_version", snapshot_args, cancel_event

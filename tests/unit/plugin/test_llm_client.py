@@ -8407,14 +8407,22 @@ class TestWholeProjectSnapshot:
             str(nested_sch),
         ]
 
-    def test_missing_state_record_falls_back_to_touched_file(self, tmp_path):
+    def test_include_list_ignores_files_outside_the_manifest(self, tmp_path):
+        pro, _root_sch, nested_sch, _pcb, state_file = self._project(tmp_path)
+        unlisted = pro.parent / "unlisted.kicad_sch"
+        unlisted.write_text("unlisted\n")
+
+        files = llm_client._snapshot_include_files(str(pro), str(nested_sch), str(state_file))
+
+        assert str(unlisted) not in files
+
+    def test_missing_state_record_raises(self, tmp_path):
         pro, _root_sch, nested_sch, _pcb, _state_file = self._project(tmp_path)
 
-        assert llm_client._snapshot_include_files(str(pro), str(nested_sch), None) == [
-            str(nested_sch)
-        ]
+        with pytest.raises(llm_client.ProjectSnapshotUnavailable, match="retry"):
+            llm_client._snapshot_include_files(str(pro), str(nested_sch), None)
 
-    def test_state_record_for_another_root_is_ignored(self, tmp_path):
+    def test_state_record_for_another_root_raises(self, tmp_path):
         pro, _root_sch, nested_sch, _pcb, state_file = self._project(tmp_path)
         other = tmp_path / "other"
         other.mkdir()
@@ -8424,9 +8432,57 @@ class TestWholeProjectSnapshot:
         (other / "other.kicad_pro").write_text("{}\n")
         state_file.write_text(json.dumps(payload), encoding="utf-8")
 
-        assert llm_client._snapshot_include_files(str(pro), str(nested_sch), str(state_file)) == [
-            str(nested_sch)
-        ]
+        with pytest.raises(llm_client.ProjectSnapshotUnavailable, match="disagree"):
+            llm_client._snapshot_include_files(str(pro), str(nested_sch), str(state_file))
+
+    def test_missing_project_file_raises(self, tmp_path):
+        pro, _root_sch, nested_sch, _pcb, state_file = self._project(tmp_path)
+        missing_project = pro.parent / "gone.kicad_pro"
+
+        with pytest.raises(llm_client.ProjectSnapshotUnavailable, match="no longer exists"):
+            llm_client._snapshot_include_files(
+                str(missing_project), str(nested_sch), str(state_file)
+            )
+
+    def test_snapshot_unavailable_aborts_before_edit(self, tmp_path, monkeypatch):
+        pro, _root_sch, nested_sch, _pcb, state_file = self._project(tmp_path)
+        client = _make_client()
+        client._state_file = str(state_file)
+
+        def boom(*args, **kwargs):
+            raise llm_client.ProjectSnapshotUnavailable("state disagrees")
+
+        monkeypatch.setattr(llm_client, "_snapshot_include_files", boom)
+        tool_response = {
+            "finish_reason": "tool_calls",
+            "message": {
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "tc1",
+                        "type": "function",
+                        "function": {
+                            "name": "set_symbol_property",
+                            "arguments": json.dumps({"schematic_path": str(nested_sch)}),
+                        },
+                    }
+                ],
+            },
+        }
+        final_response = {"finish_reason": "stop", "message": {"content": "done"}}
+        client._call_llm = MagicMock(side_effect=[tool_response, final_response])
+        client._enabled_tools = {"set_symbol_property"}
+
+        with patch("kicad_plugin.llm_client.call_mcp_tool") as mock_call_tool:
+            mock_call_tool.return_value = {"success": True}
+            result = client.run("edit nested sheet", context_block="")
+
+        assert result == "done"
+        assert [c.args[1] for c in mock_call_tool.call_args_list] == ["save_document"]
+        failed = json.loads([m for m in client._history if m["role"] == "tool"][0]["content"])
+        assert failed["success"] is False
+        assert "Failed to save project version before set_symbol_property" in failed["error"]
+        assert "state disagrees" in failed["error"]
 
     def test_snapshot_call_covers_the_whole_project(self, tmp_path):
         pro, root_sch, nested_sch, pcb, state_file = self._project(tmp_path)

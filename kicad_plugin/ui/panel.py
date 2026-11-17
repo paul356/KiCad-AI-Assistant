@@ -46,8 +46,9 @@ def _take_autoroute_snapshot(
     """Snapshot the project before FreeRouting touches the board.
 
     Returns ``(backup_path, error)``.  When the board has no owning
-    ``.kicad_pro``, *error* is an actionable message and the caller must
-    abort before launching the router.  Other snapshot failures keep the
+    ``.kicad_pro``, or the published record cannot name the whole project,
+    *error* is an actionable message and the caller must abort before
+    launching the router.  Transport-level snapshot failures keep the
     previous behaviour: log and route without a snapshot.
     """
     if not board_path or not os.path.isfile(board_path):
@@ -57,7 +58,11 @@ def _take_autoroute_snapshot(
             "then retry."
         )
 
-    from ..llm_client import _resolve_project, _snapshot_include_files
+    from ..llm_client import (
+        ProjectSnapshotUnavailable,
+        _resolve_project,
+        _snapshot_include_files,
+    )
 
     project_path, project_error = _resolve_project(board_path, state_file)
     if project_path is None:
@@ -70,12 +75,17 @@ def _take_autoroute_snapshot(
             )
         )
     try:
+        include_files = _snapshot_include_files(project_path, board_path, state_file)
+    except ProjectSnapshotUnavailable as exc:
+        log.warning("autoroute: project snapshot unavailable: %s", exc)
+        return "", str(exc)
+    try:
         result = call_tool(
             base_url,
             "save_project_version",
             {
                 "project_file": project_path,
-                "include_files": _snapshot_include_files(project_path, board_path, state_file),
+                "include_files": include_files,
             },
         )
     except Exception as exc:  # noqa: BLE001 -- snapshot must not crash the UI
