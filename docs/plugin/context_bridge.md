@@ -30,11 +30,14 @@ The formatter receives the validated schema-v2 record:
 Project root: /path/to/project
 Project file: /path/to/project/project.kicad_pro
 Schematic files:
-- project.kicad_sch
-- hardware/main_bus.kicad_sch
+- /path/to/project/project.kicad_sch
+- /path/to/project/hardware/main_bus.kicad_sch
 PCB files:
-- hardware/main.kicad_pcb
+- /path/to/project/hardware/main.kicad_pcb
 ```
+
+Manifest entries are rendered as absolute paths under `Project root`, so the
+assistant can pass them directly as `schematic_path` / `pcb_path` arguments.
 
 The block names the project and the files that belong to it. It deliberately
 does **not** name a "current" file: the state tracks the project, not which
@@ -53,10 +56,10 @@ The tools take explicit path arguments (`schematic_path`, `project_path`). A
 tool call searches global libraries unless the caller passes `project_path`;
 nothing is filled in on the way, so each call means exactly what its
 arguments say. Because of that, the system prompt and the symbol/footprint
-skills tell the assistant to pass the active project path shown in this block
-whenever it works inside a project. Omitting `project_path` therefore means
-global libraries only — it will not find project-local libraries — and
-another project's libraries are never searched.
+skills tell the assistant to pass the `Project root` shown in this block as
+`project_path` whenever it works inside a project. Omitting `project_path`
+therefore means global libraries only — it will not find project-local
+libraries — and another project's libraries are never searched.
 
 ## 6. Multi-Sheet Schematics
 

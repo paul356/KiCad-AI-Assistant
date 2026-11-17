@@ -645,29 +645,32 @@ The plugin renders the canonical project record (see
 Project root: /path/to/project
 Project file: /path/to/project/project.kicad_pro
 Schematic files:
-- project.kicad_sch
-- hardware/main_bus.kicad_sch
+- /path/to/project/project.kicad_sch
+- /path/to/project/hardware/main_bus.kicad_sch
 PCB files:
-- hardware/main.kicad_pcb
+- /path/to/project/hardware/main.kicad_pcb
 ```
 
-The block names no "current" file: the state tracks the project, not editor
-focus. Pass one of the listed `schematic_files`/`pcb_files` as the explicit
-path argument; the LLM must ask the engineer which file to edit when the
-decision is ambiguous. When the record is missing or invalid the whole block
-is omitted.
+Manifest entries are absolute paths under `Project root`. The block names no
+"current" file: the state tracks the project, not editor focus. Pass one of
+the listed schematic/PCB paths as the explicit path argument; the LLM must
+ask the engineer which file to edit when the decision is ambiguous. When the
+record is missing or invalid the whole block is omitted.
 
 ### 5.1 Project resolution failures
 
-Project-relative paths are resolved from the same record:
+Project-relative paths are resolved from the same record, with no fallback
+search:
 
 - a path inside `project_root` resolves to the record's `profile_file`;
 - a path outside the current project is refused with an error naming the
   active `<project_root>` — another project's `.kicad_pro` is never adopted;
-- when the record's `profile_file` has gone stale, the upward search may
-  supply a replacement only from the same `project_root`;
-- with no valid record, the pre-edit snapshot falls back to the upward
-  search and reports the directories it searched when nothing is found.
+- with no valid record, or when the recorded project file has disappeared,
+  resolution fails with a message telling the user to reopen the panel and
+  retry;
+- the same rules back the pre-edit and Auto Route snapshots: a snapshot that
+  cannot name the whole project fails before any edit instead of degrading
+  to the touched file alone.
 
 ---
 

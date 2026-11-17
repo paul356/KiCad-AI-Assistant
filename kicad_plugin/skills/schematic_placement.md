@@ -52,7 +52,8 @@ tools: [extract_schematic_netlist, add_symbol_to_schematic, place_symbol_relativ
   (library file) and, for parts already placed,
   **update_schematic_symbol_pin(schematic_path, lib_id, pins)** (the
   schematic's cached `lib_symbols` copy that KiCad actually renders). For the
-  library tool `project_dir` is required (pass `active_project`): its
+  library tool `project_dir` is required (pass `active_project`, the
+  `Project root` from the context block): its
   `sym-lib-table` is searched first, then the global table. `lib_id` there is
   `"Library:Symbol"` and is split on the first colon; for the schematic tool
   `lib_id` is matched by exact cached entry name, so no colon is required.

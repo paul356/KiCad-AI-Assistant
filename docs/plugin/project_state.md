@@ -66,27 +66,35 @@ record, the file is not written at all, so an idle project never churns its
 mtime.
 
 At startup the panel writes the state file *before* auto-restoring a session,
-so restore judges ownership against this run's record.
+so restore judges ownership against this run's record.  A session is restored
+only when this run's probe produced a record: a stale record left by an
+earlier run (with no board open now) is never used to restore a session.
+The same rule applies when a hidden panel is shown again.
+
+When the state file matches the scanned record, it is left untouched.  The
+comparison is against the file as it is on disk, so a state file deleted or
+replaced externally is recreated by the next scan (within one scan tick on
+the watch, five seconds by default).
 
 ## 6. Readers
 
 | Reader | Uses the record for |
 |---|---|
 | Panel `_current_project_path()` | Session auto-restore, Load dialog, context block, session stamps |
-| `kicad_plugin/context_bridge.py` | `## Active KiCad Context` system-prompt block |
+| `kicad_plugin/context_bridge.py` | `## Active KiCad Context` system-prompt block (absolute file paths) |
 | `_project_path_for()` (`kicad_plugin/llm_client.py`) | Pre-edit snapshots and project-relative paths |
 | `PathValidator` (`kcaa/utils/path_validator.py`) | The project trust root |
 
-The panel read path has **no fallback**: a missing, corrupt, `null` or invalid
-record means "no project". Auto-restore loads no project session, the Load
+Every read path **fails closed**: a missing, corrupt, `null` or invalid
+record means "no project".  Auto-restore loads no project session, the Load
 dialog lists only unowned sessions, the context block is omitted, and session
 stamps are empty.
 
-`_project_path_for` is the one exception with a defined fallback: when a
-valid record's `profile_file` has gone stale (renamed or deleted), the upward
-search may supply the replacement, but only if it lives in the same
-`project_root`. A path outside the root is refused even when another valid
-project exists there.
+The pre-edit resolver has no fallback either.  With no valid record it
+returns no project and an actionable "reopen the plugin panel and retry"
+error; a path outside `project_root` is refused; a recorded `profile_file`
+that no longer exists also fails with a retry message.  There is no upward
+filesystem search on the read side.
 
 ## 7. Invariants
 

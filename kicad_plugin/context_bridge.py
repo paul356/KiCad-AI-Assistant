@@ -30,7 +30,7 @@ def context_to_system_prompt_block(state: dict | None) -> str:
         f"Project file: {project_file}",
         "Schematic files:",
     ]
-    lines.extend(f"- {name}" for name in state.get("schematic_files", ()))
+    lines.extend(f"- {os.path.join(root, name)}" for name in state.get("schematic_files", ()))
     lines.append("PCB files:")
-    lines.extend(f"- {name}" for name in state.get("pcb_files", ()))
+    lines.extend(f"- {os.path.join(root, name)}" for name in state.get("pcb_files", ()))
     return "\n".join(lines)

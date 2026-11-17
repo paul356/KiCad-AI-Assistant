@@ -97,24 +97,22 @@ class TestProjectFileSet:
 
         assert list(files).count("hardware/main_bus.kicad_sch") == 1
 
-    def test_outside_and_missing_entries_are_skipped(self, tmp_path):
-        pro, root_sch, sheet = _project(tmp_path)
+    def test_missing_entry_raises(self, tmp_path):
+        pro, _root_sch, _sheet = _project(tmp_path)
+        missing = pro.parent / "gone.kicad_sch"
+
+        with pytest.raises(ValueError, match="not an existing file"):
+            version_manager.project_file_set(str(pro), extra_files=[str(missing)])
+
+    def test_outside_entry_raises(self, tmp_path):
+        pro, _root_sch, _sheet = _project(tmp_path)
         outside = tmp_path / "outside.kicad_sch"
         outside.write_text("outside\n")
         traversal = os.path.join(str(pro.parent), "..", "outside.kicad_sch")
 
-        files = version_manager.project_file_set(
-            str(pro),
-            extra_files=[str(outside), traversal, str(pro.parent / "gone.kicad_sch"), str(sheet)],
-        )
-
-        assert set(files) == {
-            "aria.kicad_pro",
-            "aria.kicad_sch",
-            "hardware/main_bus.kicad_sch",
-        }
-        assert files["hardware/main_bus.kicad_sch"] == str(sheet)
-        assert files["aria.kicad_sch"] == str(root_sch)
+        for entry in (str(outside), traversal):
+            with pytest.raises(ValueError, match="outside the project directory"):
+                version_manager.project_file_set(str(pro), extra_files=[entry])
 
     def test_extra_files_keep_input_order_after_default_set(self, tmp_path):
         pro, _, sheet = _project(tmp_path)
@@ -283,23 +281,22 @@ class TestWholeProjectSnapshot:
         assert (pro.parent / "sub" / "b.kicad_sch").read_text() == "b v1\n"
         assert (pro.parent / "sub" / "a.kicad_pcb").read_text() == "a pcb v1\n"
 
-    def test_missing_and_outside_entries_do_not_fail_the_snapshot(self, tmp_path):
+    def test_missing_and_outside_entries_fail_the_snapshot(self, tmp_path):
         pro, files = _whole_project(tmp_path)
         outside = tmp_path / "outside.kicad_sch"
         outside.write_text("outside\n")
-        includes = [
-            str(outside),
-            str(pro.parent / "gone.kicad_sch"),
-            *(str(path) for path in files),
-        ]
 
-        archive = version_manager.save_project_version(str(pro), include_files=includes)
-
-        with tarfile.open(archive, "r:gz") as tar:
-            names = set(tar.getnames())
-        assert "sub/a.kicad_sch" in names
-        assert "outside.kicad_sch" not in names
-        assert "gone.kicad_sch" not in names
+        with pytest.raises(ValueError, match="outside the project directory"):
+            version_manager.save_project_version(
+                str(pro),
+                include_files=[str(outside), *(str(path) for path in files)],
+            )
+        with pytest.raises(ValueError, match="not an existing file"):
+            version_manager.save_project_version(
+                str(pro),
+                include_files=[str(pro.parent / "gone.kicad_sch"), *(str(p) for p in files)],
+            )
+        assert version_manager.list_project_versions(str(pro)) == []
 
     def test_retention_prunes_the_oldest_archive(self, tmp_path):
         pro, files = _whole_project(tmp_path)

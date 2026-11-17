@@ -18,15 +18,15 @@ def _state(root="/proj", profile="board.kicad_pro"):
     }
 
 
-def test_renders_root_project_file_and_both_manifests():
+def test_renders_root_project_file_and_absolute_manifests():
     block = context_to_system_prompt_block(_state())
 
     assert block.startswith("## Active KiCad Context")
     assert "Project root: /proj" in block
     assert "Project file: /proj/board.kicad_pro" in block
-    assert "- board.kicad_sch" in block
-    assert "- hardware/main_bus.kicad_sch" in block
-    assert "- hardware/main.kicad_pcb" in block
+    assert "- /proj/board.kicad_sch" in block
+    assert "- /proj/hardware/main_bus.kicad_sch" in block
+    assert "- /proj/hardware/main.kicad_pcb" in block
 
 
 def test_invalid_state_renders_nothing_at_all():

@@ -1531,8 +1531,8 @@ _PROMPT_SCHEMATIC = """\
 # Hard rules (schematic)
 - Always call extract_schematic_netlist (or get_schematic_sheet_info) for
   state before making spatial changes. Never invent coordinates.
-- Use the active_schematic path from the context block below as the
-  schematic_path argument for every editing tool.
+- Use an absolute path listed under Schematic files in the context block below
+  as the schematic_path argument for every editing tool.
 - Mutations auto-write a .kicad_sch.bak backup; the framework handles the
   version snapshot and final reload automatically.
 - Report errors clearly. Do not silently retry failed tool calls.
@@ -1558,8 +1558,8 @@ _PROMPT_PCB = """\
 # Hard rules (PCB)
 - Always call get_board_info + list_footprints before making spatial changes.
   Never invent footprint coordinates.
-- Use the active_pcb path from the context block below as the pcb_path
-  argument for every PCB editing tool.
+- Use an absolute path listed under PCB files in the context block below as
+  the pcb_path argument for every PCB editing tool.
 - Mutations auto-write a .kicad_pcb.bak backup; the framework handles the
   version snapshot and final reload automatically.
 - Report errors clearly. Do not silently retry failed tool calls.

@@ -101,6 +101,7 @@ def _fake_panel(module, config_dir, probe=None):
         "_autoload_session",
         "_on_load_session",
         "_init_llm_client",
+        "_on_panel_show",
     ):
         setattr(obj, name, types.MethodType(getattr(module.AssistantPanel, name), obj))
     obj._settings = types.SimpleNamespace(config_dir=str(config_dir))
@@ -246,6 +247,47 @@ class TestStartupOrder:
         assert obj._published is not None
         assert obj.started == [panel._PROJECT_TICK_MS]
 
+    def test_failed_probe_does_not_restore_the_previous_run_session(
+        self, panel, tmp_path, monkeypatch
+    ):
+        root, pro = _project(tmp_path)
+        cfg = tmp_path / "cfg"
+        _publish(_fake_panel(panel, cfg), pro)
+        session = cfg / "kicad_ai_sessions" / "session_owned.json"
+        payload = sstore.make_payload([{"type": "user", "text": "hello"}], [], str(pro), [])
+        assert sstore.save_session(str(cfg), session.name, payload) is None
+        sstore.update_current_link(str(cfg), session.name)
+
+        # This run sees no board: the valid record on disk is stale.
+        obj = _fake_panel(panel, cfg, probe=None)
+
+        class _Client:
+            def __init__(self, settings, base_url):
+                pass
+
+        monkeypatch.setattr(llm_client, "LLMClient", _Client)
+
+        obj._init_llm_client()
+
+        assert obj._conv_entries == []
+
+    def test_panel_show_does_not_restore_from_a_stale_record(self, panel, tmp_path):
+        root, pro = _project(tmp_path)
+        cfg = tmp_path / "cfg"
+        _publish(_fake_panel(panel, cfg), pro)
+        obj = _fake_panel(panel, cfg, probe=None)
+        obj._llm_client = object()
+        obj._recovery_checked = True
+        obj._update_check_started = True
+        obj.autoload_calls = []
+        obj._autoload_session = lambda prompt_if_missing=False: obj.autoload_calls.append(
+            prompt_if_missing
+        )
+
+        obj._on_panel_show(types.SimpleNamespace(IsShown=lambda: True, Skip=lambda: None))
+
+        assert obj.autoload_calls == []
+
 
 class TestWritePath:
     def test_probe_failure_writes_nothing(self, panel, tmp_path):
@@ -310,6 +352,21 @@ class TestTickTiming:
 
         assert state_file.read_bytes() == before
         assert os.stat(state_file).st_mtime_ns == before_mtime
+
+    def test_externally_deleted_state_file_is_recreated_on_scan(self, panel, tmp_path):
+        root, pro = _project(tmp_path)
+        cfg = tmp_path / "cfg"
+        obj = _fake_panel(panel, cfg, probe=str(pro))
+        _publish(obj, pro)
+        obj._start_project_watch()
+        state_file = cfg / pstate.PROJECT_STATE_FILENAME
+        state_file.unlink()
+        assert obj._current_project_path() is None
+
+        for _ in range(panel._PROJECT_SCAN_TICKS):
+            obj._on_project_watch_tick(None)
+
+        assert obj._current_project_path() == str(pro)
 
     def test_project_switch_writes_and_autoloads_once(self, panel, tmp_path):
         root_a, pro_a = _project(tmp_path, "a")

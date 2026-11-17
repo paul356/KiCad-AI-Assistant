@@ -315,19 +315,19 @@ class TestSaveProjectVersionIncludeFiles:
         with tarfile.open(result["archive_path"], "r:gz") as tar:
             assert "hardware/main_bus.kicad_sch" in tar.getnames()
 
-    def test_outside_entry_is_skipped(self, tmp_path):
+    def test_outside_entry_fails_the_tool_call(self, tmp_path):
         pro, _ = self._nested_project(tmp_path)
         outside = tmp_path / "outside.kicad_sch"
         outside.write_text("outside\n")
 
         result = _run(self.fn(str(pro), include_files=[str(outside)], ctx=None))
 
-        assert result["success"] is True
-        assert "outside.kicad_sch" not in result["files"]
-        with tarfile.open(result["archive_path"], "r:gz") as tar:
-            assert "outside.kicad_sch" not in tar.getnames()
+        assert "error" in result
+        assert "outside.kicad_sch" in result["error"]
+        assert "outside the project directory" in result["error"]
+        assert not (pro.parent / ".versions").exists()
 
-    def test_parent_traversal_entry_is_skipped(self, tmp_path):
+    def test_parent_traversal_entry_fails_the_tool_call(self, tmp_path):
         pro, _ = self._nested_project(tmp_path)
         outside = tmp_path / "outside.kicad_sch"
         outside.write_text("outside\n")
@@ -335,19 +335,19 @@ class TestSaveProjectVersionIncludeFiles:
 
         result = _run(self.fn(str(pro), include_files=[traversal], ctx=None))
 
-        assert result["success"] is True
-        assert "outside.kicad_sch" not in result["files"]
+        assert "error" in result
+        assert "outside the project directory" in result["error"]
 
-    def test_missing_entry_is_skipped_and_archive_still_created(self, tmp_path):
+    def test_missing_entry_fails_the_tool_call_without_an_archive(self, tmp_path):
         pro, sheet = self._nested_project(tmp_path)
         missing = str(pro.parent / "gone.kicad_sch")
 
         result = _run(self.fn(str(pro), include_files=[missing, str(sheet)], ctx=None))
 
-        assert result["success"] is True
-        assert result["created"] is True
-        assert "gone.kicad_sch" not in result["files"]
-        assert "hardware/main_bus.kicad_sch" in result["files"]
+        assert "error" in result
+        assert missing in result["error"]
+        assert "not an existing file" in result["error"]
+        assert not (pro.parent / ".versions").exists()
 
     def test_default_set_duplicate_is_skipped(self, tmp_path):
         pro, _ = self._nested_project(tmp_path)

@@ -211,7 +211,7 @@ whenever the project or its file manifest changes:
 {
   "version": 2,
   "written_at": "2026-11-17T09:12:33Z",
-  "project_root": "/home/user/MyProject",
+  "project_root": "<project_root>",
   "profile_file": "MyProject.kicad_pro",
   "pcb_files": ["MyProject.kicad_pcb"],
   "schematic_files": ["MyProject.kicad_sch"]
@@ -239,21 +239,23 @@ keep working with no project at all.
 Before an auto-snapshot mutation the plugin resolves the owning `.kicad_pro`
 from the canonical state record: a path inside the published `project_root`
 uses its `profile_file`; a path outside that root is refused with an error
-naming the active project. When the record's `profile_file` has gone stale,
-the upward search may supply a replacement only from the same
-`project_root`; with no valid record the upward search decides. The snapshot
-call receives that project file plus `include_files` naming **the whole
-project**: every `pcb_files` and `schematic_files` entry from the state
+naming the active project. There is no fallback search: with no valid record,
+or when the recorded project file has disappeared, the tool call fails
+before the document is touched and reports an actionable retry message. The
+snapshot call receives that project file plus `include_files` naming **the
+whole project**: every `pcb_files` and `schematic_files` entry from the state
 record, converted to absolute paths under `project_root`, together with the
-file about to be edited. A missing, invalid or empty record degrades to the
-touched file alone, which is exactly the default trio (`.kicad_pro`,
-same-stem root `.kicad_sch`, same-stem `.kicad_pcb`) — the snapshot never
-fails because the state is unavailable. When no project can be resolved,
-the tool call fails before the document is touched; the snapshot is not
-skipped silently.
+file about to be edited.
+
+The include list never degrades.  If the record is missing, describes a
+different root than the resolved project, or the project file no longer
+exists, the pre-edit snapshot raises and the edit tool is not called.  Each
+`include_files` entry must be an existing file inside the project directory;
+a bad entry fails the snapshot instead of being dropped.
 
 The same rule backs the Auto Route pre-routing snapshot, so FreeRouting
-cannot change a nested board that the archive does not cover.
+cannot change a nested board that the archive does not cover; an
+unresolvable project or include list aborts the route with the same message.
 
 Snapshot state is keyed by **(project, file) per turn**: editing file A and
 then file B in the same project within one turn produces a snapshot before

@@ -28,8 +28,10 @@ inside the active project directory.
 ### KiCad Plugin (Python, runs inside KiCad)
 - Renders the chat panel, tool-call log, and approve/reject controls inside a `wx`-based panel.
 - Publishes one canonical project record (project root, project file, PCB and
-  schematic manifests) and renders it into each request's context block. Only
-  the watch's write path probes KiCad's board; readers use the record.
+  schematic manifests) and renders it into each request's context block with
+  absolute file paths. The board probe runs only on the write side — at
+  startup, on panel show, and on each watch tick; every read path uses the
+  record and fails closed when it is missing or invalid.
 - Spawns the MCP server subprocess and monitors it via a background thread.
 - After each LLM turn, calls `SCH_EDIT_FRAME.LoadSchematic()` (or equivalent) to reload any files
   the server modified.

@@ -37,9 +37,10 @@ def register_version_tools(mcp: FastMCP) -> None:
         archived.  *include_files* adds the rest of the project, such as
         nested sub-sheets and additional boards: each existing file inside
         the project directory is archived under its project-relative path
-        (an entry already in the default set is skipped).  Missing entries
-        and paths outside the project directory are skipped and logged, so
-        one stale entry never fails the snapshot.  If the current file set
+        (an entry already in the default set is skipped).  A missing entry
+        or a path outside the project directory fails the tool call with an
+        error naming that entry, so a snapshot is never silently narrowed.
+        If the current file set
         is identical to the latest archive, no new archive is created and
         the existing one is returned instead.  At most *keep* archives are
         retained (default 10); oldest are pruned first.
@@ -48,9 +49,9 @@ def register_version_tools(mcp: FastMCP) -> None:
             project_file: Absolute path to the project file (.kicad_pro).
             keep: Number of archives to retain, default 10.
             include_files: Extra files to archive, typically every board
-                and sheet listed by the project state.  Entries that are
-                missing or resolve outside the project directory are
-                skipped.
+                and sheet listed by the project state.  An entry that is
+                missing or resolves outside the project directory is an
+                error.
 
         Returns:
             A dict with keys:
@@ -68,6 +69,8 @@ def register_version_tools(mcp: FastMCP) -> None:
             )
         except FileNotFoundError as exc:
             return {"error": str(exc)}
+        except ValueError as exc:
+            return {"error": f"Failed to save project version: {exc}"}
         except OSError as exc:
             return {"error": f"Failed to save project version: {exc}"}
 

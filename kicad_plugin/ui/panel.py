@@ -824,8 +824,11 @@ if _WX_AVAILABLE:
                 self._llm_client = LLMClient(self._settings, self._server_mgr.base_url)
                 # Publish this run's project record first so auto-restore
                 # judges the session against the project that is open now.
-                self._write_project_state()
-                self._autoload_session()
+                # A failed probe must not restore a stale session: only a
+                # record written this run permits auto-restore.
+                record = self._write_project_state()
+                if record is not None:
+                    self._autoload_session()
                 self._start_project_watch()
                 # Auto-sync the footprint index for the current project
                 # (deferred until the backend is up if needed).
@@ -853,8 +856,14 @@ if _WX_AVAILABLE:
                 self._init_llm_client()
             elif event.IsShown():
                 try:
-                    current_project = self._current_project_path()
+                    # Probe and publish this display's record first.  Only a
+                    # record written in this run may drive auto-restore; a
+                    # stale on-disk record (or no board) never restores a
+                    # session from another project.
+                    project = self._probe_project()
                     published_project = _pstate.project_file_path(self._published)
+                    record = self._write_project_state(project) if project is not None else None
+                    current_project = _pstate.project_file_path(record)
                     log.debug(
                         "panel show: current=%r published=%r busy=%r",
                         current_project,
@@ -3466,8 +3475,9 @@ if _WX_AVAILABLE:
             Returns the record now in effect, or None when nothing can be
             published (no probe result, vanished project file, failed write).
             The state file is never touched when an invalid record would
-            result, nor when the scanned content matches the last published
-            record (so an idle project does not churn its mtime).
+            result, nor when the scanned content matches the record already
+            on disk (so an idle project does not churn its mtime); a state
+            file deleted externally is recreated on the next scan.
             """
             project_file = project_file or self._probe_project()
             if project_file is None:
@@ -3475,8 +3485,13 @@ if _WX_AVAILABLE:
             record = _pstate.build_record(project_file)
             if record is None:
                 return None
-            if self._published is not None and _same_project_content(record, self._published):
-                return self._published
+            # Compare with what is actually on disk, not with the in-memory
+            # mirror: the state file may have been deleted or replaced
+            # externally, in which case this probe recreates it.
+            published = _pstate.read_state(self._state_path())
+            if published is not None and _same_project_content(record, published):
+                self._published = published
+                return published
             try:
                 written = _pstate.write_state(self._state_path(), record)
             except OSError as exc:
