@@ -5746,6 +5746,51 @@ class TestPruneRollbackHistory:
         # The pruned history should contain: save user+assistant+save_result, restore user+restore_result, final user
         # (empty assistant removed since all its tool_calls pruned)
 
+    def test_prune_reads_the_state_file_once(self, monkeypatch):
+        history = self._make_history(
+            [
+                ("user", "start"),
+                (
+                    "assistant+tc",
+                    [_tool_call("s1", "save_project_version", {"project_file": "f.kicad_pro"})],
+                ),
+                ("tool+save", "f.sch", "v1", "s1"),
+                (
+                    "assistant+tc",
+                    [_tool_call("tcA", "add_symbol_to_schematic", {"file_path": "f.sch"})],
+                ),
+                ("tool", "tcA", '{"uuid": "A"}'),
+                ("assistant+tc", [_tool_call("tcB", "move_component", {"file_path": "f.sch"})]),
+                ("tool", "tcB", '{"ok": true}'),
+                (
+                    "assistant+tc",
+                    [
+                        _tool_call(
+                            "rst",
+                            "restore_project_version",
+                            {"project_file": "f.kicad_pro", "version_id": "v1"},
+                        )
+                    ],
+                ),
+                ("tool+restore", "f.sch", "v1", "rst"),
+            ]
+        )
+        client = _make_client()
+        client._history = history
+        reads = []
+        real_read = llm_client.project_state.read_state
+
+        def counting_read(path):
+            reads.append(path)
+            return real_read(path)
+
+        monkeypatch.setattr(llm_client.project_state, "read_state", counting_read)
+
+        client._prune_rollback_history()
+
+        assert len(client._history) < len(history)  # pruning actually ran
+        assert len(reads) == 1
+
     def test_non_file_touching_turns_preserved(self):
         history = self._make_history(
             [

@@ -2452,6 +2452,8 @@ class LLMClient:
         Handles nested restores: starts from the most recent restore and skips
         any restore whose messages fall inside an already-pruned range.
         """
+        record = project_state.read_state(self._state_file)
+
         # ---- Build save-point lookup ------------------------------------------
         # For each save_project_version result, record (project_file, version_id) → index.
         save_points: dict[tuple[str, str], int] = {}
@@ -2532,7 +2534,7 @@ class LLMClient:
                             tcj_args = json.loads(tcj["function"].get("arguments", "{}"))
                         except (json.JSONDecodeError, KeyError, TypeError):
                             continue
-                        if self._tool_touches_project(tcj_args, project_file):
+                        if self._tool_touches_project_record(tcj_args, project_file, record):
                             marked.add(j)
                             tool_call_removals.setdefault(pj, []).append(tcj_id)
                 break
@@ -2652,16 +2654,24 @@ class LLMClient:
         if annotated:
             log.info("_annotate_stale_queries: tagged %d stale query result(s)", annotated)
 
-    def _tool_touches_project(self, args: dict[str, Any], project_file: str) -> bool:
+    @staticmethod
+    def _tool_touches_project_record(
+        args: dict[str, Any], project_file: str, record: dict | None
+    ) -> bool:
         """Return True if *args* reference any file of *project_file*'s project."""
         target = os.path.abspath(project_file)
-        record = project_state.read_state(self._state_file)
         for key in ("file_path", "schematic_path", "pcb_path", "project_path"):
             value = args.get(key)
             resolved = _project_path_from_record(value, record) if value else None
             if resolved is not None and resolved == target:
                 return True
         return False
+
+    def _tool_touches_project(self, args: dict[str, Any], project_file: str) -> bool:
+        """Return True if *args* reference any file of *project_file*'s project."""
+        return self._tool_touches_project_record(
+            args, project_file, project_state.read_state(self._state_file)
+        )
 
     def _validate_history(self) -> None:
         """Repair orphaned tool_calls in self._history.

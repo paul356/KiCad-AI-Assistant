@@ -258,3 +258,30 @@ class TestContract:
 
         assert project_state.validate_state(payload) is None
         assert core_state.validate_state(payload) is None
+
+
+class TestTransientRead:
+    def test_permission_error_is_retried_once(self, tmp_path, monkeypatch):
+        import builtins
+
+        root, pro = _project(tmp_path)
+        state_file = tmp_path / "project_state.json"
+        assert project_state.write_state(str(state_file), _record(root, pro))
+
+        real_open = builtins.open
+        calls = {"n": 0}
+
+        def flaky_open(path, *args, **kwargs):
+            if os.fspath(path) == str(state_file):
+                calls["n"] += 1
+                if calls["n"] == 1:
+                    raise PermissionError(13, "sharing violation")
+            return real_open(path, *args, **kwargs)
+
+        monkeypatch.setattr(builtins, "open", flaky_open)
+
+        record = project_state.read_state(str(state_file))
+
+        assert record is not None
+        assert record["project_root"] == str(root)
+        assert calls["n"] == 2
