@@ -299,6 +299,37 @@ class TestStartupOrder:
 
         assert obj._conv_entries == []
 
+    def test_footprint_sync_uses_this_runs_record(self, panel, tmp_path, monkeypatch):
+        root, pro = _project(tmp_path)
+        cfg = tmp_path / "cfg"
+        obj = _fake_panel(panel, cfg, probe=str(pro))
+
+        class _Client:
+            def __init__(self, settings, base_url):
+                pass
+
+        monkeypatch.setattr(llm_client, "LLMClient", _Client)
+
+        obj._init_llm_client()
+
+        assert obj.sync_calls == [str(pro)]
+
+    def test_failed_probe_does_not_sync_footprints(self, panel, tmp_path, monkeypatch):
+        root, pro = _project(tmp_path)
+        cfg = tmp_path / "cfg"
+        _publish(_fake_panel(panel, cfg), pro)  # stale record from an earlier run
+        obj = _fake_panel(panel, cfg, probe=None)
+
+        class _Client:
+            def __init__(self, settings, base_url):
+                pass
+
+        monkeypatch.setattr(llm_client, "LLMClient", _Client)
+
+        obj._init_llm_client()
+
+        assert obj.sync_calls == []
+
     def test_panel_show_does_not_restore_from_a_stale_record(self, panel, tmp_path):
         root, pro = _project(tmp_path)
         cfg = tmp_path / "cfg"

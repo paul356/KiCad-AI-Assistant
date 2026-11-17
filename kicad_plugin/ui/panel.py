@@ -90,12 +90,22 @@ def _take_autoroute_snapshot(
     except Exception as exc:  # noqa: BLE001 -- report instead of crashing the UI
         log.warning("autoroute: version snapshot failed: %s", exc)
         return "", f"Auto Route could not save a project snapshot before routing: {exc}"
-    if isinstance(result, dict) and result.get("error"):
-        log.warning("autoroute: version snapshot failed: %s", result["error"])
+    if not isinstance(result, dict):
         return "", (
-            f"Auto Route could not save a project snapshot before routing: {result['error']}"
+            "Auto Route could not save a project snapshot before routing: "
+            "the server returned an invalid result."
         )
-    archive_path = result.get("archive_path", "") if isinstance(result, dict) else ""
+    if result.get("success") is False or "error" in result:
+        detail = result.get("error") or "the server reported failure"
+        log.warning("autoroute: version snapshot failed: %s", detail)
+        return "", f"Auto Route could not save a project snapshot before routing: {detail}"
+    archive_path = result.get("archive_path")
+    if not archive_path:
+        log.warning("autoroute: version snapshot returned no archive path")
+        return "", (
+            "Auto Route could not save a project snapshot before routing: "
+            "the server returned no archive path."
+        )
     log.info("autoroute: project version snapshot saved to %s", archive_path)
     return archive_path, None
 
@@ -831,9 +841,10 @@ if _WX_AVAILABLE:
                 if record is not None:
                     self._autoload_session()
                 self._start_project_watch()
-                # Auto-sync the footprint index for the current project
-                # (deferred until the backend is up if needed).
-                project_file = self._current_project_path()
+                # Auto-sync the footprint index for this run's project.  Use
+                # the record written above, not a fresh disk read: a failed
+                # probe must not sync a stale project.
+                project_file = _pstate.project_file_path(record)
                 if project_file:
                     self._request_footprint_sync(project_file)
             except Exception as e:

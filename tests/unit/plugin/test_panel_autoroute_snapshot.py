@@ -198,6 +198,44 @@ def test_snapshot_tool_error_returns_an_error(tmp_path):
     assert "disk full" in error
 
 
+def test_snapshot_tool_failure_flag_returns_an_error(tmp_path):
+    pro = tmp_path / "aria.kicad_pro"
+    pro.write_text("{}\n")
+    board = tmp_path / "aria.kicad_pcb"
+    board.write_text("(kicad_pcb)\n")
+    state_file = _publish(tmp_path / "project_state.json", pro)
+
+    def call_tool(base_url, name, args):
+        return {"success": False}
+
+    backup_path, error = _take_autoroute_snapshot(
+        str(board), "http://mcp", call_tool, str(state_file)
+    )
+
+    assert backup_path == ""
+    assert error is not None
+    assert "could not save a project snapshot" in error
+
+
+def test_snapshot_tool_missing_archive_path_returns_an_error(tmp_path):
+    pro = tmp_path / "aria.kicad_pro"
+    pro.write_text("{}\n")
+    board = tmp_path / "aria.kicad_pcb"
+    board.write_text("(kicad_pcb)\n")
+    state_file = _publish(tmp_path / "project_state.json", pro)
+
+    def call_tool(base_url, name, args):
+        return {"success": True}
+
+    backup_path, error = _take_autoroute_snapshot(
+        str(board), "http://mcp", call_tool, str(state_file)
+    )
+
+    assert backup_path == ""
+    assert error is not None
+    assert "no archive path" in error
+
+
 def _autoroute_panel(module, state_file):
     obj = object.__new__(module.AssistantPanel)
     obj._on_autoroute = types.MethodType(module.AssistantPanel._on_autoroute, obj)
