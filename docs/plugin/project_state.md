@@ -61,8 +61,8 @@ via the upward search). A failed probe changes nothing: no scan, no write.
 The watch timer ticks every **1000 ms**. A project switch is noticed and
 written on the next tick. The project tree is rescanned every **5 ticks**,
 which bounds new/removed sub-sheet visibility at 5 seconds. A tick that does
-not need a scan is free. When the scanned content matches the last published
-record, the file is not written at all, so an idle project never churns its
+not need a scan is free. When the scanned content matches the record already
+on disk, the file is not written at all, so an idle project never churns its
 mtime.
 
 At startup the panel writes the state file *before* auto-restoring a session,
@@ -90,11 +90,30 @@ record means "no project".  Auto-restore loads no project session, the Load
 dialog lists only unowned sessions, the context block is omitted, and session
 stamps are empty.
 
+The one exception is the session stamp used when persisting a conversation:
+`_session_project_path()` reads the canonical file first and falls back to
+the record this panel last published only when the file is missing or
+unreadable.  That keeps the stamp available after teardown (when `pcbnew`
+no longer returns a board) without letting an in-memory record override a
+valid file.
+
+On Windows a reader may hit the same transient sharing race the writer
+already retries during `os.replace`.  The read side retries once (50 ms) on
+`PermissionError` / `ERROR_SHARING_VIOLATION` before declaring the file
+unreadable; a still-failing read returns "no project" and clears the trust
+root as before.
+
 The pre-edit resolver has no fallback either.  With no valid record it
 returns no project and an actionable "reopen the plugin panel and retry"
 error; a path outside `project_root` is refused; a recorded `profile_file`
-that no longer exists also fails with a retry message.  There is no upward
+that no longer exists also fails with a retry message.  The file being
+edited is checked against `project_root` as well.  There is no upward
 filesystem search on the read side.
+
+The canonical upward search in `kcaa/utils/project_resolution.py` (used by
+the router, ERC validation and standalone tools) is intentionally tolerant:
+an unreadable directory is treated as having no project and the search moves
+to the parent.  The plugin's pre-edit snapshot does **not** use it.
 
 ## 7. Invariants
 

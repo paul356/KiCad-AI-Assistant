@@ -197,10 +197,13 @@ plugin data directory.
 ### 9.1 How the plugin publishes the open project
 
 The panel probes the open board (`pcbnew.GetBoard().GetFileName()`) and
-resolves the owning `.kicad_pro` by walking upward: at most one project per
-directory level, nearest level wins. KiCad 10's scripting API exposes no
-usable project-path accessor, so `board.GetProject()` is not used. The panel
-never derives a project path from a sibling file stem.
+resolves the owning `.kicad_pro` by walking upward to the nearest ancestor
+directory that contains one. When that directory holds several projects the
+choice is deterministic: prefer a project whose stem has a matching
+`.kicad_sch`/`.kicad_pcb`, then one whose stem equals the queried file's
+stem, then the lexicographically smallest filename. KiCad 10's scripting API
+exposes no usable project-path accessor, so `board.GetProject()` is not used.
+The panel never derives a project path from a sibling file stem.
 
 `ServerManager` starts the server with `KCAA_PROJECT_STATE_FILE` pointing at
 `<kcaa data dir>/project_state.json`. The panel atomically writes the schema
@@ -254,8 +257,10 @@ exists, the pre-edit snapshot raises and the edit tool is not called.  Each
 a bad entry fails the snapshot instead of being dropped.
 
 The same rule backs the Auto Route pre-routing snapshot, so FreeRouting
-cannot change a nested board that the archive does not cover; an
-unresolvable project or include list aborts the route with the same message.
+cannot change a nested board that the archive does not cover.  Any snapshot
+failure — an unresolvable project, an unavailable include list, or a failing
+`save_project_version` call — aborts the route with a visible warning in the
+conversation; FreeRouting is never started without a whole-project archive.
 
 Snapshot state is keyed by **(project, file) per turn**: editing file A and
 then file B in the same project within one turn produces a snapshot before
