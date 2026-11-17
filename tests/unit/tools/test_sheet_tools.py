@@ -509,40 +509,11 @@ class TestInstancePathResolution:
         sheet = _sheet_node(_load(str(root)), result["sheet_uuid"])
         assert _instance_path(sheet) == "/existing-root"
 
-    @pytest.mark.parametrize("root_name", ["root", "Root", "Top"])
-    def test_project_file_root_sheet_is_the_last_resort(self, tools, tmp_path, root_name):
+    def test_root_without_uuid_or_instances_is_rejected(self, tools, tmp_path):
         root = tmp_path / "root.kicad_sch"
         _write_schematic(root, root_uuid=None, pages=())
         (tmp_path / "root.kicad_pro").write_text(
-            json.dumps({"sheets": [[PROJECT_UUID, root_name]]}), encoding="utf-8"
-        )
-
-        result = _add_sheet(tools, str(root))
-        assert result.get("success") is True, result
-
-        sheet = _sheet_node(_load(str(root)), result["sheet_uuid"])
-        assert _instance_path(sheet) == f"/{PROJECT_UUID}"
-
-    def test_foreign_project_file_is_not_adopted(self, tools, tmp_path):
-        root = tmp_path / "root.kicad_sch"
-        _write_schematic(root, root_uuid=None, pages=())
-        (tmp_path / "other.kicad_pro").write_text(
-            json.dumps({"sheets": [[PROJECT_UUID, "Top"]]}), encoding="utf-8"
-        )
-        before = root.read_text(encoding="utf-8")
-
-        result = _add_sheet(tools, str(root), create_child=True, sheet_file="orphan.kicad_sch")
-
-        assert "error" in result
-        assert root.read_text(encoding="utf-8") == before
-        assert not (tmp_path / "root.kicad_sch.bak").exists()
-        assert not (tmp_path / "orphan.kicad_sch").exists()
-
-    def test_sibling_project_file_with_wrong_root_name_is_rejected(self, tools, tmp_path):
-        root = tmp_path / "root.kicad_sch"
-        _write_schematic(root, root_uuid=None, pages=())
-        (tmp_path / "root.kicad_pro").write_text(
-            json.dumps({"sheets": [[PROJECT_UUID, "Nope"]]}), encoding="utf-8"
+            json.dumps({"sheets": [[PROJECT_UUID, "root"]]}), encoding="utf-8"
         )
         before = root.read_text(encoding="utf-8")
 

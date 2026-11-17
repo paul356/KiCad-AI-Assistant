@@ -127,32 +127,6 @@ class TestSeveralProjectsInOneDirectory:
         assert project_resolution.find_project_file(str(sheet)) == str(pro)
 
 
-class TestSiblingProjectFile:
-    def test_returns_project_beside_schematic(self, isolated_root):
-        pro = _touch(isolated_root / "aria.kicad_pro")
-        sheet = _touch(isolated_root / "aria.kicad_sch")
-
-        assert project_resolution.sibling_project_file(str(sheet)) == str(pro)
-
-    def test_ignores_differently_named_project_in_same_directory(self, isolated_root):
-        _touch(isolated_root / "other.kicad_pro")
-        sheet = _touch(isolated_root / "aria.kicad_sch")
-
-        assert project_resolution.sibling_project_file(str(sheet)) is None
-
-    def test_returns_none_when_sibling_file_is_missing(self, isolated_root):
-        sheet = _touch(isolated_root / "aria.kicad_sch")
-
-        assert project_resolution.sibling_project_file(str(sheet)) is None
-
-    def test_subdirectory_does_not_adopt_ancestor_project(self, isolated_root):
-        _touch(isolated_root / "aria.kicad_pro")
-        local = _touch(isolated_root / "hardware" / "aria.kicad_pro")
-        sheet = _touch(isolated_root / "hardware" / "aria.kicad_sch")
-
-        assert project_resolution.sibling_project_file(str(sheet)) == str(local)
-
-
 class TestProjectName:
     def test_subdirectory_sheet_resolves_root_project_name(self, isolated_root):
         _touch(isolated_root / "aria.kicad_pro")

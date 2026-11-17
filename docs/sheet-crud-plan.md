@@ -470,12 +470,14 @@ The node matches the KiCad 10 dialect exactly, so KiCad does not rewrite it
 on load or save: solid stroke (sheet symbols have no line style), colour
 fill, all four flags, and canonical property names.
 
-The `instances` path is the path of the *containing* sheet, resolved from
-the root schematic's own `(uuid ...)`, then an existing sheet's instance
-path, then the project file's `"Top"` sheet entry.  The page is the lowest
-positive integer not used anywhere in the project's sheet hierarchy.  Only
-root schematics can be extended; adding a sheet to a child schematic fails
-because the tool cannot know its enclosing path.
+The `instances` path is the path of the *containing* sheet, resolved only
+from the schematic itself: the root schematic's own `(uuid ...)`, then an
+existing sheet's instance path (preferring the clause for this schematic's
+stem).  There is no project-file fallback; if neither source exists the
+call fails and writes nothing.  The page is the lowest positive integer not
+used anywhere in the project's sheet hierarchy.  Only root schematics can
+be extended; adding a sheet to a child schematic fails because the tool
+cannot know its enclosing path.
 
 ---
 

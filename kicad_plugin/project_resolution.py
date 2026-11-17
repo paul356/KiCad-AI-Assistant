@@ -119,25 +119,6 @@ def find_project_file(path: str) -> str | None:
         directory = parent
 
 
-def sibling_project_file(path: str) -> str | None:
-    """Return the ``.kicad_pro`` beside *path*, or None.
-
-    Only ``<dirname(abspath(path))>/<stem><PROJECT_SUFFIX>`` is considered:
-    there is no upward search, no directory listing, and no stem
-    substitution.  This is deliberately narrower than
-    :func:`find_project_file`, which may adopt a differently named project
-    from the file's directory or an ancestor.  Callers that must not guess
-    which project owns the file use this function instead.
-
-    Returns the absolute candidate path only when that exact file exists.
-    """
-    target = os.path.abspath(path)
-    directory = os.path.dirname(target)
-    stem = os.path.splitext(os.path.basename(target))[0]
-    candidate = os.path.join(directory, stem + PROJECT_SUFFIX)
-    return candidate if os.path.isfile(candidate) else None
-
-
 def project_name(path: str) -> str | None:
     """Return the owning project's stem for *path*, or None.
 

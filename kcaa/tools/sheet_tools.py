@@ -16,7 +16,7 @@ import uuid
 
 from fastmcp import Context, FastMCP
 
-from kcaa.utils.project_resolution import project_name, sibling_project_file
+from kcaa.utils.project_resolution import project_name
 from kcaa.utils.skip_compat import safe_schematic
 
 log = logging.getLogger(__name__)
@@ -268,51 +268,18 @@ def _sheet_file_from_node(sheet_node: list) -> str | None:
     return None
 
 
-def _project_root_uuid(schematic_path: str) -> str | None:
-    """Return the root sheet UUID recorded in the sibling ``.kicad_pro``.
-
-    KiCad stores the root sheet as the first ``sheets`` entry, a
-    ``[uuid, name]`` pair whose name is the project stem or ``"Root"``.
-    ``"Top"`` is accepted for older kcaa fixtures.  Only ``<stem>.kicad_pro``
-    is read, so a different project in the same directory cannot lend its
-    UUID.
-    """
-    import json
-
-    stem = os.path.splitext(os.path.basename(schematic_path))[0]
-    project_path = sibling_project_file(schematic_path)
-    if project_path is None:
-        return None
-    try:
-        with open(project_path, encoding="utf-8") as fh:
-            data = json.load(fh)
-    except (OSError, ValueError):
-        return None
-
-    if not isinstance(data, dict):
-        return None
-    sheets = data.get("sheets")
-    if not isinstance(sheets, list) or not sheets:
-        return None
-    root_entry = sheets[0]
-    if (
-        isinstance(root_entry, list)
-        and len(root_entry) >= 2
-        and isinstance(root_entry[0], str)
-        and isinstance(root_entry[1], str)
-        and root_entry[1] in {stem, "Root", "Top"}
-    ):
-        return root_entry[0]
-    return None
-
-
 def _resolve_sheet_parent_path(schematic_path: str, tree: list) -> tuple[str | None, str | None]:
     """Resolve the instance path of the sheet that owns *schematic_path*.
 
     For a root schematic this is ``"/" + <root sheet UUID>``, resolved from
     the file's own ``(uuid ...)``, then from an existing sibling sheet's
-    ``instances`` path, then from the root entry of the sibling
-    ``<stem>.kicad_pro`` ``sheets`` array.
+    ``instances`` path (preferring the clause for this schematic's stem).
+    There is no project-file fallback.
+
+    KiCad always writes ``(uuid ...)`` into a saved schematic and assigns one
+    on load when it is missing, so a root with neither its own UUID nor an
+    existing sheet instance path is not a state KiCad produces.  The root
+    UUID must come from the schematic itself rather than a cross-file guess.
 
     Returns ``(path, error)``; exactly one of the two is set.  A child
     schematic has no record of its enclosing sheet path, so it is rejected
@@ -337,15 +304,10 @@ def _resolve_sheet_parent_path(schematic_path: str, tree: list) -> tuple[str | N
             if instance_path:
                 return instance_path, None
 
-    project_uuid = _project_root_uuid(schematic_path)
-    if project_uuid:
-        return "/" + project_uuid, None
-
     return None, (
         f"Cannot resolve the root sheet UUID for {os.path.basename(schematic_path)!r}: "
-        "the file has no (uuid ...), it has no existing sheet instances, and its "
-        "sibling project file has no usable root sheet entry.  Refusing to write a "
-        "guessed instance path."
+        "the file has no (uuid ...) and no existing sheet instances, so the enclosing "
+        "sheet path cannot be determined.  Nothing was written."
     )
 
 
