@@ -198,7 +198,7 @@ class TestAddSheetSymbol:
             )
         )
 
-        assert result["success"] is True, result
+        assert result.get("success") is True, result
         assert result["position_adjusted"] is True
         assert result["requested_position"] == {"x": requested_x, "y": requested_y}
         assert result["position"]["x"] == pytest.approx(candidate["x"])
@@ -247,7 +247,7 @@ class TestUpdateSheetSymbol:
                 height=50.8,
             )
         )
-        assert result["success"] is True, result
+        assert result.get("success") is True, result
         return result["sheet_uuid"]
 
     def test_auto_place_true_avoids_overlap(self, tools, tmp_sch):
@@ -268,7 +268,7 @@ class TestUpdateSheetSymbol:
                 y=20.0,
             )
         )
-        assert result["success"] is True, result
+        assert result.get("success") is True, result
         assert result["position_adjusted"] is True
         assert result["requested_position"] == {"x": 20.0, "y": 20.0}
         assert result["note"] == "Position adjusted to nearest free area."
@@ -296,7 +296,7 @@ class TestUpdateSheetSymbol:
                 y=10.16,
             )
         )
-        assert result["success"] is True, result
+        assert result.get("success") is True, result
         # No conflict → no adjustment.
         assert result.get("position_adjusted") is False
 
@@ -312,7 +312,7 @@ class TestUpdateSheetSymbol:
                 height=76.2,
             )
         )
-        assert result["success"] is True, result
+        assert result.get("success") is True, result
         # position_adjusted not set for size-only changes.
         assert "position_adjusted" not in result
 
@@ -327,7 +327,7 @@ class TestUpdateSheetSymbol:
                 x=185.0,
             )
         )
-        assert result["success"] is True, result
+        assert result.get("success") is True, result
         # Should not error out; position_adjusted may be True or False.
         assert "error" not in result
 
@@ -338,7 +338,7 @@ class TestCanonicalSheetData:
     def test_written_sheet_node_is_canonical(self, tools, tmp_sch):
         root_uuid = _child(_load(tmp_sch), "uuid")[1]
         result = _add_sheet(tools, tmp_sch, x=200.0, y=25.4)
-        assert result["success"] is True, result
+        assert result.get("success") is True, result
 
         sheet = _sheet_node(_load(tmp_sch), result["sheet_uuid"])
 
@@ -378,7 +378,7 @@ class TestCanonicalSheetData:
 
     def test_canonical_sheet_can_be_renamed(self, tools, tmp_sch):
         result = _add_sheet(tools, tmp_sch, x=200.0, y=25.4)
-        assert result["success"] is True, result
+        assert result.get("success") is True, result
 
         update = asyncio.run(
             tools["update_sheet_symbol"](
@@ -414,7 +414,7 @@ class TestPageAllocation:
         _write_schematic(root, root_uuid=ROOT_UUID, pages=pages)
 
         result = _add_sheet(tools, str(root))
-        assert result["success"] is True, result
+        assert result.get("success") is True, result
 
         sheet = _sheet_node(_load(str(root)), result["sheet_uuid"])
         assert int(_instance_page(sheet)) == expected
@@ -448,7 +448,7 @@ class TestPageAllocation:
         _write_schematic(root, root_uuid=ROOT_UUID, pages=(2,), child_file="child.kicad_sch")
 
         result = _add_sheet(tools, str(root))
-        assert result["success"] is True, result
+        assert result.get("success") is True, result
 
         sheet = _sheet_node(_load(str(root)), result["sheet_uuid"])
         assert int(_instance_page(sheet)) == 4
@@ -466,12 +466,23 @@ class TestPageAllocation:
         root.write_text(text.replace('"leaf.kicad_sch"', '"broken.kicad_sch"', 1), encoding="utf-8")
 
         result = _add_sheet(tools, str(root))
-        assert result["success"] is True, result
+        assert result.get("success") is True, result
 
         sheet = _sheet_node(_load(str(root)), result["sheet_uuid"])
         # Pages 2 and 3 belong to the root sheets, page 4 to the readable
         # sibling; the malformed child must not hide either.
         assert int(_instance_page(sheet)) == 5
+
+    def test_deeply_nested_child_sheet_does_not_abort_page_collection(self, tools, tmp_path):
+        root = tmp_path / "root.kicad_sch"
+        _write_schematic(root, root_uuid=ROOT_UUID, pages=(2,), child_file="deep.kicad_sch")
+        (tmp_path / "deep.kicad_sch").write_text("(a " * 20_000 + ")" * 20_000, encoding="utf-8")
+
+        result = _add_sheet(tools, str(root))
+        assert result.get("success") is True, result
+
+        sheet = _sheet_node(_load(str(root)), result["sheet_uuid"])
+        assert int(_instance_page(sheet)) == 3
 
 
 class TestInstancePathResolution:
@@ -482,7 +493,7 @@ class TestInstancePathResolution:
         _write_schematic(root, root_uuid=ROOT_UUID, instance_path="/stale", pages=(2,))
 
         result = _add_sheet(tools, str(root))
-        assert result["success"] is True, result
+        assert result.get("success") is True, result
 
         sheet = _sheet_node(_load(str(root)), result["sheet_uuid"])
         assert _instance_path(sheet) == f"/{ROOT_UUID}"
@@ -492,7 +503,7 @@ class TestInstancePathResolution:
         _write_schematic(root, root_uuid=None, instance_path="/existing-root", pages=(2,))
 
         result = _add_sheet(tools, str(root))
-        assert result["success"] is True, result
+        assert result.get("success") is True, result
 
         sheet = _sheet_node(_load(str(root)), result["sheet_uuid"])
         assert _instance_path(sheet) == "/existing-root"
@@ -506,7 +517,7 @@ class TestInstancePathResolution:
         )
 
         result = _add_sheet(tools, str(root))
-        assert result["success"] is True, result
+        assert result.get("success") is True, result
 
         sheet = _sheet_node(_load(str(root)), result["sheet_uuid"])
         assert _instance_path(sheet) == f"/{PROJECT_UUID}"
@@ -522,6 +533,22 @@ class TestInstancePathResolution:
         result = _add_sheet(tools, str(root), create_child=True, sheet_file="orphan.kicad_sch")
 
         assert "error" in result
+        assert root.read_text(encoding="utf-8") == before
+        assert not (tmp_path / "root.kicad_sch.bak").exists()
+        assert not (tmp_path / "orphan.kicad_sch").exists()
+
+    def test_sibling_project_file_with_wrong_root_name_is_rejected(self, tools, tmp_path):
+        root = tmp_path / "root.kicad_sch"
+        _write_schematic(root, root_uuid=None, pages=())
+        (tmp_path / "root.kicad_pro").write_text(
+            json.dumps({"sheets": [[PROJECT_UUID, "Nope"]]}), encoding="utf-8"
+        )
+        before = root.read_text(encoding="utf-8")
+
+        result = _add_sheet(tools, str(root), create_child=True, sheet_file="orphan.kicad_sch")
+
+        assert "error" in result
+        assert "Cannot resolve the root sheet UUID" in result["error"]
         assert root.read_text(encoding="utf-8") == before
         assert not (tmp_path / "root.kicad_sch.bak").exists()
         assert not (tmp_path / "orphan.kicad_sch").exists()
@@ -588,7 +615,7 @@ class TestChildSchematic:
         _write_schematic(root, root_uuid=ROOT_UUID)
 
         result = _add_sheet(tools, str(root), create_child=True, sheet_file="new_child.kicad_sch")
-        assert result["success"] is True, result
+        assert result.get("success") is True, result
 
         child_path = tmp_path / "new_child.kicad_sch"
         assert Path(result["child_path"]) == child_path
@@ -602,7 +629,7 @@ class TestChildSchematic:
 
     def test_new_sheet_precedes_root_only_sections(self, tools, tmp_sch):
         result = _add_sheet(tools, tmp_sch, x=200.0, y=25.4)
-        assert result["success"] is True, result
+        assert result.get("success") is True, result
 
         tree = _load(tmp_sch)
         sheet_index = next(i for i, node in enumerate(tree) if _tag(node) == "sheet")
@@ -666,7 +693,7 @@ class TestKicadRoundTrip:
         root = tmp_path / "root.kicad_sch"
         _write_schematic(root, root_uuid=ROOT_UUID)
         result = _add_sheet(tools, str(root))
-        assert result["success"] is True, result
+        assert result.get("success") is True, result
 
         # The project file keeps KiCad from blanking the instances project name.
         (tmp_path / "root.kicad_pro").write_text(
