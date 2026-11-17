@@ -54,7 +54,11 @@ def _resolve_project(
     """
     record = project_state.read_state(state_file)
     if record is None:
-        return None, "No valid project state is published; reopen the plugin panel and retry."
+        return None, (
+            "No KiCad project is published for the plugin. Save the project and open "
+            "its PCB editor so the panel can detect it, then retry; if the panel still "
+            "shows no project, reopen it."
+        )
     root = record["project_root"]
     project_file = os.path.join(root, record["profile_file"])
     if not project_state.is_within(root, file_path):
@@ -102,7 +106,9 @@ def _snapshot_include_files(
     record = project_state.read_state(state_file)
     if record is None:
         raise ProjectSnapshotUnavailable(
-            "No valid project state is published; reopen the plugin panel and retry."
+            "No KiCad project is published for the plugin. Save the project and open "
+            "its PCB editor so the panel can detect it, then retry; if the panel still "
+            "shows no project, reopen it."
         )
     root = record["project_root"]
     if os.path.realpath(os.path.dirname(os.path.abspath(project_file))) != os.path.realpath(root):
