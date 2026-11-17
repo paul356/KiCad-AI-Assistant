@@ -398,9 +398,12 @@ def _generate_child_schematic(
     """Create a minimal valid ``.kicad_sch`` file for a hierarchical child sheet.
 
     The file is created in the same directory as *parent_path* (unless
-    *child_filename* is absolute).  It contains the required boilerplate
-    that KiCad expects: ``(kicad_sch ...)`` header, empty ``(lib_symbols)``,
-    ``(sheet_instances)`` with the root path, and ``(embedded_fonts no)``.
+    *child_filename* is absolute).  It contains the boilerplate KiCad expects
+    from a child schematic: ``(kicad_sch ...)`` header, ``(uuid ...)``,
+    ``(paper ...)``, optional ``title_block`` and an empty ``(lib_symbols)``.
+
+    ``sheet_instances`` and ``embedded_fonts`` are root-file-only sections and
+    are deliberately omitted; KiCad drops them from child files on save.
 
     :param parent_path: Absolute path to the parent ``.kicad_sch`` file, used
         to resolve a relative *child_filename* and to infer the project name.
@@ -432,11 +435,11 @@ def _generate_child_schematic(
             (title "My Sheet")
           )
           (lib_symbols)
-          (sheet_instances
-            (path "/aaaa1111-bbbb-cccc-dddd-eeeeeeeeeeee" (page "1"))
-          )
-          (embedded_fonts no)
         )
+
+    A file written as a project root would instead end with
+    ``(sheet_instances (path "/" (page "1")))`` and ``(embedded_fonts no)``;
+    that form is not emitted here.
     """
     if paper not in _PAPER_SIZES:
         raise ValueError(f"Unknown paper size {paper!r}.  Valid: {', '.join(sorted(_PAPER_SIZES))}")
@@ -454,12 +457,13 @@ def _generate_child_schematic(
     if os.path.exists(child_path):
         raise FileExistsError(f"Child schematic already exists: {child_path!r}")
 
-    root_uuid = str(uuid.uuid4())
+    file_uuid = str(uuid.uuid4())
 
-    # Build S-expression lines
+    # Build S-expression lines.  Child schematics stop at (lib_symbols):
+    # sheet_instances/embedded_fonts belong to the project's root file only.
     lines: list[str] = []
     lines.append('(kicad_sch (version 20260306) (generator "kcaa") (generator_version "0.2.0")')
-    lines.append(f'  (uuid "{root_uuid}")')
+    lines.append(f'  (uuid "{file_uuid}")')
     lines.append(f'  (paper "{paper}")')
 
     if title:
@@ -468,10 +472,6 @@ def _generate_child_schematic(
         lines.append("  )")
 
     lines.append("  (lib_symbols)")
-    lines.append("  (sheet_instances")
-    lines.append(f'    (path "/{root_uuid}" (page "1"))')
-    lines.append("  )")
-    lines.append("  (embedded_fonts no)")
     lines.append(")")
 
     with open(child_path, "w", encoding="utf-8") as fh:
