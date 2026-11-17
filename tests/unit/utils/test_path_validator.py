@@ -369,10 +369,8 @@ class TestStateFile:
         assert validator.validate_path(_inside_kicad_user_dir("x.kicad_pcb"))
 
     @pytest.mark.parametrize("error_cls", [OSError, ValueError], ids=["oserror", "valueerror"])
-    def test_realpath_failure_after_state_read_never_escapes(
-        self, tmp_path, monkeypatch, error_cls
-    ):
-        """A filesystem change during refresh keeps the root; validate_path does not raise."""
+    def test_realpath_failure_clears_project_root(self, tmp_path, monkeypatch, error_cls):
+        """A filesystem failure while resolving a valid record clears the root."""
         state_file = tmp_path / "project_state.json"
         project_a = tmp_path / "a"
         project_b = tmp_path / "b"
@@ -384,7 +382,6 @@ class TestStateFile:
         _write_state(str(state_file), str(project_a))
         validator = _make_state_validator(monkeypatch, str(state_file))
         assert validator.validate_path(str(file_a), must_exist=True) == str(file_a)
-        previous = validator._project_root
 
         _write_state(str(state_file), str(project_b))
 
@@ -393,18 +390,14 @@ class TestStateFile:
 
         monkeypatch.setattr(path_validator_mod, "_normalize", broken_normalize)
 
-        assert validator.validate_path(str(file_a), must_exist=True) == str(file_a)
-        assert validator._project_root == previous
+        with pytest.raises(PathValidationError):
+            validator.validate_path(str(file_a), must_exist=True)
+        assert validator._project_root is None
+        assert validator.validate_path(_inside_kicad_user_dir("x.kicad_pcb"))
 
     @pytest.mark.parametrize("error_cls", [OSError, ValueError], ids=["oserror", "valueerror"])
-    def test_no_second_resolution_when_installing_state_root(
-        self, tmp_path, monkeypatch, error_cls
-    ):
-        """The state value is resolved once; a failure while installing it is guarded.
-
-        Under the old two-realpath design the second resolution raised out of
-        validate_path when the filesystem changed between the calls.
-        """
+    def test_install_failure_clears_project_root(self, tmp_path, monkeypatch, error_cls):
+        """The state value is resolved once; a failed install clears the root."""
         state_file = tmp_path / "project_state.json"
         project_a = tmp_path / "a"
         project_b = tmp_path / "b"
@@ -416,7 +409,6 @@ class TestStateFile:
         _write_state(str(state_file), str(project_a))
         validator = _make_state_validator(monkeypatch, str(state_file))
         assert validator.validate_path(str(file_a), must_exist=True) == str(file_a)
-        previous = validator._project_root
 
         _write_state(str(state_file), str(project_b))
         calls = {"n": 0}
@@ -428,15 +420,18 @@ class TestStateFile:
                 raise error_cls("second resolution failed")
             return real_normalize(path)
 
-        def failing_install(_self, _normalized):
-            raise error_cls("filesystem changed while installing the root")
+        def failing_install(_self, normalized):
+            if normalized is not None:
+                raise error_cls("filesystem changed while installing the root")
 
         monkeypatch.setattr(path_validator_mod, "_normalize", normalize_that_fails_on_second_call)
         monkeypatch.setattr(PathValidator, "_install_root", failing_install)
 
-        assert validator.validate_path(str(file_a), must_exist=True) == str(file_a)
-        assert validator._project_root == previous
+        with pytest.raises(PathValidationError):
+            validator.validate_path(str(file_a), must_exist=True)
+        assert validator._project_root is None
         assert calls["n"] == 1
+        assert validator.validate_path(_inside_kicad_user_dir("x.kicad_pcb"))
 
 
 class TestContainment:

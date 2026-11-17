@@ -172,7 +172,8 @@ class PathValidator:
         (no mtime tracking). An invalid record — missing/unreadable file,
         malformed JSON, wrong schema version, wrong types, a profile outside
         the root — clears the project root; only the static KiCad roots stay.
-        A valid record is resolved exactly once and installed in place.
+        A valid record is resolved exactly once and installed in place; if
+        resolution or installation fails, the root is cleared as well.
         """
         state_file = self._state_file
         if not state_file:
@@ -183,15 +184,9 @@ class PathValidator:
             try:
                 normalized = _normalize(state["project_root"])
             except (OSError, ValueError) as exc:
-                # The record is valid but the filesystem refused to resolve
-                # it; keep whatever root the last successful read installed.
-                log.debug(
-                    "Could not resolve project root from %s (%s); keeping %r",
-                    state_file,
-                    exc,
-                    self._project_root,
-                )
-                return
+                # The record is valid but the path cannot be resolved; the
+                # trust root falls back to the static KiCad roots.
+                log.debug("Could not resolve project root from %s (%s)", state_file, exc)
 
         if normalized == self._project_root:
             return
@@ -199,12 +194,14 @@ class PathValidator:
         try:
             self._install_root(normalized)
         except (PathValidationError, OSError, ValueError) as exc:
-            log.debug(
-                "Could not install project root from %s (%s); keeping %r",
-                state_file,
-                exc,
-                self._project_root,
-            )
+            log.debug("Could not install project root from %s (%s)", state_file, exc)
+            self._clear_root()
+
+    def _clear_root(self) -> None:
+        """Drop the project root, leaving only the static KiCad roots."""
+        with self._lock:
+            self._project_root = None
+            self.trusted_roots = set(self._static_roots)
 
     # ------------------------------------------------------------------ #
     # Public validation API
