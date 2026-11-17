@@ -31,23 +31,28 @@ def _file_hash(path: str) -> str:
     return h.hexdigest()
 
 
-def project_relative_path(project_file: str, path: str) -> str:
+def project_relative_path(project_file: str, path: str, display_path: str | None = None) -> str:
     """Return *path* relative to the project directory, using ``/`` separators.
 
     Both paths are resolved with :func:`os.path.realpath` before the
     containment check, so ``..`` traversal and symlinks that point outside
     the project are rejected.  The entry must be an existing file.
 
+    *display_path* overrides the path shown in error messages; callers that
+    resolve a relative ``include_files`` entry pass the entry as supplied so
+    the reported name matches what the caller can fix.
+
     :raises ValueError: If *path* is not a file or resolves outside the
         project directory; the message names the offending path.
     """
     project_root = os.path.realpath(os.path.dirname(os.path.abspath(project_file)))
     target = os.path.realpath(os.path.abspath(path))
+    reported = path if display_path is None else display_path
     if not os.path.isfile(target):
-        raise ValueError(f"include_files entry is not an existing file: {path}")
+        raise ValueError(f"include_files entry is not an existing file: {reported}")
     rel = os.path.relpath(target, project_root)
     if rel == os.pardir or rel.startswith(os.pardir + os.sep) or os.path.isabs(rel):
-        raise ValueError(f"include_files entry is outside the project directory: {path}")
+        raise ValueError(f"include_files entry is outside the project directory: {reported}")
     return rel.replace(os.sep, "/")
 
 
@@ -61,14 +66,16 @@ def project_file_set(project_file: str, extra_files: list[str] | None = None) ->
 
     *extra_files* adds explicit files (for example every sheet and board
     listed by the project state), archived under their project-relative
-    paths in the given order.  Entries already in the default set are
-    skipped silently.  The returned mapping is de-duplicated by relative
-    path and keeps insertion order, so default files come first and follow
-    the input order after that.
+    paths in the given order.  A relative entry is resolved against the
+    project directory (not the server process cwd); absolute entries are
+    used as given.  Entries already in the default set are skipped silently.
+    The returned mapping is de-duplicated by relative path and keeps
+    insertion order, so default files come first and follow the input order
+    after that.
 
     :raises ValueError: If an *extra_files* entry is missing, is not a file,
         or resolves outside the project directory.  A bad entry names the
-        path in the message; the snapshot is never silently narrowed.
+        path as supplied; the snapshot is never silently narrowed.
     """
     pro = os.path.abspath(project_file)
     d = os.path.dirname(pro)
@@ -78,8 +85,9 @@ def project_file_set(project_file: str, extra_files: list[str] | None = None) ->
         path = os.path.join(d, rel)
         if os.path.isfile(path):
             files[rel] = path
-    for path in extra_files or ():
-        rel = project_relative_path(pro, path)
+    for entry in extra_files or ():
+        path = entry if os.path.isabs(entry) else os.path.join(d, entry)
+        rel = project_relative_path(pro, path, display_path=entry)
         if rel not in files:
             files[rel] = os.path.realpath(os.path.abspath(path))
     return files

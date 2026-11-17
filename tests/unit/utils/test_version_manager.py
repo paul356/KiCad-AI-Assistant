@@ -73,6 +73,30 @@ class TestProjectRelativePath:
 
 
 class TestProjectFileSet:
+    def test_relative_entry_is_resolved_against_the_project(self, tmp_path):
+        pro, root_sch, sheet = _project(tmp_path)
+
+        files = version_manager.project_file_set(
+            str(pro), extra_files=["hardware/main_bus.kicad_sch"]
+        )
+
+        assert files["hardware/main_bus.kicad_sch"] == str(sheet)
+        assert files["aria.kicad_sch"] == str(root_sch)
+
+    def test_relative_parent_escape_raises_with_the_supplied_entry(self, tmp_path):
+        pro, _root_sch, _sheet = _project(tmp_path)
+        outside = tmp_path / "outside.kicad_sch"
+        outside.write_text("outside\n")
+
+        with pytest.raises(ValueError, match="outside the project directory: ../outside.kicad_sch"):
+            version_manager.project_file_set(str(pro), extra_files=["../outside.kicad_sch"])
+
+    def test_missing_relative_entry_raises_with_the_supplied_entry(self, tmp_path):
+        pro, _root_sch, _sheet = _project(tmp_path)
+
+        with pytest.raises(ValueError, match="not an existing file: hardware/gone.kicad_sch"):
+            version_manager.project_file_set(str(pro), extra_files=["hardware/gone.kicad_sch"])
+
     def test_include_adds_nested_sheet(self, tmp_path):
         pro, root_sch, sheet = _project(tmp_path)
 
