@@ -9,6 +9,7 @@ import sys  # Add sys import
 from typing import Any
 
 from kcaa.utils.config import config
+from kcaa.utils.project_resolution import project_name
 
 # Get PID for logging - Removed, handled by logging config
 # _PID = os.getpid()
@@ -60,12 +61,12 @@ def find_kicad_projects() -> list[dict[str, Any]]:
                         # Attempt to get modification time to ensure file is accessible
                         mod_time = os.path.getmtime(project_path)
                         rel_path = os.path.relpath(project_path, search_dir)
-                        project_name = get_project_name_from_path(project_path)
+                        project_stem = project_name(project_path)
 
                         logging.info(f"Found accessible KiCad project: {project_path}")
                         projects.append(
                             {
-                                "name": project_name,
+                                "name": project_stem,
                                 "path": project_path,
                                 "relative_path": rel_path,
                                 "modified": mod_time,
@@ -79,19 +80,6 @@ def find_kicad_projects() -> list[dict[str, Any]]:
 
     logging.info(f"Found {len(projects)} KiCad projects after scanning.")
     return projects
-
-
-def get_project_name_from_path(project_path: str) -> str:
-    """Extract the project name from a .kicad_pro file path.
-
-    Args:
-        project_path: Path to the .kicad_pro file
-
-    Returns:
-        Project name without extension
-    """
-    basename = os.path.basename(project_path)
-    return basename[: -len(config.kicad_extensions["project"])]
 
 
 def open_kicad_project(project_path: str) -> dict[str, Any]:

@@ -11,6 +11,7 @@ from pathlib import Path
 import re
 import ssl
 import sys
+import tarfile
 import threading
 import time
 import types
@@ -21,6 +22,7 @@ import urllib.request
 import pytest
 
 from kicad_plugin import llm_client
+from kicad_plugin import project_state as pstate
 from kicad_plugin import session_store as sstore
 from kicad_plugin.llm_client import LLMClient, LLMTurnFailure, _subprocess_sse_stream
 from kicad_plugin.settings import DEFAULT_LLM_USER_AGENT
@@ -106,6 +108,21 @@ def _make_client(
         llm_supports_vision=False,
     )
     return LLMClient(settings, mcp_base_url="http://127.0.0.1:9999")
+
+
+@pytest.fixture()
+def board_project(tmp_path, monkeypatch):
+    """Create a minimal project and publish its canonical state record."""
+    pcb = tmp_path / "board.kicad_pcb"
+    pro = tmp_path / "board.kicad_pro"
+    pcb.write_text("(kicad_pcb)\n")
+    pro.write_text("{}\n")
+    state_file = tmp_path / "project_state.json"
+    record = pstate.build_record(str(pro))
+    assert record is not None
+    assert pstate.write_state(str(state_file), record)
+    monkeypatch.setenv(pstate.PROJECT_STATE_ENV, str(state_file))
+    return str(pcb), str(pro)
 
 
 def _user(content="hello"):
@@ -1000,7 +1017,8 @@ class TestRunIntegration:
         assert result == "done"
         mock_compact.assert_called_once()
 
-    def test_framework_auto_snapshots_and_reloads_mutations(self):
+    def test_framework_auto_snapshots_and_reloads_mutations(self, board_project):
+        pcb, pro = board_project
         client = _make_client()
         tool_response = {
             "finish_reason": "tool_calls",
@@ -1014,7 +1032,7 @@ class TestRunIntegration:
                             "name": "set_footprint_position",
                             "arguments": json.dumps(
                                 {
-                                    "pcb_path": "/tmp/board.kicad_pcb",
+                                    "pcb_path": pcb,
                                     "items": [{"reference": "R1", "x": 1.0}],
                                 }
                             ),
@@ -1032,25 +1050,25 @@ class TestRunIntegration:
             mock_call_tool.side_effect = [
                 {"success": True},  # save_document
                 {"success": True, "version_id": "v1"},
-                {"success": True, "pcb_path": "/tmp/board.kicad_pcb"},
-                {"success": True, "reloaded": ["/tmp/board.kicad_pcb"], "failed": []},
+                {"success": True, "pcb_path": pcb},
+                {"success": True, "reloaded": [pcb], "failed": []},
             ]
             result = client.run("move R1", context_block="", on_tool_call=on_tool_call)
 
         assert result == "done"
         assert [c.args for c in mock_call_tool.call_args_list] == [
-            (client._mcp_base_url, "save_document", {"file_path": "/tmp/board.kicad_pcb"}),
+            (client._mcp_base_url, "save_document", {"file_path": pcb}),
             (
                 client._mcp_base_url,
                 "save_project_version",
-                {"project_file": "/tmp/board.kicad_pro"},
+                {"project_file": pro, "include_files": [pcb]},
             ),
             (
                 client._mcp_base_url,
                 "set_footprint_position",
-                {"pcb_path": "/tmp/board.kicad_pcb", "items": [{"reference": "R1", "x": 1.0}]},
+                {"pcb_path": pcb, "items": [{"reference": "R1", "x": 1.0}]},
             ),
-            (client._mcp_base_url, "reload_kicad", {"paths": ["/tmp/board.kicad_pcb"]}),
+            (client._mcp_base_url, "reload_kicad", {"paths": [pcb]}),
         ]
         assert [call.args[0] for call in on_tool_call.call_args_list] == [
             "save_document",
@@ -1059,9 +1077,10 @@ class TestRunIntegration:
             "reload_kicad",
         ]
 
-    def test_failed_mutation_still_reloads_dirty_path_at_turn_end(self):
+    def test_failed_mutation_still_reloads_dirty_path_at_turn_end(self, board_project):
         """A failed PCB mutation still marks the path dirty so reload_kicad
         runs at turn end, keeping the UI refresh consistent with the action."""
+        pcb, pro = board_project
         client = _make_client()
         tool_response = {
             "finish_reason": "tool_calls",
@@ -1073,9 +1092,7 @@ class TestRunIntegration:
                         "type": "function",
                         "function": {
                             "name": "pcb_route_pad_to_pad",
-                            "arguments": json.dumps(
-                                {"pcb_path": "/tmp/board.kicad_pcb", "pad1": "A1", "pad2": "B2"}
-                            ),
+                            "arguments": json.dumps({"pcb_path": pcb, "pad1": "A1", "pad2": "B2"}),
                         },
                     }
                 ],
@@ -1091,24 +1108,24 @@ class TestRunIntegration:
                 {"success": True},  # save_document
                 {"success": True, "version_id": "v1"},
                 {"success": False, "error": "routing failed"},  # pcb_route_pad_to_pad fails
-                {"success": True, "reloaded": ["/tmp/board.kicad_pcb"], "failed": []},
+                {"success": True, "reloaded": [pcb], "failed": []},
             ]
             result = client.run("route A1 to B2", context_block="", on_tool_call=on_tool_call)
 
         assert result == "done"
         assert [c.args for c in mock_call_tool.call_args_list] == [
-            (client._mcp_base_url, "save_document", {"file_path": "/tmp/board.kicad_pcb"}),
+            (client._mcp_base_url, "save_document", {"file_path": pcb}),
             (
                 client._mcp_base_url,
                 "save_project_version",
-                {"project_file": "/tmp/board.kicad_pro"},
+                {"project_file": pro, "include_files": [pcb]},
             ),
             (
                 client._mcp_base_url,
                 "pcb_route_pad_to_pad",
-                {"pcb_path": "/tmp/board.kicad_pcb", "pad1": "A1", "pad2": "B2"},
+                {"pcb_path": pcb, "pad1": "A1", "pad2": "B2"},
             ),
-            (client._mcp_base_url, "reload_kicad", {"paths": ["/tmp/board.kicad_pcb"]}),
+            (client._mcp_base_url, "reload_kicad", {"paths": [pcb]}),
         ]
         assert [call.args[0] for call in on_tool_call.call_args_list] == [
             "save_document",
@@ -1117,9 +1134,10 @@ class TestRunIntegration:
             "reload_kicad",
         ]
 
-    def test_llm_error_after_mutation_still_reloads_dirty_path(self):
+    def test_llm_error_after_mutation_still_reloads_dirty_path(self, board_project):
         """An [LLM error] exit still flushes dirty paths via the shared
         end-of-turn reload, matching the UI refresh display."""
+        pcb, _pro = board_project
         client = _make_client()
         tool_response = {
             "finish_reason": "tool_calls",
@@ -1133,7 +1151,7 @@ class TestRunIntegration:
                             "name": "set_footprint_position",
                             "arguments": json.dumps(
                                 {
-                                    "pcb_path": "/tmp/board.kicad_pcb",
+                                    "pcb_path": pcb,
                                     "items": [{"reference": "R1", "x": 1.0}],
                                 }
                             ),
@@ -1150,8 +1168,8 @@ class TestRunIntegration:
             mock_call_tool.side_effect = [
                 {"success": True},  # save_document
                 {"success": True, "version_id": "v1"},
-                {"success": True, "pcb_path": "/tmp/board.kicad_pcb"},
-                {"success": True, "reloaded": ["/tmp/board.kicad_pcb"], "failed": []},
+                {"success": True, "pcb_path": pcb},
+                {"success": True, "reloaded": [pcb], "failed": []},
             ]
             result = client.run("move R1", context_block="", on_turn_failure=failures.append)
 
@@ -1160,14 +1178,15 @@ class TestRunIntegration:
         assert mock_call_tool.call_args_list[-1].args == (
             client._mcp_base_url,
             "reload_kicad",
-            {"paths": ["/tmp/board.kicad_pcb"]},
+            {"paths": [pcb]},
         )
 
-    def test_max_iterations_exit_still_reloads_dirty_path(self, caplog):
+    def test_max_iterations_exit_still_reloads_dirty_path(self, caplog, board_project):
         """Hitting the iteration cap still flushes dirty paths via the shared
         end-of-turn reload, logs a WARNING with the reply so the failure is
         greppable, and reports the structured ITERATION_CAP category
         (issue #191)."""
+        pcb, _pro = board_project
         client = _make_client()
         tool_response = {
             "finish_reason": "tool_calls",
@@ -1181,7 +1200,7 @@ class TestRunIntegration:
                             "name": "set_footprint_position",
                             "arguments": json.dumps(
                                 {
-                                    "pcb_path": "/tmp/board.kicad_pcb",
+                                    "pcb_path": pcb,
                                     "items": [{"reference": "R1", "x": 1.0}],
                                 }
                             ),
@@ -1196,7 +1215,7 @@ class TestRunIntegration:
         failures = []
         with patch("kicad_plugin.llm_client.call_mcp_tool") as mock_call_tool:
             mock_call_tool.side_effect = lambda base, name, args, timeout=None: (
-                {"success": True, "reloaded": ["/tmp/board.kicad_pcb"], "failed": []}
+                {"success": True, "reloaded": [pcb], "failed": []}
                 if name == "reload_kicad"
                 else {"success": True}
             )
@@ -1220,7 +1239,7 @@ class TestRunIntegration:
         assert result == cap_reply
         assert cap_reply in caplog.text  # greppable failure in the plugin log
         assert mock_call_tool.call_args_list[-1][0][1] == "reload_kicad"
-        assert mock_call_tool.call_args_list[-1][0][2] == {"paths": ["/tmp/board.kicad_pcb"]}
+        assert mock_call_tool.call_args_list[-1][0][2] == {"paths": [pcb]}
 
     def test_compaction_error_fires_failure_callback(self):
         """A compaction failure reports COMPACTION_ERROR through
@@ -1255,11 +1274,12 @@ class TestRunIntegration:
         assert failures == [LLMTurnFailure.FRAMEWORK_ERROR]
         client._call_llm.assert_not_called()
 
-    def test_tool_exception_recorded_and_still_reloads_dirty_path(self):
+    def test_tool_exception_recorded_and_still_reloads_dirty_path(self, board_project):
         """A tool raising mid-turn no longer escapes run() (issue #176): the
         exception is captured as a recorded tool result so the failed call
         keeps its history pair, and the end-of-turn reload still flushes dirty
         paths from the earlier successful mutation."""
+        pcb, _pro = board_project
         client = _make_client()
         tool_response = {
             "finish_reason": "tool_calls",
@@ -1273,7 +1293,7 @@ class TestRunIntegration:
                             "name": "set_footprint_position",
                             "arguments": json.dumps(
                                 {
-                                    "pcb_path": "/tmp/board.kicad_pcb",
+                                    "pcb_path": pcb,
                                     "items": [{"reference": "R1", "x": 1.0}],
                                 }
                             ),
@@ -1284,9 +1304,7 @@ class TestRunIntegration:
                         "type": "function",
                         "function": {
                             "name": "flip_footprint",
-                            "arguments": json.dumps(
-                                {"pcb_path": "/tmp/board.kicad_pcb", "reference": "R2"}
-                            ),
+                            "arguments": json.dumps({"pcb_path": pcb, "reference": "R2"}),
                         },
                     },
                 ],
@@ -1304,10 +1322,10 @@ class TestRunIntegration:
             mock_call_tool.side_effect = [
                 {"success": True},  # save_document (snapshot for set_footprint_position)
                 {"success": True, "version_id": "v1"},
-                {"success": True, "pcb_path": "/tmp/board.kicad_pcb"},
+                {"success": True, "pcb_path": pcb},
                 # flip_footprint reuses the same-turn snapshot (no save calls)
                 RuntimeError("boom"),  # flip_footprint raises → captured as result
-                {"success": True, "reloaded": ["/tmp/board.kicad_pcb"], "failed": []},
+                {"success": True, "reloaded": [pcb], "failed": []},
             ]
             result = client.run("edit board", context_block="")
 
@@ -1321,9 +1339,10 @@ class TestRunIntegration:
         assert len(failed) == 1
         assert failed[0]["success"] is False
         assert mock_call_tool.call_args_list[-1][0][1] == "reload_kicad"
-        assert mock_call_tool.call_args_list[-1][0][2] == {"paths": ["/tmp/board.kicad_pcb"]}
+        assert mock_call_tool.call_args_list[-1][0][2] == {"paths": [pcb]}
 
-    def test_framework_snapshots_each_file_once_per_turn(self):
+    def test_framework_snapshots_each_file_once_per_turn(self, board_project):
+        pcb, pro = board_project
         client = _make_client()
         tool_response = {
             "finish_reason": "tool_calls",
@@ -1337,7 +1356,7 @@ class TestRunIntegration:
                             "name": "set_footprint_position",
                             "arguments": json.dumps(
                                 {
-                                    "pcb_path": "/tmp/board.kicad_pcb",
+                                    "pcb_path": pcb,
                                     "items": [{"reference": "R1", "x": 1.0}],
                                 }
                             ),
@@ -1348,9 +1367,7 @@ class TestRunIntegration:
                         "type": "function",
                         "function": {
                             "name": "flip_footprint",
-                            "arguments": json.dumps(
-                                {"pcb_path": "/tmp/board.kicad_pcb", "reference": "R2"}
-                            ),
+                            "arguments": json.dumps({"pcb_path": pcb, "reference": "R2"}),
                         },
                     },
                 ],
@@ -1364,34 +1381,300 @@ class TestRunIntegration:
             mock_call_tool.side_effect = [
                 {"success": True},  # save_document
                 {"success": True, "version_id": "v1"},
-                {"success": True, "pcb_path": "/tmp/board.kicad_pcb"},
-                {"success": True, "pcb_path": "/tmp/board.kicad_pcb"},
-                {"success": True, "reloaded": ["/tmp/board.kicad_pcb"], "failed": []},
+                {"success": True, "pcb_path": pcb},
+                {"success": True, "pcb_path": pcb},
+                {"success": True, "reloaded": [pcb], "failed": []},
             ]
             result = client.run("edit board", context_block="")
 
         assert result == "done"
         assert [c.args for c in mock_call_tool.call_args_list] == [
-            (client._mcp_base_url, "save_document", {"file_path": "/tmp/board.kicad_pcb"}),
+            (client._mcp_base_url, "save_document", {"file_path": pcb}),
             (
                 client._mcp_base_url,
                 "save_project_version",
-                {"project_file": "/tmp/board.kicad_pro"},
+                {"project_file": pro, "include_files": [pcb]},
             ),
             (
                 client._mcp_base_url,
                 "set_footprint_position",
-                {"pcb_path": "/tmp/board.kicad_pcb", "items": [{"reference": "R1", "x": 1.0}]},
+                {"pcb_path": pcb, "items": [{"reference": "R1", "x": 1.0}]},
             ),
             (
                 client._mcp_base_url,
                 "flip_footprint",
-                {"pcb_path": "/tmp/board.kicad_pcb", "reference": "R2"},
+                {"pcb_path": pcb, "reference": "R2"},
             ),
-            (client._mcp_base_url, "reload_kicad", {"paths": ["/tmp/board.kicad_pcb"]}),
+            (client._mcp_base_url, "reload_kicad", {"paths": [pcb]}),
         ]
 
-    def test_explicit_save_project_version_is_reused_by_later_mutation(self):
+    def test_two_files_same_project_each_get_pre_edit_snapshot(self, tmp_path):
+        """A second file edited in the same project/turn gets its own backup."""
+        from kcaa.utils import version_manager as _vm
+
+        pro = tmp_path / "aria.kicad_pro"
+        pro.write_text("{}\n")
+        (tmp_path / "aria.kicad_sch").write_text("root\n")
+        hardware = tmp_path / "hardware"
+        hardware.mkdir()
+        file_a = hardware / "a.kicad_pcb"
+        file_b = hardware / "b.kicad_pcb"
+        file_a.write_text("A-v1\n")
+        file_b.write_text("B-v1\n")
+        state_file = tmp_path / "project_state.json"
+        record = pstate.build_record(str(pro))
+        assert record is not None
+        assert pstate.write_state(str(state_file), record)
+
+        client = _make_client()
+        client._state_file = str(state_file)
+        tool_response = {
+            "finish_reason": "tool_calls",
+            "message": {
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "tcA",
+                        "type": "function",
+                        "function": {
+                            "name": "set_footprint_position",
+                            "arguments": json.dumps(
+                                {
+                                    "pcb_path": str(file_a),
+                                    "items": [{"reference": "R1", "x": 1.0}],
+                                }
+                            ),
+                        },
+                    },
+                    {
+                        "id": "tcB",
+                        "type": "function",
+                        "function": {
+                            "name": "flip_footprint",
+                            "arguments": json.dumps({"pcb_path": str(file_b), "reference": "R2"}),
+                        },
+                    },
+                ],
+            },
+        }
+        client._call_llm = MagicMock(
+            side_effect=[
+                tool_response,
+                {"finish_reason": "stop", "message": {"content": "done"}},
+            ]
+        )
+        client._enabled_tools = {"set_footprint_position", "flip_footprint"}
+
+        calls = []
+
+        def _server(base_url, name, args, timeout=None):
+            calls.append((name, args))
+            if name == "save_project_version":
+                archive = _vm.save_project_version(
+                    args["project_file"], include_files=args.get("include_files")
+                )
+                return {
+                    "success": True,
+                    "version_id": _vm.project_version_id(archive, args["project_file"]),
+                }
+            if name == "reload_kicad":
+                return {"success": True, "reloaded": args["paths"], "failed": []}
+            return {"success": True}
+
+        with patch("kicad_plugin.llm_client.call_mcp_tool", side_effect=_server):
+            result = client.run("edit two files", context_block="")
+
+        assert result == "done"
+        snapshot_args = [args for name, args in calls if name == "save_project_version"]
+        root_sch = str(tmp_path / "aria.kicad_sch")
+        assert [args["include_files"] for args in snapshot_args] == [
+            [str(file_a), str(file_b), root_sch],
+            [str(file_a), str(file_b), root_sch],
+        ]
+
+        versions = _vm.list_project_versions(str(pro))
+        # Both files trigger a snapshot, but each covers the whole project and
+        # the content is unchanged, so the second reuses the first archive.
+        assert len(versions) == 1
+
+        archived: dict[str, bytes] = {}
+        archive_dir = os.path.join(tmp_path, ".versions", "project")
+        for version in versions:
+            archive_path = os.path.join(archive_dir, f"aria.project.{version['id']}.tar.gz")
+            with tarfile.open(archive_path, "r:gz") as tar:
+                for member in tar.getmembers():
+                    if member.name in (
+                        "hardware/a.kicad_pcb",
+                        "hardware/b.kicad_pcb",
+                    ):
+                        fh = tar.extractfile(member)
+                        assert fh is not None
+                        archived[member.name] = fh.read()
+        assert archived == {
+            "hardware/a.kicad_pcb": b"A-v1\n",
+            "hardware/b.kicad_pcb": b"B-v1\n",
+        }
+
+    @staticmethod
+    def _nested_sheet_project(tmp_path):
+        pro = tmp_path / "aria.kicad_pro"
+        pro.write_text("{}\n")
+        root_sch = tmp_path / "aria.kicad_sch"
+        root_sch.write_text("root-v1\n")
+        hardware = tmp_path / "hardware"
+        hardware.mkdir()
+        nested = hardware / "main_bus.kicad_sch"
+        nested.write_text("nested-v1\n")
+        state_file = tmp_path / "project_state.json"
+        record = pstate.build_record(str(pro))
+        assert record is not None
+        assert pstate.write_state(str(state_file), record)
+        return pro, root_sch, nested, state_file
+
+    def _run_two_tool_calls(self, client, first, second):
+        responses = [
+            {"finish_reason": "tool_calls", "message": {"content": "", "tool_calls": [first]}},
+            {"finish_reason": "tool_calls", "message": {"content": "", "tool_calls": [second]}},
+            {"finish_reason": "stop", "message": {"content": "done"}},
+        ]
+        client._call_llm = MagicMock(side_effect=responses)
+        return client.run("edit", context_block="")
+
+    def test_explicit_save_does_not_suppress_uncovered_nested_sheet(self, tmp_path):
+        """An explicit save covers only its reported files; a nested edit still snapshots."""
+        from kcaa.utils import version_manager as _vm
+
+        pro, root_sch, nested, state_file = self._nested_sheet_project(tmp_path)
+        calls = []
+
+        def _server(base_url, name, args, timeout=None):
+            calls.append((name, args))
+            if name == "save_project_version":
+                files = sorted(
+                    _vm.project_file_set(
+                        args["project_file"], extra_files=args.get("include_files")
+                    )
+                )
+                archive = _vm.save_project_version(
+                    args["project_file"], include_files=args.get("include_files")
+                )
+                return {
+                    "success": True,
+                    "version_id": _vm.project_version_id(archive, args["project_file"]),
+                    "files": files,
+                }
+            if name == "set_symbol_property":
+                nested.write_text("nested-v2\n")
+            if name == "reload_kicad":
+                return {"success": True, "reloaded": args["paths"], "failed": []}
+            return {"success": True}
+
+        client = _make_client()
+        client._state_file = str(state_file)
+        client._enabled_tools = {"save_project_version", "set_symbol_property"}
+        with patch("kicad_plugin.llm_client.call_mcp_tool", side_effect=_server):
+            result = self._run_two_tool_calls(
+                client,
+                _tool_call("s1", "save_project_version", {"project_file": str(pro)}),
+                _tool_call("e1", "set_symbol_property", {"schematic_path": str(nested)}),
+            )
+
+        assert result == "done"
+        names = [name for name, _ in calls]
+        assert "save_document" in names
+        assert any(
+            name == "save_project_version"
+            and args.get("include_files") == [str(root_sch), str(nested)]
+            for name, args in calls
+        )
+        versions = _vm.list_project_versions(str(pro))
+        assert len(versions) == 2
+        archived = {}
+        for version in versions:
+            archive_path = os.path.join(
+                tmp_path, ".versions", "project", f"aria.project.{version['id']}.tar.gz"
+            )
+            with tarfile.open(archive_path, "r:gz") as tar:
+                for member in tar.getmembers():
+                    if member.name == "hardware/main_bus.kicad_sch":
+                        fh = tar.extractfile(member)
+                        assert fh is not None
+                        archived[version["id"]] = fh.read()
+        assert b"nested-v1\n" in archived.values()
+
+    def test_explicit_save_still_suppresses_covered_root_sheet(self, tmp_path):
+        """A root sheet in the explicit save's files list needs no second snapshot."""
+        from kcaa.utils import version_manager as _vm
+
+        pro, root_sch, _nested, state_file = self._nested_sheet_project(tmp_path)
+        calls = []
+
+        def _server(base_url, name, args, timeout=None):
+            calls.append((name, args))
+            if name == "save_project_version":
+                files = sorted(_vm.project_file_set(args["project_file"]))
+                archive = _vm.save_project_version(args["project_file"])
+                return {
+                    "success": True,
+                    "version_id": _vm.project_version_id(archive, args["project_file"]),
+                    "files": files,
+                }
+            if name == "reload_kicad":
+                return {"success": True, "reloaded": args["paths"], "failed": []}
+            return {"success": True}
+
+        client = _make_client()
+        client._state_file = str(state_file)
+        client._enabled_tools = {"save_project_version", "set_symbol_property"}
+        with patch("kicad_plugin.llm_client.call_mcp_tool", side_effect=_server):
+            result = self._run_two_tool_calls(
+                client,
+                _tool_call("s1", "save_project_version", {"project_file": str(pro)}),
+                _tool_call("e1", "set_symbol_property", {"schematic_path": str(root_sch)}),
+            )
+
+        assert result == "done"
+        names = [name for name, _ in calls]
+        assert names.count("save_project_version") == 1
+        assert "save_document" not in names
+        assert len(_vm.list_project_versions(str(pro))) == 1
+
+    def test_restore_covers_only_files_it_reported(self, tmp_path):
+        """Files absent from the restored archive are not suppressed."""
+        pro, root_sch, nested, state_file = self._nested_sheet_project(tmp_path)
+        calls = []
+
+        def _server(base_url, name, args, timeout=None):
+            calls.append((name, args))
+            if name == "restore_project_version":
+                return {"success": True, "files": ["aria.kicad_sch"]}
+            if name == "reload_kicad":
+                return {"success": True, "reloaded": args["paths"], "failed": []}
+            return {"success": True}
+
+        client = _make_client()
+        client._state_file = str(state_file)
+        client._enabled_tools = {"restore_project_version", "set_symbol_property"}
+        with patch("kicad_plugin.llm_client.call_mcp_tool", side_effect=_server):
+            result = self._run_two_tool_calls(
+                client,
+                _tool_call(
+                    "r1", "restore_project_version", {"project_file": str(pro), "version_id": "v1"}
+                ),
+                _tool_call("e1", "set_symbol_property", {"schematic_path": str(nested)}),
+            )
+
+        assert result == "done"
+        names = [name for name, _ in calls]
+        assert "save_document" in names
+        assert any(
+            name == "save_project_version"
+            and args.get("include_files") == [str(root_sch), str(nested)]
+            for name, args in calls
+        )
+
+    def test_explicit_save_project_version_is_reused_by_later_mutation(self, board_project):
+        pcb, pro = board_project
         client = _make_client()
         save_response = {
             "finish_reason": "tool_calls",
@@ -1403,7 +1686,7 @@ class TestRunIntegration:
                         "type": "function",
                         "function": {
                             "name": "save_project_version",
-                            "arguments": json.dumps({"project_file": "/tmp/board.kicad_pro"}),
+                            "arguments": json.dumps({"project_file": pro}),
                         },
                     }
                 ],
@@ -1421,7 +1704,7 @@ class TestRunIntegration:
                             "name": "set_footprint_position",
                             "arguments": json.dumps(
                                 {
-                                    "pcb_path": "/tmp/board.kicad_pcb",
+                                    "pcb_path": pcb,
                                     "items": [{"reference": "R1", "x": 1.0}],
                                 }
                             ),
@@ -1436,9 +1719,13 @@ class TestRunIntegration:
 
         with patch("kicad_plugin.llm_client.call_mcp_tool") as mock_call_tool:
             mock_call_tool.side_effect = [
-                {"success": True, "version_id": "v1"},
-                {"success": True, "pcb_path": "/tmp/board.kicad_pcb"},
-                {"success": True, "reloaded": ["/tmp/board.kicad_pcb"], "failed": []},
+                {
+                    "success": True,
+                    "version_id": "v1",
+                    "files": ["board.kicad_pro", "board.kicad_sch", "board.kicad_pcb"],
+                },
+                {"success": True, "pcb_path": pcb},
+                {"success": True, "reloaded": [pcb], "failed": []},
             ]
             result = client.run("edit board", context_block="")
 
@@ -1447,17 +1734,18 @@ class TestRunIntegration:
             (
                 client._mcp_base_url,
                 "save_project_version",
-                {"project_file": "/tmp/board.kicad_pro"},
+                {"project_file": pro},
             ),
             (
                 client._mcp_base_url,
                 "set_footprint_position",
-                {"pcb_path": "/tmp/board.kicad_pcb", "items": [{"reference": "R1", "x": 1.0}]},
+                {"pcb_path": pcb, "items": [{"reference": "R1", "x": 1.0}]},
             ),
-            (client._mcp_base_url, "reload_kicad", {"paths": ["/tmp/board.kicad_pcb"]}),
+            (client._mcp_base_url, "reload_kicad", {"paths": [pcb]}),
         ]
 
-    def test_mutation_returns_error_when_auto_snapshot_fails(self):
+    def test_mutation_returns_error_when_auto_snapshot_fails(self, board_project):
+        pcb, pro = board_project
         client = _make_client()
         tool_response = {
             "finish_reason": "tool_calls",
@@ -1471,7 +1759,7 @@ class TestRunIntegration:
                             "name": "set_footprint_position",
                             "arguments": json.dumps(
                                 {
-                                    "pcb_path": "/tmp/board.kicad_pcb",
+                                    "pcb_path": pcb,
                                     "items": [{"reference": "R1", "x": 1.0}],
                                 }
                             ),
@@ -1490,11 +1778,11 @@ class TestRunIntegration:
 
         assert result == "done"
         assert [c.args for c in mock_call_tool.call_args_list] == [
-            (client._mcp_base_url, "save_document", {"file_path": "/tmp/board.kicad_pcb"}),
+            (client._mcp_base_url, "save_document", {"file_path": pcb}),
             (
                 client._mcp_base_url,
                 "save_project_version",
-                {"project_file": "/tmp/board.kicad_pro"},
+                {"project_file": pro, "include_files": [pcb]},
             ),
         ]
         tool_results = [m for m in client._history if m["role"] == "tool"]
@@ -1722,13 +2010,14 @@ class TestMCPToolTimeoutAndInterrupt:
         assert len(tool_results) == 1
         assert json.loads(tool_results[0]["content"])["interrupted"] is True
 
-    def test_failed_call_result_written_into_session_payload(self):
+    def test_failed_call_result_written_into_session_payload(self, board_project):
         """A failed tool call must write a result entry carrying the
         server-side error into the session payload (llm_history), so the next
         turn can see why the call failed."""
+        pcb, _pro = board_project
         client = _make_client()
         route_args = {
-            "pcb_path": "/tmp/board.kicad_pcb",
+            "pcb_path": pcb,
             "ref_a": "U11",
             "pad_a": "3v3",
             "ref_b": "J2",
@@ -2016,16 +2305,17 @@ class TestMCPToolTimeoutAndInterrupt:
         for m in tool_results:
             assert json.loads(m["content"])["interrupted"] is True
 
-    def test_snapshot_phase_timeout_aborts_turn_with_marker(self):
+    def test_snapshot_phase_timeout_aborts_turn_with_marker(self, board_project):
         """A Stop/deadline landing during the pre-tool snapshot phase must
         carry the marker: the turn aborts with [Error] and records
         timed_out, and the main tool never runs with a fresh deadline."""
+        pcb, _pro = board_project
         client = _make_client()
         client._mcp_tool_timeout = 0.05
         client._call_llm = MagicMock(
             return_value=self._tool_response(
                 name="pcb_route_pad_to_pad",
-                args={"pcb_path": "/tmp/board.kicad_pcb", "pad1": "A1", "pad2": "B2"},
+                args={"pcb_path": pcb, "pad1": "A1", "pad2": "B2"},
             )
         )
         client._enabled_tools = {"pcb_route_pad_to_pad"}
@@ -5313,6 +5603,23 @@ def _tool_result(tcid, content):
 class TestPruneRollbackHistory:
     """Unit tests for rollback-aware history pruning."""
 
+    @pytest.fixture(autouse=True)
+    def _resolve_synthetic_projects(self, monkeypatch):
+        """Stub project resolution for synthetic (nonexistent) history paths.
+
+        The canonical resolver requires a real ``.kicad_pro`` on disk;
+        pruning only needs the path-to-project mapping, so these tests keep
+        the original same-stem rule.
+        """
+
+        def fake_project_path(file_path, record):
+            directory = os.path.dirname(os.path.abspath(file_path))
+            name = os.path.basename(file_path)
+            stem = name.split(".kicad_")[0] if ".kicad_" in name else os.path.splitext(name)[0]
+            return os.path.join(directory, f"{stem}.kicad_pro")
+
+        monkeypatch.setattr(llm_client, "_project_path_from_record", fake_project_path)
+
     # ---- Helpers ---------------------------------------------------------------
 
     @staticmethod
@@ -5438,6 +5745,51 @@ class TestPruneRollbackHistory:
         assert roles == ["user", "assistant", "tool", "assistant", "tool", "user"]
         # The pruned history should contain: save user+assistant+save_result, restore user+restore_result, final user
         # (empty assistant removed since all its tool_calls pruned)
+
+    def test_prune_reads_the_state_file_once(self, monkeypatch):
+        history = self._make_history(
+            [
+                ("user", "start"),
+                (
+                    "assistant+tc",
+                    [_tool_call("s1", "save_project_version", {"project_file": "f.kicad_pro"})],
+                ),
+                ("tool+save", "f.sch", "v1", "s1"),
+                (
+                    "assistant+tc",
+                    [_tool_call("tcA", "add_symbol_to_schematic", {"file_path": "f.sch"})],
+                ),
+                ("tool", "tcA", '{"uuid": "A"}'),
+                ("assistant+tc", [_tool_call("tcB", "move_component", {"file_path": "f.sch"})]),
+                ("tool", "tcB", '{"ok": true}'),
+                (
+                    "assistant+tc",
+                    [
+                        _tool_call(
+                            "rst",
+                            "restore_project_version",
+                            {"project_file": "f.kicad_pro", "version_id": "v1"},
+                        )
+                    ],
+                ),
+                ("tool+restore", "f.sch", "v1", "rst"),
+            ]
+        )
+        client = _make_client()
+        client._history = history
+        reads = []
+        real_read = llm_client.project_state.read_state
+
+        def counting_read(path):
+            reads.append(path)
+            return real_read(path)
+
+        monkeypatch.setattr(llm_client.project_state, "read_state", counting_read)
+
+        client._prune_rollback_history()
+
+        assert len(client._history) < len(history)  # pruning actually ran
+        assert len(reads) == 1
 
     def test_non_file_touching_turns_preserved(self):
         history = self._make_history(
@@ -7154,17 +7506,18 @@ class TestSkillAutoInject:
     def _ok_server(self, *_args, **_kwargs):
         return {"success": True}
 
-    def test_first_declared_tool_call_injects_skill_body(self, tmp_path):
+    def test_first_declared_tool_call_injects_skill_body(self, tmp_path, board_project):
         """Red-green core: after a call to a declared tool, the skill body is
         present in history as a user-role message positioned AFTER that
         batch's tool results."""
+        pcb, _pro = board_project
         client, skills_dir = self._client_with_placement_tool(tmp_path)
         client._call_llm = MagicMock(
             side_effect=[
                 self._tool_response(
                     "set_footprint_position",
                     args={
-                        "pcb_path": "/tmp/board.kicad_pcb",
+                        "pcb_path": pcb,
                         "items": [{"reference": "R1", "x": 1.0}],
                     },
                 ),
@@ -7190,11 +7543,12 @@ class TestSkillAutoInject:
         assert guide_idx > tool_idx
         assert client._injected_skills == {"pcb-placement"}
 
-    def test_repeat_trigger_injects_nothing(self, tmp_path):
+    def test_repeat_trigger_injects_nothing(self, tmp_path, board_project):
         """A second call to a declared tool in the same session is a pure
         no-op: no body, no 'already loaded' note, no extra mutation."""
+        pcb, _pro = board_project
         client, skills_dir = self._client_with_placement_tool(tmp_path)
-        args = {"pcb_path": "/tmp/board.kicad_pcb", "items": [{"reference": "R1", "x": 1.0}]}
+        args = {"pcb_path": pcb, "items": [{"reference": "R1", "x": 1.0}]}
         client._call_llm = MagicMock(
             side_effect=[
                 self._tool_response("set_footprint_position", tc_id="tc1", args=args),
@@ -7261,10 +7615,11 @@ class TestSkillAutoInject:
         assert any("ghost_tool" in w and "ghost-skill" in w for w in warnings)
         assert mapping["ghost_tool"].name == "ghost-skill"
 
-    def test_system_prompt_byte_identical_before_after_injection(self, tmp_path):
+    def test_system_prompt_byte_identical_before_after_injection(self, tmp_path, board_project):
         """Injection must never touch the system prompt (cache stability)."""
+        pcb, _pro = board_project
         client, skills_dir = self._client_with_placement_tool(tmp_path)
-        args = {"pcb_path": "/tmp/board.kicad_pcb", "items": [{"reference": "R1", "x": 1.0}]}
+        args = {"pcb_path": pcb, "items": [{"reference": "R1", "x": 1.0}]}
         client._call_llm = MagicMock(
             side_effect=[
                 self._tool_response("set_footprint_position", tc_id="tc1", args=args),
@@ -7282,12 +7637,13 @@ class TestSkillAutoInject:
         assert len(systems) == 3
         assert systems[0] == systems[1] == systems[2]
 
-    def test_no_user_message_between_assistant_and_tool_results(self, tmp_path):
+    def test_no_user_message_between_assistant_and_tool_results(self, tmp_path, board_project):
         """Provider pairing stays intact: every assistant tool_calls message
         is immediately followed by its role:'tool' results, even when a skill
         guide was injected after the previous batch."""
+        pcb, _pro = board_project
         client, skills_dir = self._client_with_placement_tool(tmp_path)
-        args = {"pcb_path": "/tmp/board.kicad_pcb", "items": [{"reference": "R1", "x": 1.0}]}
+        args = {"pcb_path": pcb, "items": [{"reference": "R1", "x": 1.0}]}
         client._call_llm = MagicMock(
             side_effect=[
                 self._tool_response("set_footprint_position", tc_id="tc1", args=args),
@@ -7840,3 +8196,539 @@ class TestProxyEndToEnd:
         assert status == 200
         assert text == '{"ok": true}'
         assert proxy.requests == []
+
+
+class TestProjectResolutionBeforeEdit:
+    """The pre-edit snapshot resolves the real project, never a sibling guess."""
+
+    @staticmethod
+    def _nested_project(tmp_path):
+        pro = tmp_path / "aria.kicad_pro"
+        pro.write_text("{}\n")
+        sheet = tmp_path / "hardware" / "main_bus.kicad_sch"
+        sheet.parent.mkdir()
+        sheet.write_text("(kicad_sch)\n")
+        return pro, sheet
+
+    def test_missing_state_returns_none_with_retry_and_no_search(self, tmp_path, monkeypatch):
+        _pro, sheet = self._nested_project(tmp_path)
+        searches = []
+        monkeypatch.setattr(
+            "kicad_plugin.project_resolution.find_project_file",
+            lambda path: searches.append(path),
+        )
+
+        resolved, error = llm_client._resolve_project(str(sheet), str(tmp_path / "absent.json"))
+
+        assert resolved is None
+        assert "retry" in error
+        assert searches == []
+
+    @staticmethod
+    def _write_state(state_file, pro, root, profile_file=None, **overrides):
+        payload = {
+            "version": 2,
+            "written_at": "2026-11-17T09:12:33Z",
+            "project_root": str(root),
+            "profile_file": profile_file or os.path.basename(str(pro)),
+            "pcb_files": [],
+            "schematic_files": [],
+        }
+        payload.update(overrides)
+        state_file.write_text(json.dumps(payload), encoding="utf-8")
+
+    def test_state_record_owns_paths_inside_root(self, tmp_path):
+        root = tmp_path / "proj"
+        root.mkdir()
+        pro = root / "board.kicad_pro"
+        pro.write_text("{}\n")
+        sheet = root / "hardware" / "main.kicad_sch"
+        sheet.parent.mkdir()
+        sheet.write_text("(kicad_sch)\n")
+        state_file = tmp_path / "project_state.json"
+        self._write_state(state_file, pro, root)
+
+        assert llm_client._project_path_for(str(sheet), str(state_file)) == str(pro)
+
+    def test_valid_profile_outside_root_is_refused_even_if_it_exists(self, tmp_path):
+        root_a = tmp_path / "a"
+        root_a.mkdir()
+        pro_a = root_a / "a.kicad_pro"
+        pro_a.write_text("{}\n")
+        root_b = tmp_path / "b"
+        root_b.mkdir()
+        pro_b = root_b / "b.kicad_pro"
+        pro_b.write_text("{}\n")
+        sheet_b = root_b / "b.kicad_sch"
+        sheet_b.write_text("(kicad_sch)\n")
+        state_file = tmp_path / "project_state.json"
+        self._write_state(state_file, pro_a, root_a)
+
+        assert llm_client._project_path_for(str(sheet_b), str(state_file)) is None
+        resolved, error = llm_client._resolve_project(str(sheet_b), str(state_file))
+        assert resolved is None
+        assert str(root_a) in error
+
+    def test_deleted_profile_file_fails_with_retry(self, tmp_path):
+        root = tmp_path / "proj"
+        root.mkdir()
+        old = root / "old.kicad_pro"
+        old.write_text("{}\n")
+        replacement = root / "new.kicad_pro"
+        replacement.write_text("{}\n")
+        sheet = root / "board.kicad_sch"
+        sheet.write_text("(kicad_sch)\n")
+        state_file = tmp_path / "project_state.json"
+        self._write_state(state_file, old, root)
+        old.unlink()
+
+        resolved, error = llm_client._resolve_project(str(sheet), str(state_file))
+
+        assert resolved is None
+        assert "retry" in error
+
+    def test_stale_profile_does_not_escape_to_another_root(self, tmp_path):
+        root = tmp_path / "proj"
+        root.mkdir()
+        old = root / "old.kicad_pro"
+        old.write_text("{}\n")
+        state_file = tmp_path / "project_state.json"
+        self._write_state(state_file, old, root)
+        old.unlink()
+
+        other = tmp_path / "other"
+        other.mkdir()
+        pro = other / "other.kicad_pro"
+        pro.write_text("{}\n")
+        sheet = other / "other.kicad_sch"
+        sheet.write_text("(kicad_sch)\n")
+
+        assert llm_client._project_path_for(str(sheet), str(state_file)) is None
+
+    @pytest.mark.parametrize("payload", ["{not json", "null", '{"version": 1}'])
+    def test_invalid_state_returns_none_with_retry(self, tmp_path, payload):
+        _pro, sheet = self._nested_project(tmp_path)
+        state_file = tmp_path / "project_state.json"
+        state_file.write_text(payload, encoding="utf-8")
+
+        resolved, error = llm_client._resolve_project(str(sheet), str(state_file))
+
+        assert resolved is None
+        assert "retry" in error
+
+    def test_nested_sheet_snapshot_uses_root_project_and_includes_sheet(self, tmp_path):
+        pro, sheet = self._nested_project(tmp_path)
+        state_file = tmp_path / "project_state.json"
+        self._write_state(
+            state_file,
+            pro,
+            tmp_path,
+            schematic_files=["hardware/main_bus.kicad_sch"],
+        )
+        client = _make_client()
+        client._state_file = str(state_file)
+        tool_response = {
+            "finish_reason": "tool_calls",
+            "message": {
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "tc1",
+                        "type": "function",
+                        "function": {
+                            "name": "add_symbol_to_schematic",
+                            "arguments": json.dumps({"schematic_path": str(sheet)}),
+                        },
+                    }
+                ],
+            },
+        }
+        final_response = {"finish_reason": "stop", "message": {"content": "done"}}
+        client._call_llm = MagicMock(side_effect=[tool_response, final_response])
+        client._enabled_tools = {"add_symbol_to_schematic"}
+
+        with patch("kicad_plugin.llm_client.call_mcp_tool") as mock_call_tool:
+            mock_call_tool.side_effect = [
+                {"success": True},  # save_document
+                {"success": True, "version_id": "v1"},
+                {"success": True},
+                {"success": True, "reloaded": [str(sheet)], "failed": []},
+            ]
+            result = client.run("add a symbol", context_block="")
+
+        assert result == "done"
+        assert [c.args for c in mock_call_tool.call_args_list][:2] == [
+            (client._mcp_base_url, "save_document", {"file_path": str(sheet)}),
+            (
+                client._mcp_base_url,
+                "save_project_version",
+                {"project_file": str(pro), "include_files": [str(sheet)]},
+            ),
+        ]
+
+    def test_missing_state_fails_actionably_without_snapshot(self, tmp_path, monkeypatch):
+        sheet = tmp_path / "hardware" / "main_bus.kicad_sch"
+        sheet.parent.mkdir()
+        sheet.write_text("(kicad_sch)\n")
+        searches = []
+        monkeypatch.setattr(
+            "kicad_plugin.project_resolution.find_project_file",
+            lambda path: searches.append(path),
+        )
+        client = _make_client()
+        tool_response = {
+            "finish_reason": "tool_calls",
+            "message": {
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "tc1",
+                        "type": "function",
+                        "function": {
+                            "name": "add_symbol_to_schematic",
+                            "arguments": json.dumps({"schematic_path": str(sheet)}),
+                        },
+                    }
+                ],
+            },
+        }
+        final_response = {"finish_reason": "stop", "message": {"content": "done"}}
+        client._call_llm = MagicMock(side_effect=[tool_response, final_response])
+        client._enabled_tools = {"add_symbol_to_schematic"}
+
+        with patch("kicad_plugin.llm_client.call_mcp_tool") as mock_call_tool:
+            mock_call_tool.return_value = {"success": True}
+            result = client.run("add a symbol", context_block="")
+
+        assert result == "done"
+        called_names = [c.args[1] for c in mock_call_tool.call_args_list]
+        assert called_names == []  # neither save_document nor the edit tool ran
+        assert searches == []  # no filesystem fallback on the read side
+        tool_results = [m for m in client._history if m["role"] == "tool"]
+        failed = json.loads(tool_results[0]["content"])
+        assert failed["success"] is False
+        assert "retry" in failed["error"]
+
+
+class TestWholeProjectSnapshot:
+    """The pre-edit snapshot covers every board and sheet in the project."""
+
+    @staticmethod
+    def _project(tmp_path):
+        root = tmp_path / "proj"
+        root.mkdir()
+        pro = root / "proj.kicad_pro"
+        pro.write_text("{}\n")
+        root_sch = root / "proj.kicad_sch"
+        root_sch.write_text("root\n")
+        hardware = root / "hardware"
+        hardware.mkdir()
+        nested_sch = hardware / "main.kicad_sch"
+        nested_sch.write_text("nested\n")
+        pcb = hardware / "main.kicad_pcb"
+        pcb.write_text("(kicad_pcb)\n")
+        state_file = tmp_path / "project_state.json"
+        state_file.write_text(
+            json.dumps(
+                {
+                    "version": 2,
+                    "written_at": "2026-11-17T09:12:33Z",
+                    "project_root": str(root),
+                    "profile_file": pro.name,
+                    "pcb_files": ["hardware/main.kicad_pcb"],
+                    "schematic_files": ["proj.kicad_sch", "hardware/main.kicad_sch"],
+                }
+            ),
+            encoding="utf-8",
+        )
+        return pro, root_sch, nested_sch, pcb, state_file
+
+    def test_manifest_becomes_absolute_include_list(self, tmp_path):
+        pro, root_sch, nested_sch, pcb, state_file = self._project(tmp_path)
+
+        assert llm_client._snapshot_include_files(str(pro), str(nested_sch), str(state_file)) == [
+            str(pcb),
+            str(root_sch),
+            str(nested_sch),
+        ]
+
+    def test_include_list_ignores_files_outside_the_manifest(self, tmp_path):
+        pro, _root_sch, nested_sch, _pcb, state_file = self._project(tmp_path)
+        unlisted = pro.parent / "unlisted.kicad_sch"
+        unlisted.write_text("unlisted\n")
+
+        files = llm_client._snapshot_include_files(str(pro), str(nested_sch), str(state_file))
+
+        assert str(unlisted) not in files
+
+    def test_touched_file_outside_root_raises(self, tmp_path):
+        pro, _root_sch, _nested_sch, _pcb, state_file = self._project(tmp_path)
+        other = tmp_path / "other"
+        other.mkdir()
+        touched = other / "elsewhere.kicad_sch"
+        touched.write_text("(kicad_sch)\n")
+
+        with pytest.raises(
+            llm_client.ProjectSnapshotUnavailable, match="outside the current project"
+        ):
+            llm_client._snapshot_include_files(str(pro), str(touched), str(state_file))
+
+    def test_touched_file_inside_root_is_included(self, tmp_path):
+        pro, _root_sch, _nested_sch, _pcb, state_file = self._project(tmp_path)
+        touched = pro.parent / "late.kicad_sch"
+        touched.write_text("(kicad_sch)\n")
+
+        files = llm_client._snapshot_include_files(str(pro), str(touched), str(state_file))
+
+        assert str(touched) in files
+
+    def test_missing_state_record_raises(self, tmp_path):
+        pro, _root_sch, nested_sch, _pcb, _state_file = self._project(tmp_path)
+
+        with pytest.raises(llm_client.ProjectSnapshotUnavailable, match="retry"):
+            llm_client._snapshot_include_files(str(pro), str(nested_sch), None)
+
+    def test_state_record_for_another_root_raises(self, tmp_path):
+        pro, _root_sch, nested_sch, _pcb, state_file = self._project(tmp_path)
+        other = tmp_path / "other"
+        other.mkdir()
+        payload = json.loads(state_file.read_text(encoding="utf-8"))
+        payload["project_root"] = str(other)
+        payload["profile_file"] = "other.kicad_pro"
+        (other / "other.kicad_pro").write_text("{}\n")
+        state_file.write_text(json.dumps(payload), encoding="utf-8")
+
+        with pytest.raises(llm_client.ProjectSnapshotUnavailable, match="disagree"):
+            llm_client._snapshot_include_files(str(pro), str(nested_sch), str(state_file))
+
+    def test_missing_project_file_raises(self, tmp_path):
+        pro, _root_sch, nested_sch, _pcb, state_file = self._project(tmp_path)
+        missing_project = pro.parent / "gone.kicad_pro"
+
+        with pytest.raises(llm_client.ProjectSnapshotUnavailable, match="no longer exists"):
+            llm_client._snapshot_include_files(
+                str(missing_project), str(nested_sch), str(state_file)
+            )
+
+    def test_snapshot_unavailable_aborts_before_edit(self, tmp_path, monkeypatch):
+        pro, _root_sch, nested_sch, _pcb, state_file = self._project(tmp_path)
+        client = _make_client()
+        client._state_file = str(state_file)
+
+        def boom(*args, **kwargs):
+            raise llm_client.ProjectSnapshotUnavailable("state disagrees")
+
+        monkeypatch.setattr(llm_client, "_snapshot_include_files", boom)
+        tool_response = {
+            "finish_reason": "tool_calls",
+            "message": {
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "tc1",
+                        "type": "function",
+                        "function": {
+                            "name": "set_symbol_property",
+                            "arguments": json.dumps({"schematic_path": str(nested_sch)}),
+                        },
+                    }
+                ],
+            },
+        }
+        final_response = {"finish_reason": "stop", "message": {"content": "done"}}
+        client._call_llm = MagicMock(side_effect=[tool_response, final_response])
+        client._enabled_tools = {"set_symbol_property"}
+
+        with patch("kicad_plugin.llm_client.call_mcp_tool") as mock_call_tool:
+            mock_call_tool.return_value = {"success": True}
+            result = client.run("edit nested sheet", context_block="")
+
+        assert result == "done"
+        assert [c.args[1] for c in mock_call_tool.call_args_list] == ["save_document"]
+        failed = json.loads([m for m in client._history if m["role"] == "tool"][0]["content"])
+        assert failed["success"] is False
+        assert "Failed to save project version before set_symbol_property" in failed["error"]
+        assert "state disagrees" in failed["error"]
+
+    def test_touched_outside_project_aborts_before_snapshot(self, tmp_path, monkeypatch):
+        pro, _root_sch, _nested_sch, _pcb, state_file = self._project(tmp_path)
+        other = tmp_path / "other"
+        other.mkdir()
+        touched = other / "elsewhere.kicad_sch"
+        touched.write_text("(kicad_sch)\n")
+        client = _make_client()
+        client._state_file = str(state_file)
+        # Simulate a resolver that let the outside path through; the snapshot
+        # must still refuse it before save_project_version or the edit runs.
+        monkeypatch.setattr(
+            llm_client, "_resolve_project", lambda path, state_file=None: (str(pro), None)
+        )
+        tool_response = {
+            "finish_reason": "tool_calls",
+            "message": {
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "tc1",
+                        "type": "function",
+                        "function": {
+                            "name": "set_symbol_property",
+                            "arguments": json.dumps({"schematic_path": str(touched)}),
+                        },
+                    }
+                ],
+            },
+        }
+        final_response = {"finish_reason": "stop", "message": {"content": "done"}}
+        client._call_llm = MagicMock(side_effect=[tool_response, final_response])
+        client._enabled_tools = {"set_symbol_property"}
+
+        with patch("kicad_plugin.llm_client.call_mcp_tool") as mock_call_tool:
+            mock_call_tool.return_value = {"success": True}
+            result = client.run("edit elsewhere", context_block="")
+
+        assert result == "done"
+        assert [c.args[1] for c in mock_call_tool.call_args_list] == ["save_document"]
+        failed = json.loads([m for m in client._history if m["role"] == "tool"][0]["content"])
+        assert failed["success"] is False
+        assert "outside the current project" in failed["error"]
+
+    def test_snapshot_call_covers_the_whole_project(self, tmp_path):
+        pro, root_sch, nested_sch, pcb, state_file = self._project(tmp_path)
+        client = _make_client()
+        client._state_file = str(state_file)
+        tool_response = {
+            "finish_reason": "tool_calls",
+            "message": {
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "tc1",
+                        "type": "function",
+                        "function": {
+                            "name": "set_symbol_property",
+                            "arguments": json.dumps({"schematic_path": str(nested_sch)}),
+                        },
+                    }
+                ],
+            },
+        }
+        final_response = {"finish_reason": "stop", "message": {"content": "done"}}
+        client._call_llm = MagicMock(side_effect=[tool_response, final_response])
+        client._enabled_tools = {"set_symbol_property"}
+
+        with patch("kicad_plugin.llm_client.call_mcp_tool") as mock_call_tool:
+            mock_call_tool.side_effect = [
+                {"success": True},  # save_document
+                {"success": True, "version_id": "v1"},
+                {"success": True},
+                {"success": True, "reloaded": [str(nested_sch)], "failed": []},
+            ]
+            result = client.run("edit nested sheet", context_block="")
+
+        assert result == "done"
+        assert mock_call_tool.call_args_list[1].args == (
+            client._mcp_base_url,
+            "save_project_version",
+            {
+                "project_file": str(pro),
+                "include_files": [str(pcb), str(root_sch), str(nested_sch)],
+            },
+        )
+
+
+class TestProjectResolvedOncePerToolCall:
+    """One resolution feeds both the pre-edit snapshot and coverage tracking."""
+
+    def test_resolution_is_shared_and_keeps_the_original_project(self, tmp_path, monkeypatch):
+        root_a = tmp_path / "a"
+        root_a.mkdir()
+        pro_a = root_a / "a.kicad_pro"
+        pro_a.write_text("{}\n")
+        sheet_a = root_a / "a.kicad_sch"
+        sheet_a.write_text("(kicad_sch)\n")
+        root_b = tmp_path / "b"
+        root_b.mkdir()
+        pro_b = root_b / "b.kicad_pro"
+        pro_b.write_text("{}\n")
+        (root_b / "b.kicad_sch").write_text("(kicad_sch)\n")
+        state_file = tmp_path / "project_state.json"
+        record_a = pstate.build_record(str(pro_a))
+        assert record_a is not None
+        assert pstate.write_state(str(state_file), record_a)
+        record_b = pstate.build_record(str(pro_b))
+        assert record_b is not None
+
+        client = _make_client()
+        client._state_file = str(state_file)
+        policy = TOOL_POLICIES["set_symbol_property"]
+        monkeypatch.setitem(
+            TOOL_POLICIES,
+            "set_symbol_property",
+            type(policy)(**{**policy.__dict__, "track_snapshot": True}),
+        )
+
+        resolutions = []
+        real_resolve = llm_client._resolve_project
+
+        def counting_resolve(path, state_file=None):
+            resolutions.append(path)
+            return real_resolve(path, state_file)
+
+        monkeypatch.setattr(llm_client, "_resolve_project", counting_resolve)
+
+        def _server(base_url, name, args, timeout=None):
+            if name == "set_symbol_property":
+                # The published project changes between resolution and the
+                # post-success tracking path.
+                assert pstate.write_state(str(state_file), record_b)
+                return {"success": True, "files": ["a.kicad_sch"]}
+            return {"success": True}
+
+        exec_state = llm_client._ToolExecutionState()
+        with patch("kicad_plugin.llm_client.call_mcp_tool", side_effect=_server):
+            result = client._execute_tool_with_policy(
+                "set_symbol_property",
+                {"schematic_path": str(sheet_a)},
+                exec_state,
+                None,
+            )
+
+        assert result["success"] is True
+        assert resolutions == [str(sheet_a)]
+        assert list(exec_state.covered_files) == [str(pro_a)]
+        assert exec_state.covered_files[str(pro_a)] == {"a.kicad_sch"}
+
+    def test_touch_check_reads_state_once(self, tmp_path, monkeypatch):
+        pro = tmp_path / "a.kicad_pro"
+        pro.write_text("{}\n")
+        sheet = tmp_path / "a.kicad_sch"
+        sheet.write_text("(kicad_sch)\n")
+        state_file = tmp_path / "project_state.json"
+        record = pstate.build_record(str(pro))
+        assert record is not None
+        assert pstate.write_state(str(state_file), record)
+        client = _make_client()
+        client._state_file = str(state_file)
+
+        reads = []
+        real_read = pstate.read_state
+
+        def counting_read(path):
+            reads.append(path)
+            return real_read(path)
+
+        monkeypatch.setattr(llm_client.project_state, "read_state", counting_read)
+
+        touches = client._tool_touches_project(
+            {
+                "file_path": str(sheet),
+                "schematic_path": str(sheet),
+                "pcb_path": str(sheet),
+                "project_path": str(pro),
+            },
+            str(pro),
+        )
+
+        assert touches is True
+        assert reads == [str(state_file)]

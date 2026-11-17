@@ -201,12 +201,28 @@ class TestGetEffectiveDesignRules:
         assert result["design_rules"]["hole_clearance"] == 0.25
         assert result["design_rules"]["silk_clearance"] == 0.15
 
-    def test_no_setup_section(self, tmp_path):
-        """When pro file is missing, returns error."""
+    def test_no_setup_section(self, tmp_path, isolated_project_search):
+        """When no owning project exists, returns an actionable error."""
         pcb = _write_pcb(_PCB_NO_SETUP, str(tmp_path))
         result = get_effective_design_rules_from_file(pcb)
         assert result["success"] is False
-        assert "Cannot read project file" in result["error"]
+        assert pcb in result["error"]
+        assert ".kicad_pro" in result["error"]
+        assert "create or save" in result["error"]
+
+    def test_reads_project_rules_for_board_in_subdirectory(self, tmp_path):
+        """A board under a differently named project resolves the root .kicad_pro."""
+        hardware = tmp_path / "hardware"
+        hardware.mkdir()
+        pcb = hardware / "main.kicad_pcb"
+        pcb.write_text(_PCB_TEMPLATE)
+        _write_pro(str(tmp_path), stem="aria")
+
+        result = get_effective_design_rules_from_file(str(pcb))
+
+        assert result["success"] is True
+        assert result["design_rules"]["min_clearance"] == 0.2
+        assert result["design_rules"]["min_track_width"] == 0.15
 
     def test_no_design_rules_subsection(self, tmp_path):
         """When design_settings.rules is missing, returns empty rules."""

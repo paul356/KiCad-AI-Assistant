@@ -196,25 +196,86 @@ plugin data directory.
 
 ### 9.1 How the plugin publishes the open project
 
+The panel probes the open board (`pcbnew.GetBoard().GetFileName()`) and
+resolves the owning `.kicad_pro` by walking upward to the nearest ancestor
+directory that contains one. When that directory holds several projects the
+choice is deterministic: prefer a project whose stem has a matching
+`.kicad_sch`/`.kicad_pcb`, then one whose stem equals the queried file's
+stem, then the lexicographically smallest filename. KiCad 10's scripting API
+exposes no usable project-path accessor, so `board.GetProject()` is not used.
+The panel never derives a project path from a sibling file stem.
+
 `ServerManager` starts the server with `KCAA_PROJECT_STATE_FILE` pointing at
-`<kcaa data dir>/active_project.json`. The panel atomically writes that file
-(temp file + `os.replace`) whenever it knows the active project:
+`<kcaa data dir>/project_state.json`. The panel atomically writes the schema
+v2 record (temp file + `os.replace`) on the first successful probe and
+whenever the project or its file manifest changes:
 
 ```json
-{"project_root": "/home/user/MyProject"}
+{
+  "version": 2,
+  "written_at": "2026-11-17T09:12:33Z",
+  "project_root": "<project_root>",
+  "profile_file": "MyProject.kicad_pro",
+  "pcb_files": ["MyProject.kicad_pcb"],
+  "schematic_files": ["MyProject.kicad_sch"]
+}
 ```
 
-With no project open (two consecutive empty probes after the project closes)
-it writes `{"project_root": null}`. The server re-reads the (tiny) file on
-every path validation and re-points the project root **in place** when the
-value changed — switching projects needs no server restart and no panel
-teardown. A missing, unreadable or malformed state file keeps the current
-root; the file is written by the plugin, never by the model.
+The writer never emits `null` or an empty string. The server re-reads the
+(tiny) file on every path validation and re-points the project root **in
+place** when it changes — switching projects needs no server restart and no
+panel teardown. A missing, unreadable, malformed, `null`, old-schema or
+otherwise invalid record **clears** the project root, leaving only the static
+KiCad roots; the file is written by the plugin, never by the model. See
+[project_state.md](project_state.md) for the full contract.
 
 ### 9.2 Empty project root is normal
 
-An empty project root (no state file, or `null`) is a normal state: matching
-then falls back to the KiCad directory roots. Server-generated temp files are
-written to a private `0o700` directory under the kcaa data directory — never
-into the project or a KiCad library directory — so they keep working with no
-project at all.
+An empty project root (no state file, or an invalid record) is a normal
+state: matching then falls back to the KiCad directory roots. Server-generated
+temp files are written to a private `0o700` directory under the kcaa data
+directory — never into the project or a KiCad library directory — so they
+keep working with no project at all.
+
+### 9.3 Pre-edit project snapshot
+
+Before an auto-snapshot mutation the plugin resolves the owning `.kicad_pro`
+from the canonical state record: a path inside the published `project_root`
+uses its `profile_file`; a path outside that root is refused with an error
+naming the active project. There is no fallback search: with no valid record,
+or when the recorded project file has disappeared, the tool call fails
+before the document is touched and reports an actionable retry message. The
+snapshot call receives that project file plus `include_files` naming **the
+whole project**: every `pcb_files` and `schematic_files` entry from the state
+record, converted to absolute paths under `project_root`, together with the
+file about to be edited.
+
+The include list never degrades.  If the record is missing, describes a
+different root than the resolved project, or the project file no longer
+exists, the pre-edit snapshot raises and the edit tool is not called.  Each
+`include_files` entry must be an existing file inside the project directory;
+a bad entry fails the snapshot instead of being dropped.
+
+The same rule backs the Auto Route pre-routing snapshot, so FreeRouting
+cannot change a nested board that the archive does not cover.  Any snapshot
+failure — an unresolvable project, an unavailable include list, or a failing
+`save_project_version` call — aborts the route with a visible warning in the
+conversation; FreeRouting is never started without a whole-project archive.
+
+Snapshot state is keyed by **(project, file) per turn**: editing file A and
+then file B in the same project within one turn produces a snapshot before
+each file's first edit, and every such snapshot archives the whole project.
+Repeated edits to the same file reuse that turn's snapshot. An explicit
+`save_project_version` or `restore_project_version` suppresses the per-file
+snapshot only for the project-relative files it reports covering — the
+archived set for a save, or the restored members for a restore. Any other
+file in the same project still gets its own pre-edit archive.
+
+Because one archive holds the whole project, changing any sub-sheet, board
+or the project file changes the manifest hashes and produces a new archive;
+an unchanged project reuses the latest one. Disk use is approximately the
+project size times `MAX_PROJECT_VERSIONS` (10 by default), since each archive
+is a full compressed copy rather than a delta. Restoring an archive extracts
+every member it contains, so a sub-sheet that was deleted after the snapshot
+is recreated, and the pre-restore backup covers every archived member that
+still exists on disk — the restore is undoable for nested files too.

@@ -12,6 +12,7 @@ import pandas as pd
 # Import the helper functions from bom_tools.py to avoid code duplication
 from kcaa.tools.bom_tools import analyze_bom_data, parse_bom_file
 from kcaa.utils.file_utils import get_project_files
+from kcaa.utils.project_resolution import project_name
 
 log = logging.getLogger(__name__)
 
@@ -53,9 +54,9 @@ def register_bom_resources(mcp: FastMCP) -> None:
             return f"# BOM Report\n\nNo BOM files found for project: {os.path.basename(project_path)}.\n\nExport a BOM from KiCad first, or use the `export_bom_csv` tool to generate one."
 
         # Format as Markdown report
-        project_name = os.path.basename(project_path)[:-10]  # Remove .kicad_pro
+        project_label = project_name(project_path) or os.path.basename(project_path)
 
-        report = f"# Bill of Materials for {project_name}\n\n"
+        report = f"# Bill of Materials for {project_label}\n\n"
 
         # Process each BOM file
         for file_type, file_path in bom_files.items():
@@ -260,7 +261,10 @@ def register_bom_resources(mcp: FastMCP) -> None:
 
         try:
             # Collect data from all BOM files
-            result = {"project": os.path.basename(project_path)[:-10], "bom_files": {}}
+            result = {
+                "project": project_name(project_path) or os.path.basename(project_path),
+                "bom_files": {},
+            }
 
             for file_type, file_path in bom_files.items():
                 # If it's already JSON, parse it directly

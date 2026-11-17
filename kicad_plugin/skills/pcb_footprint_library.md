@@ -5,8 +5,9 @@ description: "Footprint index sync, library listing, search, and inspection"
 tools: [sync_footprint_index, get_footprint_sync_status, list_footprint_libraries, list_library_footprints, search_library_footprints, get_library_footprint, find_footprints_not_in_libraries, create_footprint_library, add_footprints_to_library]
 ---
 # Project scope (do this first)
-When working inside a project, pass **`project_path` = the path shown as `Active project`**
-in the conversation context to every footprint index build and lookup. Omitting
+When working inside a project, pass **`project_path` = the `Project root` shown in the
+conversation context** (referred to as `active_project` below) to every footprint index
+build and lookup. Omitting
 `project_path` searches global footprint libraries only and will not find libraries declared
 in the project's own `fp-lib-table`; other projects are never searched.
 

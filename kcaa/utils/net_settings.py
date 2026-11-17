@@ -7,7 +7,6 @@ No KiCad process or kicad-cli is required — all operations are file-based.
 
 import json as _json
 import logging
-import os
 from typing import Any
 
 log = logging.getLogger(__name__)
@@ -24,14 +23,6 @@ _NETCLASS_FIELDS = {
     "diff_pair_gap",
     "diff_pair_via_gap",
 }
-
-
-def _find_pro_file(pcb_file: str) -> str | None:
-    """Given a .kicad_pcb path, return the corresponding .kicad_pro path."""
-    pro_file = pcb_file.replace(".kicad_pcb", ".kicad_pro")
-    if os.path.isfile(pro_file):
-        return pro_file
-    return None
 
 
 def get_net_classes_from_pro(pro_file: str) -> dict[str, Any]:

@@ -1,133 +1,36 @@
-"""
-Context bridge: collect the active KiCad editor context and return it
-as a structured dict that the plugin injects into every LLM request.
+"""Render the published project state as a system-prompt block.
+
+Collection lives in ``kicad_plugin/project_state.py``: the panel scans the
+open project and writes ``project_state.json``; this module only formats the
+validated record.  It never probes KiCad, never reads window titles and keeps
+no cache, so an invalid (or missing) record renders nothing at all.
 """
 
 from __future__ import annotations
 
-import logging
 import os
-import re
-from typing import Any
-
-log = logging.getLogger(__name__)
-
-# KiCad window titles name project/board/schematic files, e.g.
-# "PCB Editor: /path/to/board.kicad_pcb [*]" or a .kicad_pro path.
-_TITLE_PROJECT_RE = re.compile(r"([^\s\[]+\.kicad_pro)\b")
-_TITLE_FRAME_RE = re.compile(r"([^\s\[]+\.kicad_(?:pcb|sch))\b")
 
 
-def project_path_from_title(title: str) -> str | None:
-    """Extract a ``.kicad_pro`` path from a KiCad window title, or None.
+def context_to_system_prompt_block(state: dict | None) -> str:
+    """Render *state* as a plain-text block for the LLM system prompt.
 
-    Editor windows title the active file (``.kicad_pcb`` / ``.kicad_sch``),
-    the project manager window may title the ``.kicad_pro`` itself.  When
-    only a board/schematic path is named, the sibling ``.kicad_pro`` is
-    derived and returned only if it actually exists.
+    Returns an empty string for an invalid/missing record.  The block lists
+    the project root, the project file and both file manifests; it never
+    singles out a "current" file, because the state does not know which
+    editor has focus.
     """
-    for m in _TITLE_PROJECT_RE.finditer(title):
-        return os.path.abspath(m.group(1))
-    m = _TITLE_FRAME_RE.search(title)
-    if not m:
-        return None
-    pro = os.path.splitext(m.group(1))[0] + ".kicad_pro"
-    return os.path.abspath(pro) if os.path.exists(pro) else None
+    if not state:
+        return ""
 
-
-def _try_import_pcbnew():
-    try:
-        import pcbnew  # noqa: F401
-
-        return pcbnew
-    except ImportError:
-        return None
-
-
-def collect_context() -> dict[str, Any]:
-    """
-    Return the current KiCad editor context.
-
-    Fields:
-        active_project     Absolute path to .kicad_pro, or None
-        active_schematic   Absolute path to .kicad_sch (root), or None
-        active_pcb         Absolute path to .kicad_pcb, or None
-        active_sheet       Sheet path in hierarchical schematics, or None
-    """
-    ctx: dict[str, Any] = {
-        "active_project": None,
-        "active_schematic": None,
-        "active_pcb": None,
-        "active_sheet": None,
-    }
-
-    pcbnew = _try_import_pcbnew()
-    if pcbnew is None:
-        log.debug("pcbnew not available — returning empty context")
-        return ctx
-
-    # ------------------------------------------------------------------ #
-    # PCB file path (single GetBoard() call)
-    # ------------------------------------------------------------------ #
-    try:
-        board = pcbnew.GetBoard()
-        if board:
-            pcb_path = board.GetFileName()
-            if pcb_path:
-                ctx["active_pcb"] = os.path.abspath(pcb_path)
-
-                proj_dir = os.path.dirname(pcb_path)
-                proj_name = os.path.splitext(os.path.basename(pcb_path))[0]
-                pro_path = os.path.join(proj_dir, proj_name + ".kicad_pro")
-                if os.path.exists(pro_path):
-                    ctx["active_project"] = os.path.abspath(pro_path)
-
-                sch_path = os.path.join(proj_dir, proj_name + ".kicad_sch")
-                if os.path.exists(sch_path):
-                    ctx["active_schematic"] = os.path.abspath(sch_path)
-    except Exception as e:
-        log.debug("Could not collect PCB context: %s", e)
-
-    return ctx
-
-
-def context_to_system_prompt_block(ctx: dict[str, Any]) -> str:
-    """
-    Render the context dict as a plain-text block for insertion into
-    the LLM system prompt.
-    """
-    lines = ["## Active KiCad Context"]
-
-    if ctx.get("active_project"):
-        lines.append(f"Active project: {ctx['active_project']}")
-    else:
-        lines.append("Active project: (none)")
-
-    if ctx.get("active_schematic"):
-        lines.append(f"Active schematic: {ctx['active_schematic']}")
-    else:
-        lines.append("Active schematic: (none)")
-
-    if ctx.get("active_pcb"):
-        lines.append(f"Active PCB: {ctx['active_pcb']}")
-    else:
-        lines.append("Active PCB: (none)")
-
-    if ctx.get("active_sheet"):
-        lines.append(f"Active sheet path: {ctx['active_sheet']}")
-
-    if ctx.get("active_schematic"):
-        lines.append(
-            f"\nWhen editing the schematic, use {ctx['active_schematic']!r} "
-            "as the schematic_path argument for all editing tools unless the "
-            "engineer specifies a different file."
-        )
-
-    if ctx.get("active_pcb"):
-        lines.append(
-            f"\nWhen editing the PCB, use {ctx['active_pcb']!r} "
-            "as the pcb_path argument for all PCB tools unless the "
-            "engineer specifies a different file."
-        )
-
+    root = state["project_root"]
+    project_file = os.path.join(root, state["profile_file"])
+    lines = [
+        "## Active KiCad Context",
+        f"Project root: {root}",
+        f"Project file: {project_file}",
+        "Schematic files:",
+    ]
+    lines.extend(f"- {os.path.join(root, name)}" for name in state.get("schematic_files", ()))
+    lines.append("PCB files:")
+    lines.extend(f"- {os.path.join(root, name)}" for name in state.get("pcb_files", ()))
     return "\n".join(lines)

@@ -68,10 +68,10 @@ replaced with RAG retrieval later without changing the LLM-facing API.
 
 ## Why Not Context-Based or Keyword-Based Triggering?
 
-Context state (e.g. `active_schematic`) is unreliable — the user may be editing a schematic
-through the plugin even when no file is reported as open. Keyword matching is brittle for
-natural-language requests. Both approaches require pre-request heuristics that add maintenance
-burden.
+Context state (which schematic file the engineer means, for example) is unreliable — the
+user may be editing a schematic through the plugin even when no single file is the obvious
+target. Keyword matching is brittle for natural-language requests. Both approaches require
+pre-request heuristics that add maintenance burden.
 
 The **LLM-as-router** approach (Layer 2) delegates intent detection to the main LLM itself,
 which already reads the full user message. This is more accurate, requires no separate model,

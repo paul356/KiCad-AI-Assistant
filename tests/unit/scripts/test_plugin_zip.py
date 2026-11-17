@@ -81,6 +81,7 @@ def test_legacy_archive_layout(legacy_zip: Path, project: dict) -> None:
         _member(legacy_zip, f"{builder.LEGACY_ROOT}/VERSION").decode().strip() == project["version"]
     )
     assert f"{builder.LEGACY_ROOT}/ui/panel.py" in names
+    assert f"{builder.LEGACY_ROOT}/project_state.py" in names
 
 
 def test_pcm_archive_layout(pcm_zip: Path, project: dict) -> None:
@@ -90,6 +91,7 @@ def test_pcm_archive_layout(pcm_zip: Path, project: dict) -> None:
     assert "plugins/__init__.py" in names
     assert "plugins/VERSION" in names
     assert "plugins/ui/panel.py" in names
+    assert "plugins/project_state.py" in names
     assert _member(pcm_zip, "plugins/VERSION").decode().strip() == project["version"]
     assert builder.LEGACY_ROOT not in _top_level(names)
     assert not any(name.startswith(f"{builder.LEGACY_ROOT}/") for name in names)
@@ -251,3 +253,19 @@ def test_readmes_only_reference_old_folder_name_historically(readme: str) -> Non
         if "kicad_ai_plugin" not in line:
             continue
         assert any(marker in line for marker in historical_markers)
+
+
+def test_main_checks_vendored_project_resolution_before_building(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls = []
+
+    def _run(argv, **_kwargs):
+        calls.append(argv)
+
+    monkeypatch.setattr(builder.subprocess, "run", _run)
+    output = tmp_path / "legacy.zip"
+
+    assert builder.main(["legacy", "-o", str(output)]) == 0
+    assert calls and calls[0][-1] == "--check"
+    assert output.is_file()

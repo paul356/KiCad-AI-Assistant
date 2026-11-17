@@ -31,6 +31,7 @@ from kcaa.utils.pcb_footprint_utils import (
     get_fp_property,
 )
 from kcaa.utils.pcb_sexp_utils import load_pcb
+from kcaa.utils.project_resolution import find_project_file
 from kcaa.utils.sexp_utils import sym_str as _sym
 
 log = logging.getLogger(__name__)
@@ -1510,14 +1511,7 @@ def _resolve_net_data(
     import os
     import re
 
-    # Derive .kicad_pro path
-    base = os.path.splitext(os.path.basename(pcb_path))[0]
-    d = os.path.dirname(pcb_path)
-    pro_path: str | None = None
-    for f in os.listdir(d):
-        if f.startswith(base + ".") and re.match(r".+\.kicad_pro$", f):
-            pro_path = os.path.join(d, f)
-            break
+    pro_path = find_project_file(pcb_path)
 
     # Always set netclass/type (to None if .kicad_pro unavailable)
     for net_name in nets_by_name:

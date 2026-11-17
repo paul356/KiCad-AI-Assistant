@@ -224,12 +224,25 @@ def state_project(tmp_path, monkeypatch):
     import kcaa.utils.path_validator as path_validator_mod
     import kcaa.utils.secure_subprocess as secure_subprocess_mod
 
-    state_file = tmp_path / "active_project.json"
+    state_file = tmp_path / "project_state.json"
     project = tmp_path / "proj"
     project.mkdir()
     schematic = project / "board.kicad_sch"
     schematic.write_text("(kicad_sch)", encoding="utf-8")
-    state_file.write_text(json.dumps({"project_root": str(project)}), encoding="utf-8")
+    (project / "board.kicad_pro").write_text("{}", encoding="utf-8")
+    state_file.write_text(
+        json.dumps(
+            {
+                "version": 2,
+                "written_at": "2026-11-17T09:12:33Z",
+                "project_root": str(project),
+                "profile_file": "board.kicad_pro",
+                "pcb_files": [],
+                "schematic_files": ["board.kicad_sch"],
+            }
+        ),
+        encoding="utf-8",
+    )
 
     monkeypatch.setenv("KCAA_PROJECT_STATE_FILE", str(state_file))
     # Server temp files go to a scratch data dir, not the user's config dir.

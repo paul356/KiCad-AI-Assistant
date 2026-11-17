@@ -26,6 +26,7 @@ import threading
 import time
 from typing import Any
 
+from . import project_state
 from .tool_registry import TOOL_POLICIES, get_missing_tool_policies, get_tool_policy
 
 # Notice colour for wait progress; single source of truth is ui/colors.py
@@ -35,21 +36,123 @@ from .ui.colors import WARN_HEX as _STATUS_EVENT_COLOR_HEX
 log = logging.getLogger(__name__)
 
 
-def _project_path_for(file_path: str) -> str:
-    """Return the .kicad_pro path of the project containing *file_path*.
+class ProjectSnapshotUnavailable(RuntimeError):
+    """The published record cannot back a whole-project snapshot."""
 
-    Accepts a schematic, PCB or project file; the project path shares the
-    directory and the stem up to the ``.kicad_*`` suffix.
+
+def _resolve_project(
+    file_path: str, state_file: str | None = None
+) -> tuple[str | None, str | None]:
+    """Resolve the project owning *file_path* from the published record.
+
+    The state file is the only source: there is no filesystem search
+    fallback.  A missing/invalid record, a path outside the published
+    ``project_root``, or a recorded project file that has disappeared all
+    fail closed with a message telling the user to retry.
+
+    Returns ``(project_file, error)``; exactly one is None.
     """
-    d = os.path.dirname(os.path.abspath(file_path))
-    name = os.path.basename(file_path)
-    for suffix in (".kicad_pro", ".kicad_sch", ".kicad_pcb"):
-        if name.endswith(suffix):
-            stem = name[: -len(suffix)]
-            break
-    else:
-        stem = os.path.splitext(name)[0]
-    return os.path.join(d, f"{stem}.kicad_pro")
+    record = project_state.read_state(state_file)
+    if record is None:
+        return None, (
+            "No KiCad project is published for the plugin. Save the project and open "
+            "its PCB editor so the panel can detect it, then retry; if the panel still "
+            "shows no project, reopen it."
+        )
+    root = record["project_root"]
+    project_file = os.path.join(root, record["profile_file"])
+    if not project_state.is_within(root, file_path):
+        return None, (
+            f"{file_path!r} is outside the active KiCad project <{root}>; "
+            "refusing to resolve a project for it."
+        )
+    if not os.path.isfile(project_file):
+        return None, (
+            f"The project file recorded for <{root}> no longer exists; "
+            "reopen the plugin panel and retry."
+        )
+    return project_file, None
+
+
+def _project_path_from_record(file_path: str, record: dict | None) -> str | None:
+    """Return the ``.kicad_pro`` path *record* assigns to *file_path*, or None.
+
+    Pure resolver for callers that read the state file once and reuse the
+    record (history pruning).  It performs no disk read itself.
+    """
+    if record is None:
+        return None
+    root = record["project_root"]
+    if not project_state.is_within(root, file_path):
+        return None
+    return os.path.join(root, record["profile_file"])
+
+
+def _snapshot_include_files(
+    project_file: str, touched: str, state_file: str | None = None
+) -> list[str]:
+    """Return the absolute files a pre-edit snapshot must cover.
+
+    The canonical project record lists every board and sheet under
+    ``project_root``; when it agrees with *project_file*'s directory those
+    files are returned so one archive holds the whole project.  *touched* is
+    always appended and duplicates are dropped in insertion order.
+
+    Raises :class:`ProjectSnapshotUnavailable` instead of degrading to
+    *touched* whenever the record is missing, describes another root, the
+    project file has disappeared, or *touched* itself is outside
+    ``project_root``.
+    """
+    record = project_state.read_state(state_file)
+    if record is None:
+        raise ProjectSnapshotUnavailable(
+            "No KiCad project is published for the plugin. Save the project and open "
+            "its PCB editor so the panel can detect it, then retry; if the panel still "
+            "shows no project, reopen it."
+        )
+    root = record["project_root"]
+    if os.path.realpath(os.path.dirname(os.path.abspath(project_file))) != os.path.realpath(root):
+        raise ProjectSnapshotUnavailable(
+            "The project state and the resolved project disagree; reopen the panel and retry."
+        )
+    if not os.path.isfile(project_file):
+        raise ProjectSnapshotUnavailable(
+            f"The project file <{project_file}> no longer exists; reopen the panel and retry."
+        )
+    if not project_state.is_within(root, touched):
+        raise ProjectSnapshotUnavailable(
+            f"The file to edit <{touched}> is outside the current project <{root}>; "
+            "reopen the plugin panel and retry."
+        )
+    files = [os.path.join(root, rel) for rel in record["pcb_files"] + record["schematic_files"]]
+    files.append(os.path.abspath(touched))
+    return list(dict.fromkeys(files))
+
+
+def _project_path_for(file_path: str, state_file: str | None = None) -> str | None:
+    """Return the .kicad_pro path of the project owning *file_path*, or None.
+
+    See :func:`_resolve_project`; this never fabricates a sibling path.
+    """
+    return _resolve_project(file_path, state_file)[0]
+
+
+def _project_relative_path(project_file: str, path: str) -> str | None:
+    """Return *path* relative to the project directory, or None if outside.
+
+    Uses the realpath of both ends so a symlinked file is compared by its
+    target, and returns POSIX separators to match ``save_project_version``'s
+    reported ``files`` list.
+    """
+    project_root = os.path.realpath(os.path.dirname(os.path.abspath(project_file)))
+    target = os.path.realpath(os.path.abspath(path))
+    try:
+        rel = os.path.relpath(target, project_root)
+    except ValueError:
+        return None
+    if rel == os.pardir or rel.startswith(os.pardir + os.sep) or os.path.isabs(rel):
+        return None
+    return rel.replace(os.sep, "/")
 
 
 def _normalize_tool_arguments(value: Any) -> str:
@@ -1440,8 +1543,8 @@ _PROMPT_SCHEMATIC = """\
 # Hard rules (schematic)
 - Always call extract_schematic_netlist (or get_schematic_sheet_info) for
   state before making spatial changes. Never invent coordinates.
-- Use the active_schematic path from the context block below as the
-  schematic_path argument for every editing tool.
+- Use an absolute path listed under Schematic files in the context block below
+  as the schematic_path argument for every editing tool.
 - Mutations auto-write a .kicad_sch.bak backup; the framework handles the
   version snapshot and final reload automatically.
 - Report errors clearly. Do not silently retry failed tool calls.
@@ -1467,8 +1570,8 @@ _PROMPT_PCB = """\
 # Hard rules (PCB)
 - Always call get_board_info + list_footprints before making spatial changes.
   Never invent footprint coordinates.
-- Use the active_pcb path from the context block below as the pcb_path
-  argument for every PCB editing tool.
+- Use an absolute path listed under PCB files in the context block below as
+  the pcb_path argument for every PCB editing tool.
 - Mutations auto-write a .kicad_pcb.bak backup; the framework handles the
   version snapshot and final reload automatically.
 - Report errors clearly. Do not silently retry failed tool calls.
@@ -1700,7 +1803,12 @@ def _is_retryable_llm_error(error: str) -> bool:
 class _ToolExecutionState:
     """Per-request framework state for snapshot and reload orchestration."""
 
-    snapshotted_paths: set[str] = field(default_factory=set)
+    # One snapshot per (project, file) per turn, so a second file edited in
+    # the same project still gets its own pre-edit archive.
+    snapshotted_paths: set[tuple[str, str]] = field(default_factory=set)
+    # Explicit save_project_version/restore_project_version calls report the
+    # project-relative files they covered; only those files are suppressed.
+    covered_files: dict[str, set[str]] = field(default_factory=dict)
     dirty_paths: set[str] = field(default_factory=set)
 
 
@@ -1836,6 +1944,14 @@ class LLMClient:
     def __init__(self, settings, mcp_base_url: str) -> None:
         self._settings = settings
         self._mcp_base_url = mcp_base_url
+        config_dir = getattr(settings, "config_dir", None)
+        # Canonical project record written by the panel.  Every project
+        # resolution in this process reads the same file the server does.
+        self._state_file: str | None = (
+            project_state.state_path(config_dir)
+            if config_dir
+            else project_state.state_file_from_env()
+        )
         self._context_tokens: int = getattr(settings, "llm_context_tokens", 128_000)
         self._compact_threshold: float = getattr(settings, "llm_compact_threshold", 0.70)
         self._compact_target_threshold: float = getattr(
@@ -2342,6 +2458,8 @@ class LLMClient:
         Handles nested restores: starts from the most recent restore and skips
         any restore whose messages fall inside an already-pruned range.
         """
+        record = project_state.read_state(self._state_file)
+
         # ---- Build save-point lookup ------------------------------------------
         # For each save_project_version result, record (project_file, version_id) → index.
         save_points: dict[tuple[str, str], int] = {}
@@ -2422,7 +2540,7 @@ class LLMClient:
                             tcj_args = json.loads(tcj["function"].get("arguments", "{}"))
                         except (json.JSONDecodeError, KeyError, TypeError):
                             continue
-                        if self._tool_touches_project(tcj_args, project_file):
+                        if self._tool_touches_project_record(tcj_args, project_file, record):
                             marked.add(j)
                             tool_call_removals.setdefault(pj, []).append(tcj_id)
                 break
@@ -2543,14 +2661,23 @@ class LLMClient:
             log.info("_annotate_stale_queries: tagged %d stale query result(s)", annotated)
 
     @staticmethod
-    def _tool_touches_project(args: dict[str, Any], project_file: str) -> bool:
+    def _tool_touches_project_record(
+        args: dict[str, Any], project_file: str, record: dict | None
+    ) -> bool:
         """Return True if *args* reference any file of *project_file*'s project."""
         target = os.path.abspath(project_file)
         for key in ("file_path", "schematic_path", "pcb_path", "project_path"):
             value = args.get(key)
-            if value and os.path.abspath(_project_path_for(value)) == target:
+            resolved = _project_path_from_record(value, record) if value else None
+            if resolved is not None and resolved == target:
                 return True
         return False
+
+    def _tool_touches_project(self, args: dict[str, Any], project_file: str) -> bool:
+        """Return True if *args* reference any file of *project_file*'s project."""
+        return self._tool_touches_project_record(
+            args, project_file, project_state.read_state(self._state_file)
+        )
 
     def _validate_history(self) -> None:
         """Repair orphaned tool_calls in self._history.
@@ -3028,6 +3155,13 @@ class LLMClient:
         policy = get_tool_policy(tool_name)
         path = self._get_required_path(args, tool_name, policy.path_arg)
 
+        # Resolve the project once for both the pre-edit snapshot and the
+        # post-success coverage tracking of this tool call.
+        project_path: str | None = None
+        project_error: str | None = None
+        if path and (policy.auto_snapshot or policy.track_snapshot):
+            project_path, project_error = _resolve_project(path, self._state_file)
+
         if policy.auto_snapshot:
             if not path:
                 return {
@@ -3037,8 +3171,18 @@ class LLMClient:
                         f"{policy.path_arg!r} argument."
                     ),
                 }
-            project_path = _project_path_for(path)
-            if project_path not in state.snapshotted_paths:
+            if project_path is None:
+                return {
+                    "success": False,
+                    "error": project_error
+                    or f"No .kicad_pro project file found for {path!r}; reopen the panel and retry.",
+                }
+            file_key = (project_path, os.path.abspath(path))
+            file_relative = _project_relative_path(project_path, path)
+            covered = state.covered_files.get(project_path, set())
+            if file_key not in state.snapshotted_paths and (
+                file_relative is None or file_relative not in covered
+            ):
                 # Save the document in KiCad first to sync in-memory changes
                 # (e.g. from IPC operations) to disk before taking a snapshot.
                 save_args = {"file_path": path}
@@ -3061,7 +3205,19 @@ class LLMClient:
                         save_result.get("error", "unknown error"),
                     )
 
-                snapshot_args = {"project_file": project_path}
+                try:
+                    include_files = _snapshot_include_files(project_path, path, self._state_file)
+                except ProjectSnapshotUnavailable as exc:
+                    # A degraded archive silently drops project files the edit
+                    # may touch; fail before the edit tool runs instead.
+                    return self._failure_carrying_markers(
+                        {},
+                        f"Failed to save project version before {tool_name}: {exc}",
+                    )
+                snapshot_args = {
+                    "project_file": project_path,
+                    "include_files": include_files,
+                }
                 snapshot_result = self._call_mcp_tool_guarded(
                     "save_project_version", snapshot_args, cancel_event
                 )
@@ -3074,7 +3230,7 @@ class LLMClient:
                         snapshot_result,
                         f"Failed to save project version before {tool_name}: {error}",
                     )
-                state.snapshotted_paths.add(project_path)
+                state.snapshotted_paths.add(file_key)
 
         result = self._call_mcp_tool_guarded(tool_name, args, cancel_event)
 
@@ -3105,8 +3261,13 @@ class LLMClient:
         if not self._tool_result_succeeded(result):
             return result
 
-        if policy.track_snapshot and path:
-            state.snapshotted_paths.add(_project_path_for(path))
+        if policy.track_snapshot and path and project_path is not None:
+            covered = state.covered_files.setdefault(project_path, set())
+            reported = result.get("files") if isinstance(result, dict) else None
+            if isinstance(reported, list):
+                for rel in reported:
+                    if isinstance(rel, str):
+                        covered.add(rel.replace(os.sep, "/"))
         if policy.clear_dirty_paths_arg:
             reload_paths = args.get(policy.clear_dirty_paths_arg, [])
             if isinstance(reload_paths, list):

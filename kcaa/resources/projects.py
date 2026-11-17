@@ -7,6 +7,7 @@ import os
 from fastmcp import FastMCP
 
 from kcaa.utils.file_utils import get_project_files, load_project_json
+from kcaa.utils.project_resolution import project_name
 
 
 def register_project_resources(mcp: FastMCP) -> None:
@@ -32,7 +33,9 @@ def register_project_resources(mcp: FastMCP) -> None:
             files = get_project_files(project_path)
 
             # Format project details
-            result = f"# Project: {os.path.basename(project_path)[:-10]}\n\n"
+            result = (
+                f"# Project: {project_name(project_path) or os.path.basename(project_path)}\n\n"
+            )
 
             result += "## Project Files\n"
             for file_type, file_path in files.items():
