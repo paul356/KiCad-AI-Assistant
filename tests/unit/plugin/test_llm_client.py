@@ -5589,7 +5589,7 @@ class TestPruneRollbackHistory:
         the original same-stem rule.
         """
 
-        def fake_project_path(file_path):
+        def fake_project_path(file_path, state_file=None):
             directory = os.path.dirname(os.path.abspath(file_path))
             name = os.path.basename(file_path)
             stem = name.split(".kicad_")[0] if ".kicad_" in name else os.path.splitext(name)[0]
@@ -8146,6 +8146,92 @@ class TestProjectResolutionBeforeEdit:
         pro, sheet = self._nested_project(tmp_path)
 
         assert llm_client._project_path_for(str(sheet)) == str(pro)
+
+    @staticmethod
+    def _write_state(state_file, pro, root, profile_file=None, **overrides):
+        payload = {
+            "version": 2,
+            "written_at": "2026-11-17T09:12:33Z",
+            "project_root": str(root),
+            "profile_file": profile_file or os.path.basename(str(pro)),
+            "pcb_files": [],
+            "schematic_files": [],
+        }
+        payload.update(overrides)
+        state_file.write_text(json.dumps(payload), encoding="utf-8")
+
+    def test_state_record_owns_paths_inside_root(self, tmp_path):
+        root = tmp_path / "proj"
+        root.mkdir()
+        pro = root / "board.kicad_pro"
+        pro.write_text("{}\n")
+        sheet = root / "hardware" / "main.kicad_sch"
+        sheet.parent.mkdir()
+        sheet.write_text("(kicad_sch)\n")
+        state_file = tmp_path / "project_state.json"
+        self._write_state(state_file, pro, root)
+
+        assert llm_client._project_path_for(str(sheet), str(state_file)) == str(pro)
+
+    def test_valid_profile_outside_root_is_refused_even_if_it_exists(self, tmp_path):
+        root_a = tmp_path / "a"
+        root_a.mkdir()
+        pro_a = root_a / "a.kicad_pro"
+        pro_a.write_text("{}\n")
+        root_b = tmp_path / "b"
+        root_b.mkdir()
+        pro_b = root_b / "b.kicad_pro"
+        pro_b.write_text("{}\n")
+        sheet_b = root_b / "b.kicad_sch"
+        sheet_b.write_text("(kicad_sch)\n")
+        state_file = tmp_path / "project_state.json"
+        self._write_state(state_file, pro_a, root_a)
+
+        assert llm_client._project_path_for(str(sheet_b), str(state_file)) is None
+        resolved, error = llm_client._resolve_project(str(sheet_b), str(state_file))
+        assert resolved is None
+        assert str(root_a) in error
+
+    def test_stale_profile_falls_back_inside_the_same_root(self, tmp_path):
+        root = tmp_path / "proj"
+        root.mkdir()
+        old = root / "old.kicad_pro"
+        old.write_text("{}\n")
+        replacement = root / "new.kicad_pro"
+        replacement.write_text("{}\n")
+        sheet = root / "board.kicad_sch"
+        sheet.write_text("(kicad_sch)\n")
+        state_file = tmp_path / "project_state.json"
+        self._write_state(state_file, old, root)
+        old.unlink()
+
+        assert llm_client._project_path_for(str(sheet), str(state_file)) == str(replacement)
+
+    def test_stale_profile_does_not_escape_to_another_root(self, tmp_path):
+        root = tmp_path / "proj"
+        root.mkdir()
+        old = root / "old.kicad_pro"
+        old.write_text("{}\n")
+        state_file = tmp_path / "project_state.json"
+        self._write_state(state_file, old, root)
+        old.unlink()
+
+        other = tmp_path / "other"
+        other.mkdir()
+        pro = other / "other.kicad_pro"
+        pro.write_text("{}\n")
+        sheet = other / "other.kicad_sch"
+        sheet.write_text("(kicad_sch)\n")
+
+        assert llm_client._project_path_for(str(sheet), str(state_file)) is None
+
+    @pytest.mark.parametrize("payload", ["{not json", "null", '{"version": 1}'])
+    def test_invalid_state_falls_back_to_the_upward_search(self, tmp_path, payload):
+        pro, sheet = self._nested_project(tmp_path)
+        state_file = tmp_path / "project_state.json"
+        state_file.write_text(payload, encoding="utf-8")
+
+        assert llm_client._project_path_for(str(sheet), str(state_file)) == str(pro)
 
     def test_nested_sheet_snapshot_uses_root_project_and_includes_sheet(self, tmp_path):
         pro, sheet = self._nested_project(tmp_path)
