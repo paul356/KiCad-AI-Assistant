@@ -32,12 +32,17 @@ from __future__ import annotations
 
 import json
 import os
+import time
 
 PROJECT_STATE_FILENAME = "project_state.json"
 
 PROJECT_STATE_ENV = "KCAA_PROJECT_STATE_FILE"
 
 SCHEMA_VERSION = 2
+
+# Windows may hold the tiny state file open for the instant the plugin
+# replaces it; a single retry avoids clearing the trust root on that race.
+_READ_RETRY_DELAY_S = 0.05
 
 
 def state_path(config_dir: str) -> str:
@@ -121,13 +126,33 @@ def validate_state(payload: object) -> dict | None:
     }
 
 
+def _is_transient_read_error(exc: OSError) -> bool:
+    """Return True for the Windows sharing race the writer already retries.
+
+    ``PermissionError`` covers the common ``os.replace`` race; Windows also
+    reports ERROR_SHARING_VIOLATION (32) and ERROR_LOCK_VIOLATION (33).
+    """
+    if isinstance(exc, PermissionError):
+        return True
+    return getattr(exc, "winerror", None) in (32, 33)
+
+
 def read_state(path: str | None) -> dict | None:
-    """Read and validate the state file; None for every invalid state."""
+    """Read and validate the state file; None for every invalid state.
+
+    A transient sharing/permission error is retried once before the record
+    is declared unreadable, matching the writer's Windows retry.  Nothing is
+    cached: each call still observes the file as it is now.
+    """
     if not path:
         return None
-    try:
-        with open(path, encoding="utf-8") as f:
-            payload = json.load(f)
-    except (OSError, ValueError, TypeError):
-        return None
-    return validate_state(payload)
+    for attempt in (0, 1):
+        try:
+            with open(path, encoding="utf-8") as f:
+                payload = json.load(f)
+            return validate_state(payload)
+        except (OSError, ValueError, TypeError) as exc:
+            if attempt or not isinstance(exc, OSError) or not _is_transient_read_error(exc):
+                return None
+            time.sleep(_READ_RETRY_DELAY_S)
+    return None
