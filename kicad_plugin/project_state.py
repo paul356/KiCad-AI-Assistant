@@ -228,32 +228,6 @@ def read_state(path: str | None) -> dict | None:
     return validate_state(payload)
 
 
-def read_state_hint(path: str | None) -> tuple[str, str | None] | None:
-    """Return ``(project_root, absolute profile)`` even when the profile is bad.
-
-    Used only by the pre-edit resolver: a stale ``profile_file`` (renamed
-    after the record was written) still names the current project root, and
-    the caller may accept a replacement found inside that same root.  Every
-    other reader must use :func:`read_state`.
-    """
-    if not path:
-        return None
-    try:
-        with open(path, encoding="utf-8") as f:
-            payload = json.load(f)
-    except (OSError, ValueError, TypeError):
-        return None
-    if not isinstance(payload, dict) or payload.get("version") != SCHEMA_VERSION:
-        return None
-    project_root = payload.get("project_root")
-    if not isinstance(project_root, str) or not project_root or not os.path.isabs(project_root):
-        return None
-    root = os.path.abspath(project_root)
-    profile = payload.get("profile_file")
-    resolved = _resolve_inside(root, profile) if isinstance(profile, str) else None
-    return root, resolved
-
-
 def write_state(path: str, record: dict) -> bool:
     """Atomically write *record* to *path*; return False when invalid.
 

@@ -27,7 +27,6 @@ import time
 from typing import Any
 
 from . import project_state
-from .project_resolution import find_project_file
 from .tool_registry import TOOL_POLICIES, get_missing_tool_policies, get_tool_policy
 
 # Notice colour for wait progress; single source of truth is ui/colors.py
@@ -37,45 +36,52 @@ from .ui.colors import WARN_HEX as _STATUS_EVENT_COLOR_HEX
 log = logging.getLogger(__name__)
 
 
+class ProjectSnapshotUnavailable(RuntimeError):
+    """The published record cannot back a whole-project snapshot."""
+
+
 def _resolve_project(
     file_path: str, state_file: str | None = None
 ) -> tuple[str | None, str | None]:
-    """Resolve the project owning *file_path* against the canonical state.
+    """Resolve the project owning *file_path* from the published record.
 
-    The published record wins over the filesystem search:
+    The state file is the only source: there is no filesystem search
+    fallback.  A missing/invalid record, a path outside the published
+    ``project_root``, or a recorded project file that has disappeared all
+    fail closed with a message telling the user to retry.
 
-    * a valid record with a usable ``profile_file`` owns every path inside
-      ``project_root`` — a path outside the root is refused, never resolved
-      to a different project;
-    * when the record's ``profile_file`` is stale (renamed/deleted), the
-      upward search may still find the replacement, but only when it lives
-      in that same ``project_root``;
-    * with no usable record (missing/corrupt/old schema/null), the canonical
-      upward search decides.
-
-    Returns ``(project_file, error)``.  *error* is set only when the state
-    record itself explains the refusal; callers keep their own message
-    otherwise.
+    Returns ``(project_file, error)``; exactly one is None.
     """
-    hint = project_state.read_state_hint(state_file)
-    if hint is None:
-        return find_project_file(file_path), None
-    root, profile = hint
-    if profile is not None:
-        if project_state.is_within(root, file_path):
-            return profile, None
+    record = project_state.read_state(state_file)
+    if record is None:
+        return None, "No valid project state is published; reopen the plugin panel and retry."
+    root = record["project_root"]
+    project_file = os.path.join(root, record["profile_file"])
+    if not project_state.is_within(root, file_path):
         return None, (
             f"{file_path!r} is outside the active KiCad project <{root}>; "
             "refusing to resolve a project for it."
         )
-    candidate = find_project_file(file_path)
-    if candidate is not None and os.path.realpath(
-        os.path.dirname(os.path.abspath(candidate))
-    ) == os.path.realpath(root):
-        return candidate, None
-    return None, (
-        f"No .kicad_pro project file found in the active project <{root}> for {file_path!r}."
-    )
+    if not os.path.isfile(project_file):
+        return None, (
+            f"The project file recorded for <{root}> no longer exists; "
+            "reopen the plugin panel and retry."
+        )
+    return project_file, None
+
+
+def _project_path_from_record(file_path: str, record: dict | None) -> str | None:
+    """Return the ``.kicad_pro`` path *record* assigns to *file_path*, or None.
+
+    Pure resolver for callers that read the state file once and reuse the
+    record (history pruning).  It performs no disk read itself.
+    """
+    if record is None:
+        return None
+    root = record["project_root"]
+    if not project_state.is_within(root, file_path):
+        return None
+    return os.path.join(root, record["profile_file"])
 
 
 def _snapshot_include_files(
@@ -105,22 +111,9 @@ def _snapshot_include_files(
 def _project_path_for(file_path: str, state_file: str | None = None) -> str | None:
     """Return the .kicad_pro path of the project owning *file_path*, or None.
 
-    See :func:`_resolve_project` for the precedence rules.  Never fabricates
-    a sibling path.
+    See :func:`_resolve_project`; this never fabricates a sibling path.
     """
     return _resolve_project(file_path, state_file)[0]
-
-
-def _searched_directories(file_path: str) -> list[str]:
-    """Return the directories searched for a project, nearest first."""
-    directory = os.path.dirname(os.path.abspath(file_path))
-    searched: list[str] = []
-    while True:
-        searched.append(directory)
-        parent = os.path.dirname(directory)
-        if parent == directory:
-            return searched
-        directory = parent
 
 
 def _project_relative_path(project_file: str, path: str) -> str | None:
@@ -3130,6 +3123,13 @@ class LLMClient:
         policy = get_tool_policy(tool_name)
         path = self._get_required_path(args, tool_name, policy.path_arg)
 
+        # Resolve the project once for both the pre-edit snapshot and the
+        # post-success coverage tracking of this tool call.
+        project_path: str | None = None
+        project_error: str | None = None
+        if path and (policy.auto_snapshot or policy.track_snapshot):
+            project_path, project_error = _resolve_project(path, self._state_file)
+
         if policy.auto_snapshot:
             if not path:
                 return {
@@ -3139,13 +3139,11 @@ class LLMClient:
                         f"{policy.path_arg!r} argument."
                     ),
                 }
-            project_path, project_error = _resolve_project(path, self._state_file)
             if project_path is None:
-                searched = ", ".join(_searched_directories(path))
                 return {
                     "success": False,
                     "error": project_error
-                    or (f"No .kicad_pro project file found for {path!r}; searched: {searched}"),
+                    or f"No .kicad_pro project file found for {path!r}; reopen the panel and retry.",
                 }
             file_key = (project_path, os.path.abspath(path))
             file_relative = _project_relative_path(project_path, path)

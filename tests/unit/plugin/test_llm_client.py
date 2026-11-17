@@ -22,6 +22,7 @@ import urllib.request
 import pytest
 
 from kicad_plugin import llm_client
+from kicad_plugin import project_state as pstate
 from kicad_plugin import session_store as sstore
 from kicad_plugin.llm_client import LLMClient, LLMTurnFailure, _subprocess_sse_stream
 from kicad_plugin.settings import DEFAULT_LLM_USER_AGENT
@@ -110,12 +111,17 @@ def _make_client(
 
 
 @pytest.fixture()
-def board_project(tmp_path):
-    """Create a real minimal project so pre-edit snapshots can resolve it."""
+def board_project(tmp_path, monkeypatch):
+    """Create a minimal project and publish its canonical state record."""
     pcb = tmp_path / "board.kicad_pcb"
     pro = tmp_path / "board.kicad_pro"
     pcb.write_text("(kicad_pcb)\n")
     pro.write_text("{}\n")
+    state_file = tmp_path / "project_state.json"
+    record = pstate.build_record(str(pro))
+    assert record is not None
+    assert pstate.write_state(str(state_file), record)
+    monkeypatch.setenv(pstate.PROJECT_STATE_ENV, str(state_file))
     return str(pcb), str(pro)
 
 
@@ -1415,8 +1421,13 @@ class TestRunIntegration:
         file_b = hardware / "b.kicad_pcb"
         file_a.write_text("A-v1\n")
         file_b.write_text("B-v1\n")
+        state_file = tmp_path / "project_state.json"
+        record = pstate.build_record(str(pro))
+        assert record is not None
+        assert pstate.write_state(str(state_file), record)
 
         client = _make_client()
+        client._state_file = str(state_file)
         tool_response = {
             "finish_reason": "tool_calls",
             "message": {
@@ -1475,13 +1486,16 @@ class TestRunIntegration:
 
         assert result == "done"
         snapshot_args = [args for name, args in calls if name == "save_project_version"]
+        root_sch = str(tmp_path / "aria.kicad_sch")
         assert [args["include_files"] for args in snapshot_args] == [
-            [str(file_a)],
-            [str(file_b)],
+            [str(file_a), str(file_b), root_sch],
+            [str(file_a), str(file_b), root_sch],
         ]
 
         versions = _vm.list_project_versions(str(pro))
-        assert len(versions) == 2  # documented rule: one archive per edited file
+        # Both files trigger a snapshot, but each covers the whole project and
+        # the content is unchanged, so the second reuses the first archive.
+        assert len(versions) == 1
 
         archived: dict[str, bytes] = {}
         archive_dir = os.path.join(tmp_path, ".versions", "project")
@@ -1511,7 +1525,11 @@ class TestRunIntegration:
         hardware.mkdir()
         nested = hardware / "main_bus.kicad_sch"
         nested.write_text("nested-v1\n")
-        return pro, root_sch, nested
+        state_file = tmp_path / "project_state.json"
+        record = pstate.build_record(str(pro))
+        assert record is not None
+        assert pstate.write_state(str(state_file), record)
+        return pro, root_sch, nested, state_file
 
     def _run_two_tool_calls(self, client, first, second):
         responses = [
@@ -1526,7 +1544,7 @@ class TestRunIntegration:
         """An explicit save covers only its reported files; a nested edit still snapshots."""
         from kcaa.utils import version_manager as _vm
 
-        pro, _root_sch, nested = self._nested_sheet_project(tmp_path)
+        pro, root_sch, nested, state_file = self._nested_sheet_project(tmp_path)
         calls = []
 
         def _server(base_url, name, args, timeout=None):
@@ -1552,6 +1570,7 @@ class TestRunIntegration:
             return {"success": True}
 
         client = _make_client()
+        client._state_file = str(state_file)
         client._enabled_tools = {"save_project_version", "set_symbol_property"}
         with patch("kicad_plugin.llm_client.call_mcp_tool", side_effect=_server):
             result = self._run_two_tool_calls(
@@ -1564,7 +1583,8 @@ class TestRunIntegration:
         names = [name for name, _ in calls]
         assert "save_document" in names
         assert any(
-            name == "save_project_version" and args.get("include_files") == [str(nested)]
+            name == "save_project_version"
+            and args.get("include_files") == [str(root_sch), str(nested)]
             for name, args in calls
         )
         versions = _vm.list_project_versions(str(pro))
@@ -1586,7 +1606,7 @@ class TestRunIntegration:
         """A root sheet in the explicit save's files list needs no second snapshot."""
         from kcaa.utils import version_manager as _vm
 
-        pro, root_sch, _nested = self._nested_sheet_project(tmp_path)
+        pro, root_sch, _nested, state_file = self._nested_sheet_project(tmp_path)
         calls = []
 
         def _server(base_url, name, args, timeout=None):
@@ -1604,6 +1624,7 @@ class TestRunIntegration:
             return {"success": True}
 
         client = _make_client()
+        client._state_file = str(state_file)
         client._enabled_tools = {"save_project_version", "set_symbol_property"}
         with patch("kicad_plugin.llm_client.call_mcp_tool", side_effect=_server):
             result = self._run_two_tool_calls(
@@ -1620,7 +1641,7 @@ class TestRunIntegration:
 
     def test_restore_covers_only_files_it_reported(self, tmp_path):
         """Files absent from the restored archive are not suppressed."""
-        pro, _root_sch, nested = self._nested_sheet_project(tmp_path)
+        pro, root_sch, nested, state_file = self._nested_sheet_project(tmp_path)
         calls = []
 
         def _server(base_url, name, args, timeout=None):
@@ -1632,6 +1653,7 @@ class TestRunIntegration:
             return {"success": True}
 
         client = _make_client()
+        client._state_file = str(state_file)
         client._enabled_tools = {"restore_project_version", "set_symbol_property"}
         with patch("kicad_plugin.llm_client.call_mcp_tool", side_effect=_server):
             result = self._run_two_tool_calls(
@@ -1646,7 +1668,8 @@ class TestRunIntegration:
         names = [name for name, _ in calls]
         assert "save_document" in names
         assert any(
-            name == "save_project_version" and args.get("include_files") == [str(nested)]
+            name == "save_project_version"
+            and args.get("include_files") == [str(root_sch), str(nested)]
             for name, args in calls
         )
 
@@ -8142,10 +8165,19 @@ class TestProjectResolutionBeforeEdit:
         sheet.write_text("(kicad_sch)\n")
         return pro, sheet
 
-    def test_project_path_for_nested_sheet_returns_root_project(self, tmp_path):
-        pro, sheet = self._nested_project(tmp_path)
+    def test_missing_state_returns_none_with_retry_and_no_search(self, tmp_path, monkeypatch):
+        _pro, sheet = self._nested_project(tmp_path)
+        searches = []
+        monkeypatch.setattr(
+            "kicad_plugin.project_resolution.find_project_file",
+            lambda path: searches.append(path),
+        )
 
-        assert llm_client._project_path_for(str(sheet)) == str(pro)
+        resolved, error = llm_client._resolve_project(str(sheet), str(tmp_path / "absent.json"))
+
+        assert resolved is None
+        assert "retry" in error
+        assert searches == []
 
     @staticmethod
     def _write_state(state_file, pro, root, profile_file=None, **overrides):
@@ -8192,7 +8224,7 @@ class TestProjectResolutionBeforeEdit:
         assert resolved is None
         assert str(root_a) in error
 
-    def test_stale_profile_falls_back_inside_the_same_root(self, tmp_path):
+    def test_deleted_profile_file_fails_with_retry(self, tmp_path):
         root = tmp_path / "proj"
         root.mkdir()
         old = root / "old.kicad_pro"
@@ -8205,7 +8237,10 @@ class TestProjectResolutionBeforeEdit:
         self._write_state(state_file, old, root)
         old.unlink()
 
-        assert llm_client._project_path_for(str(sheet), str(state_file)) == str(replacement)
+        resolved, error = llm_client._resolve_project(str(sheet), str(state_file))
+
+        assert resolved is None
+        assert "retry" in error
 
     def test_stale_profile_does_not_escape_to_another_root(self, tmp_path):
         root = tmp_path / "proj"
@@ -8226,16 +8261,27 @@ class TestProjectResolutionBeforeEdit:
         assert llm_client._project_path_for(str(sheet), str(state_file)) is None
 
     @pytest.mark.parametrize("payload", ["{not json", "null", '{"version": 1}'])
-    def test_invalid_state_falls_back_to_the_upward_search(self, tmp_path, payload):
-        pro, sheet = self._nested_project(tmp_path)
+    def test_invalid_state_returns_none_with_retry(self, tmp_path, payload):
+        _pro, sheet = self._nested_project(tmp_path)
         state_file = tmp_path / "project_state.json"
         state_file.write_text(payload, encoding="utf-8")
 
-        assert llm_client._project_path_for(str(sheet), str(state_file)) == str(pro)
+        resolved, error = llm_client._resolve_project(str(sheet), str(state_file))
+
+        assert resolved is None
+        assert "retry" in error
 
     def test_nested_sheet_snapshot_uses_root_project_and_includes_sheet(self, tmp_path):
         pro, sheet = self._nested_project(tmp_path)
+        state_file = tmp_path / "project_state.json"
+        self._write_state(
+            state_file,
+            pro,
+            tmp_path,
+            schematic_files=["hardware/main_bus.kicad_sch"],
+        )
         client = _make_client()
+        client._state_file = str(state_file)
         tool_response = {
             "finish_reason": "tool_calls",
             "message": {
@@ -8275,11 +8321,15 @@ class TestProjectResolutionBeforeEdit:
             ),
         ]
 
-    def test_missing_project_fails_actionably_without_snapshot(self, tmp_path, monkeypatch):
+    def test_missing_state_fails_actionably_without_snapshot(self, tmp_path, monkeypatch):
         sheet = tmp_path / "hardware" / "main_bus.kicad_sch"
         sheet.parent.mkdir()
         sheet.write_text("(kicad_sch)\n")
-        monkeypatch.setattr(llm_client, "find_project_file", lambda path: None)
+        searches = []
+        monkeypatch.setattr(
+            "kicad_plugin.project_resolution.find_project_file",
+            lambda path: searches.append(path),
+        )
         client = _make_client()
         tool_response = {
             "finish_reason": "tool_calls",
@@ -8307,12 +8357,12 @@ class TestProjectResolutionBeforeEdit:
 
         assert result == "done"
         called_names = [c.args[1] for c in mock_call_tool.call_args_list]
-        assert "save_project_version" not in called_names
+        assert called_names == []  # neither save_document nor the edit tool ran
+        assert searches == []  # no filesystem fallback on the read side
         tool_results = [m for m in client._history if m["role"] == "tool"]
         failed = json.loads(tool_results[0]["content"])
         assert failed["success"] is False
-        assert str(sheet) in failed["error"]
-        assert str(tmp_path) in failed["error"]  # directories searched are reported
+        assert "retry" in failed["error"]
 
 
 class TestWholeProjectSnapshot:
