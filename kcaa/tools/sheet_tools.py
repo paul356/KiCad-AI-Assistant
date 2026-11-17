@@ -16,7 +16,7 @@ import uuid
 
 from fastmcp import Context, FastMCP
 
-from kcaa.utils.project_resolution import project_name
+from kcaa.utils.project_resolution import project_name, sibling_project_file
 from kcaa.utils.skip_compat import safe_schematic
 
 log = logging.getLogger(__name__)
@@ -279,9 +279,10 @@ def _project_root_uuid(schematic_path: str) -> str | None:
     """
     import json
 
-    directory = os.path.dirname(os.path.abspath(schematic_path))
     stem = os.path.splitext(os.path.basename(schematic_path))[0]
-    project_path = os.path.join(directory, stem + ".kicad_pro")
+    project_path = sibling_project_file(schematic_path)
+    if project_path is None:
+        return None
     try:
         with open(project_path, encoding="utf-8") as fh:
             data = json.load(fh)
