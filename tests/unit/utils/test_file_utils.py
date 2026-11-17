@@ -43,7 +43,7 @@ def test_subdirectory_board_operates_on_the_named_board(tmp_path):
     assert get_project_files(str(pro))["pcb"] == str(root_board)
 
 
-def test_no_project_returns_only_the_input_as_project(tmp_path, isolated_project_search):
+def test_no_project_keeps_the_named_board(tmp_path, isolated_project_search):
     board = tmp_path / "orphan.kicad_pcb"
     board.write_text("(kicad_pcb)\n")
     (tmp_path / "unrelated.csv").write_text("a,b\n")
@@ -51,7 +51,16 @@ def test_no_project_returns_only_the_input_as_project(tmp_path, isolated_project
 
     files = get_project_files(str(board))
 
-    assert files == {"project": str(board)}
+    assert files == {"project": str(board), "pcb": str(board)}
+
+
+def test_no_project_keeps_the_named_schematic(tmp_path, isolated_project_search):
+    sheet = tmp_path / "orphan.kicad_sch"
+    sheet.write_text("(kicad_sch)\n")
+
+    files = get_project_files(str(sheet))
+
+    assert files == {"project": str(sheet), "schematic": str(sheet)}
 
 
 def test_find_kicad_projects_reports_project_stem(tmp_path, monkeypatch):

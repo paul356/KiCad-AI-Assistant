@@ -31,8 +31,23 @@ def get_project_files(project_path: str) -> dict[str, str]:
     base = pro or project_path
     project_dir = os.path.dirname(base)
     project_stem = project_name(base)
+
+    # Operate on the named board/schematic, not a same-extension root file.
+    # This applies even when no project can be resolved, so a standalone
+    # board/schematic still reports itself instead of being dropped.
+    named_key = None
+    if os.path.isfile(project_path):
+        suffix = os.path.splitext(project_path)[1].lower()
+        if suffix == ".kicad_pcb":
+            named_key = "pcb"
+        elif suffix == ".kicad_sch":
+            named_key = "schematic"
+
     if not project_stem:
-        return {"project": base}
+        files = {"project": base}
+        if named_key:
+            files[named_key] = project_path
+        return files
 
     files = {}
 
@@ -47,13 +62,8 @@ def get_project_files(project_path: str) -> dict[str, str]:
         if os.path.exists(file_path):
             files[file_type] = file_path
 
-    # Operate on the named board/schematic, not a same-extension root file.
-    if os.path.isfile(project_path):
-        suffix = os.path.splitext(project_path)[1].lower()
-        if suffix == ".kicad_pcb":
-            files["pcb"] = project_path
-        elif suffix == ".kicad_sch":
-            files["schematic"] = project_path
+    if named_key:
+        files[named_key] = project_path
 
     # Check for data files
     try:
