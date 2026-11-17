@@ -45,11 +45,10 @@ def _take_autoroute_snapshot(
 ) -> tuple[str, str | None]:
     """Snapshot the project before FreeRouting touches the board.
 
-    Returns ``(backup_path, error)``.  When the board has no owning
-    ``.kicad_pro``, or the published record cannot name the whole project,
-    *error* is an actionable message and the caller must abort before
-    launching the router.  Transport-level snapshot failures keep the
-    previous behaviour: log and route without a snapshot.
+    Returns ``(backup_path, error)``.  Any failure to save the snapshot —
+    unresolvable project, unavailable include list, or a failing MCP call —
+    yields an actionable *error* and the caller aborts before launching the
+    router, matching the fail-closed pre-edit path.
     """
     if not board_path or not os.path.isfile(board_path):
         return "", (
@@ -88,12 +87,14 @@ def _take_autoroute_snapshot(
                 "include_files": include_files,
             },
         )
-    except Exception as exc:  # noqa: BLE001 -- snapshot must not crash the UI
+    except Exception as exc:  # noqa: BLE001 -- report instead of crashing the UI
         log.warning("autoroute: version snapshot failed: %s", exc)
-        return "", None
+        return "", f"Auto Route could not save a project snapshot before routing: {exc}"
     if isinstance(result, dict) and result.get("error"):
         log.warning("autoroute: version snapshot failed: %s", result["error"])
-        return "", None
+        return "", (
+            f"Auto Route could not save a project snapshot before routing: {result['error']}"
+        )
     archive_path = result.get("archive_path", "") if isinstance(result, dict) else ""
     log.info("autoroute: project version snapshot saved to %s", archive_path)
     return archive_path, None
