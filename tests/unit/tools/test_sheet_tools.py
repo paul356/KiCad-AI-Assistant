@@ -497,11 +497,12 @@ class TestInstancePathResolution:
         sheet = _sheet_node(_load(str(root)), result["sheet_uuid"])
         assert _instance_path(sheet) == "/existing-root"
 
-    def test_project_file_top_sheet_is_the_last_resort(self, tools, tmp_path):
+    @pytest.mark.parametrize("root_name", ["root", "Root", "Top"])
+    def test_project_file_root_sheet_is_the_last_resort(self, tools, tmp_path, root_name):
         root = tmp_path / "root.kicad_sch"
         _write_schematic(root, root_uuid=None, pages=())
         (tmp_path / "root.kicad_pro").write_text(
-            json.dumps({"sheets": [[PROJECT_UUID, "Top"]]}), encoding="utf-8"
+            json.dumps({"sheets": [[PROJECT_UUID, root_name]]}), encoding="utf-8"
         )
 
         result = _add_sheet(tools, str(root))
@@ -509,6 +510,21 @@ class TestInstancePathResolution:
 
         sheet = _sheet_node(_load(str(root)), result["sheet_uuid"])
         assert _instance_path(sheet) == f"/{PROJECT_UUID}"
+
+    def test_foreign_project_file_is_not_adopted(self, tools, tmp_path):
+        root = tmp_path / "root.kicad_sch"
+        _write_schematic(root, root_uuid=None, pages=())
+        (tmp_path / "other.kicad_pro").write_text(
+            json.dumps({"sheets": [[PROJECT_UUID, "Top"]]}), encoding="utf-8"
+        )
+        before = root.read_text(encoding="utf-8")
+
+        result = _add_sheet(tools, str(root), create_child=True, sheet_file="orphan.kicad_sch")
+
+        assert "error" in result
+        assert root.read_text(encoding="utf-8") == before
+        assert not (tmp_path / "root.kicad_sch.bak").exists()
+        assert not (tmp_path / "orphan.kicad_sch").exists()
 
     def test_unresolvable_parent_path_fails_without_writing(self, tools, tmp_path):
         root = tmp_path / "root.kicad_sch"
@@ -532,6 +548,37 @@ class TestInstancePathResolution:
         assert "error" in result
         assert child.read_text(encoding="utf-8") == before
 
+    def test_legacy_kcaa_child_with_sheet_instances_is_rejected(self, tools, tmp_path):
+        child = tmp_path / "legacy_child.kicad_sch"
+        _write_schematic(
+            child, root_uuid=CHILD_UUID, pages=(2,), child_file="leaf.kicad_sch", is_root=False
+        )
+        text = child.read_text(encoding="utf-8").rstrip()
+        child.write_text(
+            text[:-1] + f'  (sheet_instances (path "/{CHILD_UUID}" (page "1")))\n)\n',
+            encoding="utf-8",
+        )
+        before = child.read_text(encoding="utf-8")
+
+        result = _add_sheet(tools, str(child), create_child=True, sheet_file="orphan.kicad_sch")
+
+        assert "error" in result
+        assert "not the project root" in result["error"]
+        assert child.read_text(encoding="utf-8") == before
+        assert not (tmp_path / "legacy_child.kicad_sch.bak").exists()
+        assert not (tmp_path / "orphan.kicad_sch").exists()
+
+    def test_instance_path_prefers_matching_project_clause(self):
+        from kcaa.tools.sheet_tools import _first_instance_path
+
+        node = sexpdata.loads(
+            '(sheet (instances (project "other" (path "/other" (page "1")))'
+            ' (project "root" (path "/root" (page "2")))))'
+        )
+
+        assert _first_instance_path(node, "root") == "/root"
+        assert _first_instance_path(node, "unrelated") == "/other"
+
 
 class TestChildSchematic:
     """D7: child files carry only the sections KiCad keeps."""
@@ -546,8 +593,9 @@ class TestChildSchematic:
         child_path = tmp_path / "new_child.kicad_sch"
         assert Path(result["child_path"]) == child_path
         child = child_path.read_text(encoding="utf-8")
-        assert "(sheet_instances" not in child
-        assert "embedded_fonts" not in child
+        child_tags = {_tag(node) for node in _load(str(child_path))}
+        assert "sheet_instances" not in child_tags
+        assert "embedded_fonts" not in child_tags
         assert "(uuid " in child
         assert '(paper "A4")' in child
         assert "(lib_symbols)" in child

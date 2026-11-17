@@ -198,6 +198,7 @@ def _try_load_schematic_tree(path: str) -> list | None:
         OSError,
         ValueError,
         AssertionError,  # sexpdata.loads asserts on empty parses
+        RecursionError,  # sexpdata recurses once per nesting level
         sexpdata.ExpectClosingBracket,
         sexpdata.ExpectNothing,
         sexpdata.ExpectSExp,
@@ -209,10 +210,18 @@ def _try_load_schematic_tree(path: str) -> list | None:
 def _is_root_schematic(tree: list) -> bool:
     """Return True when *tree* belongs to a root schematic.
 
-    KiCad writes ``(sheet_instances ...)`` only into the first schematic of a
-    project; child schematics never contain it.
+    Only the project root records ``(sheet_instances (path "/" ...))``.
+    Children never carry that section in KiCad 10, but older kcaa releases
+    wrote ``(sheet_instances (path "/<file uuid>" ...))`` into every child,
+    so the root path itself must be checked rather than the section alone.
     """
-    return any(_tag_of(node) == "sheet_instances" for node in tree)
+    for node in tree:
+        if _tag_of(node) != "sheet_instances":
+            continue
+        for entry in node[1:]:
+            if _tag_of(entry) == "path" and len(entry) > 1 and entry[1] == "/":
+                return True
+    return False
 
 
 def _top_level_string(tree: list, tag: str) -> str | None:
@@ -223,8 +232,15 @@ def _top_level_string(tree: list, tag: str) -> str | None:
     return None
 
 
-def _first_instance_path(sheet_node: list) -> str | None:
-    """Return the first ``instances`` path recorded on a sheet node."""
+def _first_instance_path(sheet_node: list, project_name: str) -> str | None:
+    """Return the ``instances`` path recorded on a sheet node.
+
+    Prefers the ``project`` clause named *project_name* (the schematic stem),
+    since a file may carry clauses for several projects.  When no clause
+    matches, the first path in any clause is returned: the file itself does
+    not identify which clause belongs to it.
+    """
+    fallback: str | None = None
     for child in sheet_node:
         if _tag_of(child) != "instances":
             continue
@@ -233,8 +249,11 @@ def _first_instance_path(sheet_node: list) -> str | None:
                 continue
             for entry in project[1:]:
                 if _tag_of(entry) == "path" and len(entry) > 1 and isinstance(entry[1], str):
-                    return entry[1]
-    return None
+                    if len(project) > 1 and project[1] == project_name:
+                        return entry[1]
+                    if fallback is None:
+                        fallback = entry[1]
+    return fallback
 
 
 def _sheet_file_from_node(sheet_node: list) -> str | None:
@@ -252,37 +271,37 @@ def _sheet_file_from_node(sheet_node: list) -> str | None:
 def _project_root_uuid(schematic_path: str) -> str | None:
     """Return the root sheet UUID recorded in the sibling ``.kicad_pro``.
 
-    KiCad lists the root sheet in the project's ``sheets`` array under the
-    name ``"Top"`` as a ``[uuid, name]`` pair.
+    KiCad stores the root sheet as the first ``sheets`` entry, a
+    ``[uuid, name]`` pair whose name is the project stem or ``"Root"``.
+    ``"Top"`` is accepted for older kcaa fixtures.  Only ``<stem>.kicad_pro``
+    is read, so a different project in the same directory cannot lend its
+    UUID.
     """
     import json
 
     directory = os.path.dirname(os.path.abspath(schematic_path))
     stem = os.path.splitext(os.path.basename(schematic_path))[0]
-    candidates = [os.path.join(directory, stem + ".kicad_pro")]
+    project_path = os.path.join(directory, stem + ".kicad_pro")
     try:
-        for name in sorted(os.listdir(directory)):
-            if name.endswith(".kicad_pro"):
-                candidates.append(os.path.join(directory, name))
-    except OSError:
-        pass
+        with open(project_path, encoding="utf-8") as fh:
+            data = json.load(fh)
+    except (OSError, ValueError):
+        return None
 
-    for project_path in candidates:
-        if not os.path.isfile(project_path):
-            continue
-        try:
-            with open(project_path, encoding="utf-8") as fh:
-                data = json.load(fh)
-        except (OSError, ValueError):
-            continue
-        for entry in data.get("sheets") or []:
-            if (
-                isinstance(entry, list)
-                and len(entry) >= 2
-                and entry[1] == "Top"
-                and isinstance(entry[0], str)
-            ):
-                return entry[0]
+    if not isinstance(data, dict):
+        return None
+    sheets = data.get("sheets")
+    if not isinstance(sheets, list) or not sheets:
+        return None
+    root_entry = sheets[0]
+    if (
+        isinstance(root_entry, list)
+        and len(root_entry) >= 2
+        and isinstance(root_entry[0], str)
+        and isinstance(root_entry[1], str)
+        and root_entry[1] in {stem, "Root", "Top"}
+    ):
+        return root_entry[0]
     return None
 
 
@@ -291,7 +310,8 @@ def _resolve_sheet_parent_path(schematic_path: str, tree: list) -> tuple[str | N
 
     For a root schematic this is ``"/" + <root sheet UUID>``, resolved from
     the file's own ``(uuid ...)``, then from an existing sibling sheet's
-    ``instances`` path, then from the project file's ``"Top"`` sheet entry.
+    ``instances`` path, then from the root entry of the sibling
+    ``<stem>.kicad_pro`` ``sheets`` array.
 
     Returns ``(path, error)``; exactly one of the two is set.  A child
     schematic has no record of its enclosing sheet path, so it is rejected
@@ -300,17 +320,19 @@ def _resolve_sheet_parent_path(schematic_path: str, tree: list) -> tuple[str | N
     if not _is_root_schematic(tree):
         return None, (
             f"Cannot add a sheet to {os.path.basename(schematic_path)!r}: it is not the "
-            "project root (no (sheet_instances) section), so the enclosing sheet path "
-            "is unknown.  Add the sheet to the project's root schematic instead."
+            "project root (its (sheet_instances) section does not describe the '/' root "
+            "path), so the enclosing sheet path is unknown.  Add the sheet to the "
+            "project's root schematic instead."
         )
 
     root_uuid = _top_level_string(tree, "uuid")
     if root_uuid:
         return "/" + root_uuid, None
 
+    stem = os.path.splitext(os.path.basename(schematic_path))[0]
     for node in tree:
         if _tag_of(node) == "sheet":
-            instance_path = _first_instance_path(node)
+            instance_path = _first_instance_path(node, stem)
             if instance_path:
                 return instance_path, None
 
@@ -321,8 +343,8 @@ def _resolve_sheet_parent_path(schematic_path: str, tree: list) -> tuple[str | N
     return None, (
         f"Cannot resolve the root sheet UUID for {os.path.basename(schematic_path)!r}: "
         "the file has no (uuid ...), it has no existing sheet instances, and its "
-        "project file has no sheet named 'Top'.  Refusing to write a guessed "
-        "instance path."
+        "sibling project file has no usable root sheet entry.  Refusing to write a "
+        "guessed instance path."
     )
 
 
@@ -1479,9 +1501,10 @@ def register_sheet_tools(mcp: FastMCP) -> None:
     ) -> dict[str, Any]:
         """Add a hierarchical sheet symbol to a schematic.
 
-        The sheet is written with the canonical KiCad 10 sheet node
-        (``Sheetname`` / ``Sheetfile`` properties, ``(fill (color 0 0 0 0))``,
-        four ``exclude_from_sim``/``in_bom``/``on_board``/``dnp`` flags and a
+        The sheet's node structure, property names, flags, fill and stroke
+        match KiCad 10 (``Sheetname`` / ``Sheetfile`` properties,
+        ``(fill (color 0 0 0 0))``, four
+        ``exclude_from_sim``/``in_bom``/``on_board``/``dnp`` flags and a
         solid stroke), placed before any ``sheet_instances`` section.  Its
         ``instances`` path is the containing sheet's path (``/<root uuid>``
         for a sheet added to the project root) and its page is the lowest

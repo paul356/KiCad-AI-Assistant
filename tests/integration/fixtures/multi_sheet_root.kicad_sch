@@ -3,7 +3,7 @@
   (paper "A4")
   (lib_symbols)
   (sheet_instances
-    (path "/26da126d-cae6-4c9c-9258-be9c05cd004d" (page "1"))
+    (path "/" (page "1"))
   )
   (sheet (at 25.4 38.1) (size 50.8 50.8)
     (stroke (width 0) (type dash) (color 0 0 0 0))
