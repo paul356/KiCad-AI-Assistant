@@ -1,7 +1,8 @@
 """Version management for KiCad projects.
 
-Project snapshots bundle the project's schematic + PCB + ``.kicad_pro``
-into a single ``.tar.gz`` archive under ``.versions/project/`` (see
+Project snapshots bundle the whole project file set — the ``.kicad_pro``,
+every schematic and every PCB, including nested sub-sheets — into a single
+``.tar.gz`` archive under ``.versions/project/`` (see
 :func:`save_project_version`), so the whole file set shares one version id
 and can be restored together as one consistent unit.
 """
@@ -11,10 +12,13 @@ from datetime import datetime
 import hashlib
 import io
 import json
+import logging
 import os
 import shutil
 import tarfile
 from typing import Any
+
+log = logging.getLogger(__name__)
 
 _VERSIONS_DIR = ".versions"
 MAX_PROJECT_VERSIONS = 10
@@ -50,7 +54,7 @@ def project_relative_path(project_file: str, path: str) -> str:
     return rel.replace(os.sep, "/")
 
 
-def project_file_set(project_file: str, include_files: list[str] | None = None) -> dict[str, str]:
+def project_file_set(project_file: str, extra_files: list[str] | None = None) -> dict[str, str]:
     """Return the project file set as ``{relative_path: absolute_path}``.
 
     The default set follows the standard KiCad convention: the
@@ -58,10 +62,14 @@ def project_file_set(project_file: str, include_files: list[str] | None = None) 
     ``.kicad_pcb`` live side by side.  Only files that currently exist are
     included, so a schematic-only project archives just the sch + pro pair.
 
-    *include_files* adds explicit files (for example a nested sheet being
-    edited).  Each must resolve inside the project directory (see
-    :func:`project_relative_path`) and is archived under its project-relative
-    path; entries already in the default set are skipped.
+    *extra_files* adds explicit files (for example every sheet and board
+    listed by the project state), archived under their project-relative
+    paths in the given order.  Entries that are missing, not files, or
+    resolve outside the project directory are skipped with a debug log
+    rather than failing the whole snapshot; entries already in the default
+    set are skipped silently.  The returned mapping is de-duplicated by
+    relative path and keeps insertion order, so default files come first
+    and follow the input order after that.
     """
     pro = os.path.abspath(project_file)
     d = os.path.dirname(pro)
@@ -71,8 +79,12 @@ def project_file_set(project_file: str, include_files: list[str] | None = None) 
         path = os.path.join(d, rel)
         if os.path.isfile(path):
             files[rel] = path
-    for path in include_files or ():
-        rel = project_relative_path(pro, path)
+    for path in extra_files or ():
+        try:
+            rel = project_relative_path(pro, path)
+        except ValueError as exc:
+            log.debug("skipping project snapshot entry %r: %s", path, exc)
+            continue
         if rel not in files:
             files[rel] = os.path.realpath(os.path.abspath(path))
     return files
@@ -153,7 +165,7 @@ def save_project_version(
     include_files: list[str] | None = None,
     exclude_versions: set[str] | None = None,
 ) -> str:
-    """Save a version archive bundling the project's schematic + PCB + .kicad_pro.
+    """Save a version archive bundling the whole project file set.
 
     The bundle is a single ``.tar.gz`` under ``<project_dir>/.versions/
     project/`` named ``<stem>.project.<timestamp>.tar.gz``, so every file in
@@ -165,19 +177,19 @@ def save_project_version(
 
     :param project_file: Absolute path to the project file (.kicad_pro).
     :param keep: Number of archives to retain, or None for the default.
-    :param include_files: Extra files to archive, such as the nested sheet
-        being edited.  Each must resolve inside the project directory.
+    :param include_files: Extra files to archive, such as every board and
+        sheet in the project.  Entries that are missing or resolve outside
+        the project directory are skipped and logged at debug level.
     :param exclude_versions: Version ids that must never be pruned, such as
         the archive a restore is currently reading from.
     :returns: Path of the (new or existing) archive.
     :raises FileNotFoundError: If *project_file* or the whole file set is missing.
-    :raises ValueError: If an *include_files* entry is outside the project.
     :raises OSError: If the archive directory cannot be created or the write fails.
     """
     project_file = os.path.abspath(project_file)
     if not os.path.isfile(project_file):
         raise FileNotFoundError(f"File not found: {project_file}")
-    files = project_file_set(project_file, include_files=include_files)
+    files = project_file_set(project_file, extra_files=include_files)
     if not files:
         raise FileNotFoundError(f"No project files found for: {project_file}")
 

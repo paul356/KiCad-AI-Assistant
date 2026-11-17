@@ -76,7 +76,7 @@ class TestProjectFileSet:
     def test_include_adds_nested_sheet(self, tmp_path):
         pro, root_sch, sheet = _project(tmp_path)
 
-        files = version_manager.project_file_set(str(pro), include_files=[str(sheet)])
+        files = version_manager.project_file_set(str(pro), extra_files=[str(sheet)])
 
         assert files["hardware/main_bus.kicad_sch"] == str(sheet)
         assert files["aria.kicad_sch"] == str(root_sch)
@@ -85,10 +85,61 @@ class TestProjectFileSet:
     def test_default_set_entry_is_skipped(self, tmp_path):
         pro, root_sch, _ = _project(tmp_path)
 
-        files = version_manager.project_file_set(str(pro), include_files=[str(root_sch)])
+        files = version_manager.project_file_set(str(pro), extra_files=[str(root_sch)])
 
         assert files["aria.kicad_sch"] == str(root_sch)
         assert list(files).count("aria.kicad_sch") == 1
+
+    def test_duplicate_extra_entries_appear_once(self, tmp_path):
+        pro, _, sheet = _project(tmp_path)
+
+        files = version_manager.project_file_set(str(pro), extra_files=[str(sheet), str(sheet)])
+
+        assert list(files).count("hardware/main_bus.kicad_sch") == 1
+
+    def test_outside_and_missing_entries_are_skipped(self, tmp_path):
+        pro, root_sch, sheet = _project(tmp_path)
+        outside = tmp_path / "outside.kicad_sch"
+        outside.write_text("outside\n")
+        traversal = os.path.join(str(pro.parent), "..", "outside.kicad_sch")
+
+        files = version_manager.project_file_set(
+            str(pro),
+            extra_files=[str(outside), traversal, str(pro.parent / "gone.kicad_sch"), str(sheet)],
+        )
+
+        assert set(files) == {
+            "aria.kicad_pro",
+            "aria.kicad_sch",
+            "hardware/main_bus.kicad_sch",
+        }
+        assert files["hardware/main_bus.kicad_sch"] == str(sheet)
+        assert files["aria.kicad_sch"] == str(root_sch)
+
+    def test_extra_files_keep_input_order_after_default_set(self, tmp_path):
+        pro, _, sheet = _project(tmp_path)
+        other = pro.parent / "hardware" / "second.kicad_sch"
+        other.write_text("second\n")
+
+        files = version_manager.project_file_set(str(pro), extra_files=[str(sheet), str(other)])
+
+        assert list(files) == [
+            "aria.kicad_pro",
+            "aria.kicad_sch",
+            "hardware/main_bus.kicad_sch",
+            "hardware/second.kicad_sch",
+        ]
+
+    def test_include_files_none_is_the_default_set(self, tmp_path):
+        pro, _, _ = _project(tmp_path)
+
+        assert version_manager.project_file_set(str(pro)) == (
+            version_manager.project_file_set(str(pro), extra_files=None)
+        )
+        assert set(version_manager.project_file_set(str(pro))) == {
+            "aria.kicad_pro",
+            "aria.kicad_sch",
+        }
 
 
 class TestSaveAndRestoreWithIncludeFiles:
@@ -140,6 +191,129 @@ class TestSaveAndRestoreWithIncludeFiles:
         with tarfile.open(result["backup_of_current"], "r:gz") as tar:
             assert "hardware/main_bus.kicad_sch" not in tar.getnames()
         assert sheet.read_text() == "nested v1\n"
+
+
+def _whole_project(tmp_path):
+    """Create a project with a root sheet/board plus nested sub-sheets/boards."""
+    project_dir = tmp_path / "whole"
+    project_dir.mkdir()
+    pro = project_dir / "whole.kicad_pro"
+    pro.write_text('{"project": "v1"}\n')
+    root_sch = project_dir / "whole.kicad_sch"
+    root_sch.write_text("root v1\n")
+    root_pcb = project_dir / "whole.kicad_pcb"
+    root_pcb.write_text("root pcb v1\n")
+    sub = project_dir / "sub"
+    sub.mkdir()
+    sheet_a = sub / "a.kicad_sch"
+    sheet_a.write_text("a v1\n")
+    sheet_b = sub / "b.kicad_sch"
+    sheet_b.write_text("b v1\n")
+    pcb_a = sub / "a.kicad_pcb"
+    pcb_a.write_text("a pcb v1\n")
+    return pro, [root_sch, root_pcb, sheet_a, sheet_b, pcb_a]
+
+
+class TestWholeProjectSnapshot:
+    def test_archive_members_are_the_whole_project(self, tmp_path):
+        pro, files = _whole_project(tmp_path)
+
+        archive = version_manager.save_project_version(
+            str(pro), include_files=[str(path) for path in files]
+        )
+
+        with tarfile.open(archive, "r:gz") as tar:
+            names = set(tar.getnames())
+        assert names == {
+            ".manifest.json",
+            "whole.kicad_pro",
+            "whole.kicad_sch",
+            "whole.kicad_pcb",
+            "sub/a.kicad_sch",
+            "sub/b.kicad_sch",
+            "sub/a.kicad_pcb",
+        }
+        manifest = version_manager._read_project_manifest(archive)
+        assert set(manifest["files"]) == names - {".manifest.json"}
+
+    def test_unchanged_project_reuses_latest_archive(self, tmp_path):
+        pro, files = _whole_project(tmp_path)
+        includes = [str(path) for path in files]
+
+        first = version_manager.save_project_version(str(pro), include_files=includes)
+        second = version_manager.save_project_version(str(pro), include_files=includes)
+
+        assert second == first
+
+    def test_one_subsheet_change_creates_new_archive(self, tmp_path):
+        pro, files = _whole_project(tmp_path)
+        includes = [str(path) for path in files]
+        first = version_manager.save_project_version(str(pro), include_files=includes)
+
+        (pro.parent / "sub" / "b.kicad_sch").write_text("b v2\n")
+        second = version_manager.save_project_version(str(pro), include_files=includes)
+
+        assert second != first
+        assert version_manager.project_version_id(second, str(pro)) != (
+            version_manager.project_version_id(first, str(pro))
+        )
+
+    def test_restore_returns_every_file_to_snapshot(self, tmp_path):
+        pro, files = _whole_project(tmp_path)
+        includes = [str(path) for path in files]
+        archive = version_manager.save_project_version(str(pro), include_files=includes)
+        version_id = version_manager.project_version_id(archive, str(pro))
+
+        for path in files:
+            path.write_text(f"{path.name} v2\n")
+
+        result = version_manager.restore_project_version(str(pro), version_id)
+
+        assert set(result["files"]) == {
+            "whole.kicad_pro",
+            "whole.kicad_sch",
+            "whole.kicad_pcb",
+            "sub/a.kicad_sch",
+            "sub/b.kicad_sch",
+            "sub/a.kicad_pcb",
+        }
+        assert pro.read_text() == '{"project": "v1"}\n'
+        assert (pro.parent / "whole.kicad_sch").read_text() == "root v1\n"
+        assert (pro.parent / "sub" / "a.kicad_sch").read_text() == "a v1\n"
+        assert (pro.parent / "sub" / "b.kicad_sch").read_text() == "b v1\n"
+        assert (pro.parent / "sub" / "a.kicad_pcb").read_text() == "a pcb v1\n"
+
+    def test_missing_and_outside_entries_do_not_fail_the_snapshot(self, tmp_path):
+        pro, files = _whole_project(tmp_path)
+        outside = tmp_path / "outside.kicad_sch"
+        outside.write_text("outside\n")
+        includes = [
+            str(outside),
+            str(pro.parent / "gone.kicad_sch"),
+            *(str(path) for path in files),
+        ]
+
+        archive = version_manager.save_project_version(str(pro), include_files=includes)
+
+        with tarfile.open(archive, "r:gz") as tar:
+            names = set(tar.getnames())
+        assert "sub/a.kicad_sch" in names
+        assert "outside.kicad_sch" not in names
+        assert "gone.kicad_sch" not in names
+
+    def test_retention_prunes_the_oldest_archive(self, tmp_path):
+        pro, files = _whole_project(tmp_path)
+        includes = [str(path) for path in files]
+        archives = []
+        for index in range(version_manager.MAX_PROJECT_VERSIONS + 1):
+            (pro.parent / "whole.kicad_sch").write_text(f"root v{index}\n")
+            archives.append(version_manager.save_project_version(str(pro), include_files=includes))
+
+        assert len(version_manager.list_project_versions(str(pro))) == (
+            version_manager.MAX_PROJECT_VERSIONS
+        )
+        assert not os.path.exists(archives[0])
+        assert all(os.path.exists(path) for path in archives[1:])
 
 
 def _write_archive(project_file, version_id, members, *, manifest=True):
