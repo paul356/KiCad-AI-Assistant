@@ -205,7 +205,7 @@ class TestAddSheetSymbol:
         assert result["position"]["y"] == pytest.approx(candidate["y"])
         assert result["note"] == "Position adjusted to nearest free area."
 
-    def test_instances_use_owning_project_name(self, tools, tmp_path):
+    def test_instances_use_owning_project_name(self, tools, tmp_path, isolated_project_search):
         """A nested sheet records the root project's name, not its own stem."""
         (tmp_path / "aria.kicad_pro").write_text("{}")
         hardware = tmp_path / "hardware"
@@ -332,6 +332,7 @@ class TestUpdateSheetSymbol:
         assert "error" not in result
 
 
+@pytest.mark.usefixtures("isolated_project_search")
 class TestCanonicalSheetData:
     """The written sheet node matches what KiCad 10 itself writes."""
 
