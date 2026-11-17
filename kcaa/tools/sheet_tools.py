@@ -144,22 +144,45 @@ def _has_position_conflict(
 
 
 # ---------------------------------------------------------------------------
-# S-expression helpers for manual sheet construction
+# S-expression helpers for canonical sheet data
 # ---------------------------------------------------------------------------
 
+# Top-level sections KiCad writes after all schematic items.  Root schematics
+# carry both; child schematics carry neither, so new items must be inserted
+# before them rather than appended.
+_ROOT_ONLY_SECTIONS = frozenset({"sheet_instances", "embedded_fonts"})
 
-def _sexp_line_uuid(tag: str, u: str, indent: int = 2) -> str:
-    return f'{" " * indent}({tag} "{u}")'
+
+def _tag_of(node: Any) -> str | None:
+    """Return the leading symbol of an S-expression node, if it has one."""
+    import sexpdata
+
+    if isinstance(node, list) and node and isinstance(node[0], sexpdata.Symbol):
+        return node[0].value()
+    return None
 
 
-def _sexp_property(name: str, value: str, indent: int = 2) -> str:
-    return (
-        f'{" " * indent}(property "{name}" "{value}"'
-        f" (at 0 0 0)"
-        f" (show_name no)"
-        f" (do_not_autoplace yes)"
-        f" (effects (font (size 1.27 1.27)) (justify left)))"
-    )
+def _property_key(name: Any) -> str:
+    """Normalise a sheet property name: ``Sheetname`` and ``Sheet name`` match."""
+    if not isinstance(name, str):
+        return ""
+    return name.replace(" ", "").replace("_", "").lower()
+
+
+def _insert_schematic_item(tree: list, entry: list) -> None:
+    """Insert *entry* with the other schematic items.
+
+    KiCad writes ``sheet_instances`` and ``embedded_fonts`` last; appending
+    after them is not canonical.
+    """
+    import copy
+
+    index = len(tree)
+    for i, node in enumerate(tree):
+        if _tag_of(node) in _ROOT_ONLY_SECTIONS:
+            index = i
+            break
+    tree.insert(index, copy.deepcopy(entry))
 
 
 # ---------------------------------------------------------------------------
@@ -322,9 +345,7 @@ def _sheet_dict_from_wrapper(sheet) -> dict[str, Any]:
             if not isinstance(raw_tree, list) or len(raw_tree) < 3:
                 continue
             prop_name = raw_tree[1]
-            if not isinstance(prop_name, str):
-                continue
-            normalized_name = prop_name.replace(" ", "").replace("_", "").lower()
+            normalized_name = _property_key(prop_name)
             if normalized_name == "sheetname" and sheet_name is None:
                 sheet_name = raw_tree[2]
             elif normalized_name == "sheetfile" and sheet_file is None:
@@ -518,7 +539,7 @@ def _do_add_sheet_symbol(
     if not os.path.isfile(schematic_path):
         return {"error": f"Schematic file not found: {schematic_path!r}"}
 
-    # Optionally create child file first
+    # Optionally create child file
     child_path = None
     if create_child:
         try:
@@ -541,21 +562,29 @@ def _do_add_sheet_symbol(
     # Generate UUID for the sheet symbol
     sheet_uuid = str(uuid.uuid4())
 
-    # Build the (sheet ...) S-expression as a nested list
+    # Build the (sheet ...) S-expression as a nested list, in the order and
+    # dialect KiCad 10 writes it.
     sheet_entry: list = [
         sexpdata.Symbol("sheet"),
         [sexpdata.Symbol("at"), x, y],
         [sexpdata.Symbol("size"), width, height],
+        [sexpdata.Symbol("exclude_from_sim"), sexpdata.Symbol("no")],
+        [sexpdata.Symbol("in_bom"), sexpdata.Symbol("yes")],
+        [sexpdata.Symbol("on_board"), sexpdata.Symbol("yes")],
+        [sexpdata.Symbol("dnp"), sexpdata.Symbol("no")],
         [
             sexpdata.Symbol("stroke"),
             [sexpdata.Symbol("width"), 0],
-            [sexpdata.Symbol("type"), sexpdata.Symbol("dash")],
+            [sexpdata.Symbol("type"), sexpdata.Symbol("solid")],
         ],
-        [sexpdata.Symbol("fill"), [sexpdata.Symbol("type"), sexpdata.Symbol("none")]],
+        [
+            sexpdata.Symbol("fill"),
+            [sexpdata.Symbol("color"), 0, 0, 0, 0],
+        ],
         [sexpdata.Symbol("uuid"), sheet_uuid],
         [
             sexpdata.Symbol("property"),
-            "Sheet name",
+            "Sheetname",
             sheet_name,
             [sexpdata.Symbol("at"), 0, 0, 0],
             [sexpdata.Symbol("show_name"), sexpdata.Symbol("no")],
@@ -568,7 +597,7 @@ def _do_add_sheet_symbol(
         ],
         [
             sexpdata.Symbol("property"),
-            "Sheet file",
+            "Sheetfile",
             sheet_file,
             [sexpdata.Symbol("at"), 0, 0, 0],
             [sexpdata.Symbol("show_name"), sexpdata.Symbol("no")],
@@ -644,9 +673,9 @@ def _do_add_sheet_symbol(
     ]
     sheet_entry.append(instances_entry)
 
-    # Load schematic and insert the new sheet
+    # Load schematic and insert the new sheet with the other schematic items.
     sch = safe_schematic(schematic_path)
-    sch.new_from_list(sheet_entry)
+    _insert_schematic_item(sch.tree, sheet_entry)
 
     # Save the modified schematic
     backup_path = save_schematic(schematic_path, sch)
@@ -878,7 +907,7 @@ def _do_update_sheet_symbol(
         for child in sheet_entry:
             if isinstance(child, list) and len(child) > 0:
                 if isinstance(child[0], sexpdata.Symbol) and child[0].value() == "property":
-                    if len(child) > 1 and child[1] == "Sheet name":
+                    if len(child) > 2 and _property_key(child[1]) == "sheetname":
                         child[2] = sheet_name
                         final_sheet_name = sheet_name
                         updated_fields.append("sheet_name")
@@ -889,7 +918,7 @@ def _do_update_sheet_symbol(
         for child in sheet_entry:
             if isinstance(child, list) and len(child) > 0:
                 if isinstance(child[0], sexpdata.Symbol) and child[0].value() == "property":
-                    if len(child) > 1 and child[1] == "Sheet file":
+                    if len(child) > 2 and _property_key(child[1]) == "sheetfile":
                         child[2] = sheet_file
                         final_sheet_file = sheet_file
                         updated_fields.append("sheet_file")
@@ -1215,6 +1244,18 @@ def register_sheet_tools(mcp: FastMCP) -> None:
         ctx: Context | None = None,
     ) -> dict[str, Any]:
         """Add a hierarchical sheet symbol to a schematic.
+
+        The sheet is written with the canonical KiCad 10 sheet node
+        (``Sheetname`` / ``Sheetfile`` properties, ``(fill (color 0 0 0 0))``,
+        four ``exclude_from_sim``/``in_bom``/``on_board``/``dnp`` flags and a
+        solid stroke), placed before any ``sheet_instances`` section.  Its
+        ``instances`` path is the containing sheet's path (``/<root uuid>``
+        for a sheet added to the project root) and its page is the lowest
+        unused page number in the project.
+
+        Only root schematics can be extended: a child schematic has no record
+        of its enclosing sheet path, so the call fails rather than writing a
+        guessed instance path.
 
         Args:
             schematic_path: Absolute path to the target ``.kicad_sch`` file.
