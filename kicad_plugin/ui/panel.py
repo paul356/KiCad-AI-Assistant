@@ -362,8 +362,9 @@ if _WX_AVAILABLE:
             # Project-scoped session watch: tracks the open KiCad project so
             # switching projects can re-offer that project's saved sessions
             # (same flow as startup auto-restore). Started by _init_llm_client.
-            # _published is the last valid record this panel wrote; it is used
-            # for change detection and session stamps, never as a read fallback.
+            # _published is the last valid record this panel wrote; it drives change
+            # detection and is the session-stamp fallback when the state file
+            # is unreadable.
             self._published: dict | None = None
             self._ticks_until_scan: int = 0
             self._project_watch_timer = wx.Timer(self)
@@ -3441,10 +3442,11 @@ if _WX_AVAILABLE:
         def _current_project_path(self) -> str | None:
             """Absolute ``.kicad_pro`` path from the published record, or None.
 
-            This is the only project read path: no live probe, no in-memory
-            fallback.  A missing, corrupt, ``null`` or otherwise invalid
-            record means "no project" for session restore, the Load dialog,
-            the context block and session stamps.
+            This path has no live probe and no in-memory fallback.  A missing,
+            corrupt, ``null`` or otherwise invalid record means "no project"
+            for session restore, the Load dialog and the context block.
+            Session stamps use :meth:`_session_project_path`, which has its
+            own narrow fallback.
             """
             state = _pstate.read_state(self._state_path())
             return _pstate.project_file_path(state)

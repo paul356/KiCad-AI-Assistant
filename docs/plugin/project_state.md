@@ -5,8 +5,9 @@
 The plugin runs in KiCad's embedded interpreter; the MCP server runs in a
 separate subprocess. Both need to agree on *which project is open* for path
 trust, session ownership, context prompts and pre-edit snapshots. Exactly one
-file carries that answer — there is no second probe, window-title fallback or
-in-memory mirror.
+file carries that answer — there is no second probe and no window-title
+fallback. The panel keeps the last record it published only for change
+detection and the session-stamp fallback described below.
 
 ## 2. Location
 
@@ -80,9 +81,11 @@ the watch, five seconds by default).
 
 | Reader | Uses the record for |
 |---|---|
-| Panel `_current_project_path()` | Session auto-restore, Load dialog, context block, session stamps |
+| Panel `_current_project_path()` | Session auto-restore, Load dialog, context block |
+| Panel `_session_project_path()` | Session stamps (with the unreadable-file fallback below) |
 | `kicad_plugin/context_bridge.py` | `## Active KiCad Context` system-prompt block (absolute file paths) |
-| `_project_path_for()` (`kicad_plugin/llm_client.py`) | Pre-edit snapshots and project-relative paths |
+| `_resolve_project()` (`kicad_plugin/llm_client.py`) | Pre-edit and Auto Route snapshots, project-relative paths |
+| `save_project_version` (`kcaa/tools/version_tools.py`) | Merging the whole project into an explicit snapshot |
 | `PathValidator` (`kcaa/utils/path_validator.py`) | The project trust root |
 
 Every read path **fails closed**: a missing, corrupt, `null` or invalid
@@ -104,16 +107,21 @@ unreadable; a still-failing read returns "no project" and clears the trust
 root as before.
 
 The pre-edit resolver has no fallback either.  With no valid record it
-returns no project and an actionable "reopen the plugin panel and retry"
-error; a path outside `project_root` is refused; a recorded `profile_file`
-that no longer exists also fails with a retry message.  The file being
-edited is checked against `project_root` as well.  There is no upward
-filesystem search on the read side.
+returns no project and an actionable error (save the project, open its PCB
+editor, then retry); a path outside `project_root` is refused; a recorded
+`profile_file` that no longer exists also fails with a retry message.  The
+file being edited is checked against `project_root` as well.  There is no
+upward filesystem search on the read side.
 
 The canonical upward search in `kcaa/utils/project_resolution.py` (used by
-the router, ERC validation and standalone tools) is intentionally tolerant:
-an unreadable directory is treated as having no project and the search moves
-to the parent.  The plugin's pre-edit snapshot does **not** use it.
+the router, ERC validation and standalone tools) stops when a directory
+cannot be read instead of adopting a project higher up.  The plugin's
+pre-edit snapshot does **not** use it.
+
+The plugin's pre-edit snapshot and a direct `save_project_version` call read
+the same record: when the record names the project being versioned, the tool
+merges every `pcb_files`/`schematic_files` entry into the archive, so an
+explicit call also covers the whole project.
 
 ## 7. Invariants
 

@@ -164,6 +164,12 @@ The short version of these instructions also ships inside the plugin zip (`kicad
 5. Click **KiCad AI Assistant** in the plugin list to open the chat panel.
 6. Go to **Options → Settings** and enter your LLM API key.
 
+The panel publishes the open project from the PCB editor. Editing tools that
+need a project (including the automatic pre-edit snapshots) therefore require
+a saved KiCad project with the PCB editor open; when no project can be read
+they return an actionable error instead of guessing from sibling files.
+Save the project and open its PCB editor, then retry.
+
 ## Configuration
 
 Plugin settings are stored in the KiCad user config directory:

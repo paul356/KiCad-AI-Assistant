@@ -599,9 +599,11 @@ Routing is orthogonal (horizontal-vertical). If an endpoint lies on the interior
 **Key parameters:**
 - `project_file` (`str`) — absolute path to the owning `.kicad_pro`.
 - `keep` (`int | None`) — number of archives to retain (default 10); oldest are pruned first.
-- `include_files` (`list[str] | None`) — extra files to archive, typically every board and sheet listed by the project state.
+- `include_files` (`list[str] | None`) — extra files to archive, such as `sym-lib-table`/`fp-lib-table`. A relative entry is resolved against the project directory (the directory containing `project_file`), not the server process cwd; absolute entries are used as given.
 
-**Containment rule:** every `include_files` entry is archived only when it is an existing file whose `realpath` (symlinks resolved) is inside the project directory — the directory containing `project_file`. An entry containing `..` that escapes the root, an absolute path outside the root, a symlink pointing outside, a non-file, or a missing file is **skipped** and logged at debug level; it never fails the snapshot. Entries already in the default set (`.kicad_pro`, same-stem root `.kicad_sch`, same-stem `.kicad_pcb`) are skipped silently. The plugin passes every board and sheet from the canonical project state here, so one archive holds the whole project and any sub-sheet change creates a new archive.
+**Whole-project merge:** in plugin mode the tool reads the published project state (`KCAA_PROJECT_STATE_FILE`) and, when the record's `project_root` (realpath) equals the project directory and its `profile_file` equals `project_file`'s basename, merges every `pcb_files`/`schematic_files` entry into the archive. A standalone MCP server (no state variable), an invalid record, or a record naming another project silently keeps the explicit list only.
+
+**Containment rule:** every `include_files` entry (explicit or merged) is archived only when it is an existing file whose `realpath` (symlinks resolved) is inside the project directory. A missing file, a non-file, a `..` escape, or an absolute path/symlink outside the root fails the tool call with an error naming the entry as supplied; the snapshot is never silently narrowed. Entries already covered are skipped silently. The resolved `files` list uses project-relative paths, so those names can be passed back as `include_files`.
 
 **Archive layout:** a single `.tar.gz` at `<project_dir>/.versions/project/<project_stem>.project.<timestamp>.tar.gz`. Members are stored under their project-relative paths (`hardware/main_bus.kicad_sch`), plus `.manifest.json` with each member's SHA-256. Restore extracts every member over the project tree, and the `files` result lists the archived relative paths.
 
