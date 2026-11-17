@@ -177,6 +177,35 @@ def _load_schematic_tree(path: str) -> list:
         return sexpdata.loads(fh.read())
 
 
+def _try_load_schematic_tree(path: str) -> list | None:
+    """Parse *path*, returning ``None`` when the file is unusable.
+
+    Best-effort variant of :func:`_load_schematic_tree` for child sheets an
+    unrelated tool may have left missing or truncated.  ``OSError`` covers
+    missing/unreadable files, ``ValueError`` covers undecodable bytes
+    (``UnicodeDecodeError``), and the ``sexpdata`` parser reports unbalanced
+    or trailing input with its own exception types.
+    """
+    import sexpdata
+
+    try:
+        with open(path, encoding="utf-8") as fh:
+            content = fh.read()
+        if not content.strip():
+            return None
+        return sexpdata.loads(content)
+    except (
+        OSError,
+        ValueError,
+        AssertionError,  # sexpdata.loads asserts on empty parses
+        sexpdata.ExpectClosingBracket,
+        sexpdata.ExpectNothing,
+        sexpdata.ExpectSExp,
+    ) as exc:
+        log.debug("Skipping unreadable child schematic %s: %s", path, exc)
+        return None
+
+
 def _is_root_schematic(tree: list) -> bool:
     """Return True when *tree* belongs to a root schematic.
 
@@ -344,9 +373,8 @@ def _collect_used_page_numbers(
             child_path = (
                 child_file if os.path.isabs(child_file) else os.path.join(base_dir, child_file)
             )
-            try:
-                child_tree = _load_schematic_tree(child_path)
-            except Exception:  # unreadable child is best-effort
+            child_tree = _try_load_schematic_tree(child_path)
+            if child_tree is None:
                 continue
             walk(child_path, child_tree, depth + 1)
 

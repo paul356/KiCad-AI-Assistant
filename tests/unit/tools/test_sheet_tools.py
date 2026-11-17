@@ -453,6 +453,26 @@ class TestPageAllocation:
         sheet = _sheet_node(_load(str(root)), result["sheet_uuid"])
         assert int(_instance_page(sheet)) == 4
 
+    def test_malformed_child_sheet_does_not_abort_page_collection(self, tools, tmp_path):
+        root = tmp_path / "root.kicad_sch"
+        leaf = tmp_path / "leaf.kicad_sch"
+        _write_schematic(leaf, root_uuid=CHILD_UUID, pages=(4,), is_root=False)
+        _write_schematic(root, root_uuid=ROOT_UUID, pages=(2, 3), child_file="leaf.kicad_sch")
+
+        (tmp_path / "broken.kicad_sch").write_text(
+            "(kicad_sch (version 20260306)\n", encoding="utf-8"
+        )
+        text = root.read_text(encoding="utf-8")
+        root.write_text(text.replace('"leaf.kicad_sch"', '"broken.kicad_sch"', 1), encoding="utf-8")
+
+        result = _add_sheet(tools, str(root))
+        assert result["success"] is True, result
+
+        sheet = _sheet_node(_load(str(root)), result["sheet_uuid"])
+        # Pages 2 and 3 belong to the root sheets, page 4 to the readable
+        # sibling; the malformed child must not hide either.
+        assert int(_instance_page(sheet)) == 5
+
 
 class TestInstancePathResolution:
     """D1: resolve the parent path from real project data, never guess it."""
