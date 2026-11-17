@@ -5612,13 +5612,13 @@ class TestPruneRollbackHistory:
         the original same-stem rule.
         """
 
-        def fake_project_path(file_path, state_file=None):
+        def fake_project_path(file_path, record):
             directory = os.path.dirname(os.path.abspath(file_path))
             name = os.path.basename(file_path)
             stem = name.split(".kicad_")[0] if ".kicad_" in name else os.path.splitext(name)[0]
             return os.path.join(directory, f"{stem}.kicad_pro")
 
-        monkeypatch.setattr(llm_client, "_project_path_for", fake_project_path)
+        monkeypatch.setattr(llm_client, "_project_path_from_record", fake_project_path)
 
     # ---- Helpers ---------------------------------------------------------------
 
@@ -8526,3 +8526,100 @@ class TestWholeProjectSnapshot:
                 "include_files": [str(pcb), str(root_sch), str(nested_sch)],
             },
         )
+
+
+class TestProjectResolvedOncePerToolCall:
+    """One resolution feeds both the pre-edit snapshot and coverage tracking."""
+
+    def test_resolution_is_shared_and_keeps_the_original_project(self, tmp_path, monkeypatch):
+        root_a = tmp_path / "a"
+        root_a.mkdir()
+        pro_a = root_a / "a.kicad_pro"
+        pro_a.write_text("{}\n")
+        sheet_a = root_a / "a.kicad_sch"
+        sheet_a.write_text("(kicad_sch)\n")
+        root_b = tmp_path / "b"
+        root_b.mkdir()
+        pro_b = root_b / "b.kicad_pro"
+        pro_b.write_text("{}\n")
+        (root_b / "b.kicad_sch").write_text("(kicad_sch)\n")
+        state_file = tmp_path / "project_state.json"
+        record_a = pstate.build_record(str(pro_a))
+        assert record_a is not None
+        assert pstate.write_state(str(state_file), record_a)
+        record_b = pstate.build_record(str(pro_b))
+        assert record_b is not None
+
+        client = _make_client()
+        client._state_file = str(state_file)
+        policy = TOOL_POLICIES["set_symbol_property"]
+        monkeypatch.setitem(
+            TOOL_POLICIES,
+            "set_symbol_property",
+            type(policy)(**{**policy.__dict__, "track_snapshot": True}),
+        )
+
+        resolutions = []
+        real_resolve = llm_client._resolve_project
+
+        def counting_resolve(path, state_file=None):
+            resolutions.append(path)
+            return real_resolve(path, state_file)
+
+        monkeypatch.setattr(llm_client, "_resolve_project", counting_resolve)
+
+        def _server(base_url, name, args, timeout=None):
+            if name == "set_symbol_property":
+                # The published project changes between resolution and the
+                # post-success tracking path.
+                assert pstate.write_state(str(state_file), record_b)
+                return {"success": True, "files": ["a.kicad_sch"]}
+            return {"success": True}
+
+        exec_state = llm_client._ToolExecutionState()
+        with patch("kicad_plugin.llm_client.call_mcp_tool", side_effect=_server):
+            result = client._execute_tool_with_policy(
+                "set_symbol_property",
+                {"schematic_path": str(sheet_a)},
+                exec_state,
+                None,
+            )
+
+        assert result["success"] is True
+        assert resolutions == [str(sheet_a)]
+        assert list(exec_state.covered_files) == [str(pro_a)]
+        assert exec_state.covered_files[str(pro_a)] == {"a.kicad_sch"}
+
+    def test_touch_check_reads_state_once(self, tmp_path, monkeypatch):
+        pro = tmp_path / "a.kicad_pro"
+        pro.write_text("{}\n")
+        sheet = tmp_path / "a.kicad_sch"
+        sheet.write_text("(kicad_sch)\n")
+        state_file = tmp_path / "project_state.json"
+        record = pstate.build_record(str(pro))
+        assert record is not None
+        assert pstate.write_state(str(state_file), record)
+        client = _make_client()
+        client._state_file = str(state_file)
+
+        reads = []
+        real_read = pstate.read_state
+
+        def counting_read(path):
+            reads.append(path)
+            return real_read(path)
+
+        monkeypatch.setattr(llm_client.project_state, "read_state", counting_read)
+
+        touches = client._tool_touches_project(
+            {
+                "file_path": str(sheet),
+                "schematic_path": str(sheet),
+                "pcb_path": str(sheet),
+                "project_path": str(pro),
+            },
+            str(pro),
+        )
+
+        assert touches is True
+        assert reads == [str(state_file)]

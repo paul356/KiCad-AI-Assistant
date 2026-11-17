@@ -2649,9 +2649,10 @@ class LLMClient:
     def _tool_touches_project(self, args: dict[str, Any], project_file: str) -> bool:
         """Return True if *args* reference any file of *project_file*'s project."""
         target = os.path.abspath(project_file)
+        record = project_state.read_state(self._state_file)
         for key in ("file_path", "schematic_path", "pcb_path", "project_path"):
             value = args.get(key)
-            resolved = _project_path_for(value, self._state_file) if value else None
+            resolved = _project_path_from_record(value, record) if value else None
             if resolved is not None and resolved == target:
                 return True
         return False
@@ -3238,15 +3239,13 @@ class LLMClient:
         if not self._tool_result_succeeded(result):
             return result
 
-        if policy.track_snapshot and path:
-            resolved_project = _project_path_for(path, self._state_file)
-            if resolved_project is not None:
-                covered = state.covered_files.setdefault(resolved_project, set())
-                reported = result.get("files") if isinstance(result, dict) else None
-                if isinstance(reported, list):
-                    for rel in reported:
-                        if isinstance(rel, str):
-                            covered.add(rel.replace(os.sep, "/"))
+        if policy.track_snapshot and path and project_path is not None:
+            covered = state.covered_files.setdefault(project_path, set())
+            reported = result.get("files") if isinstance(result, dict) else None
+            if isinstance(reported, list):
+                for rel in reported:
+                    if isinstance(rel, str):
+                        covered.add(rel.replace(os.sep, "/"))
         if policy.clear_dirty_paths_arg:
             reload_paths = args.get(policy.clear_dirty_paths_arg, [])
             if isinstance(reload_paths, list):
