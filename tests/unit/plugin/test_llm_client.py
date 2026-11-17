@@ -1534,7 +1534,7 @@ class TestRunIntegration:
             if name == "save_project_version":
                 files = sorted(
                     _vm.project_file_set(
-                        args["project_file"], include_files=args.get("include_files")
+                        args["project_file"], extra_files=args.get("include_files")
                     )
                 )
                 archive = _vm.save_project_version(
@@ -8313,3 +8313,110 @@ class TestProjectResolutionBeforeEdit:
         assert failed["success"] is False
         assert str(sheet) in failed["error"]
         assert str(tmp_path) in failed["error"]  # directories searched are reported
+
+
+class TestWholeProjectSnapshot:
+    """The pre-edit snapshot covers every board and sheet in the project."""
+
+    @staticmethod
+    def _project(tmp_path):
+        root = tmp_path / "proj"
+        root.mkdir()
+        pro = root / "proj.kicad_pro"
+        pro.write_text("{}\n")
+        root_sch = root / "proj.kicad_sch"
+        root_sch.write_text("root\n")
+        hardware = root / "hardware"
+        hardware.mkdir()
+        nested_sch = hardware / "main.kicad_sch"
+        nested_sch.write_text("nested\n")
+        pcb = hardware / "main.kicad_pcb"
+        pcb.write_text("(kicad_pcb)\n")
+        state_file = tmp_path / "project_state.json"
+        state_file.write_text(
+            json.dumps(
+                {
+                    "version": 2,
+                    "written_at": "2026-11-17T09:12:33Z",
+                    "project_root": str(root),
+                    "profile_file": pro.name,
+                    "pcb_files": ["hardware/main.kicad_pcb"],
+                    "schematic_files": ["proj.kicad_sch", "hardware/main.kicad_sch"],
+                }
+            ),
+            encoding="utf-8",
+        )
+        return pro, root_sch, nested_sch, pcb, state_file
+
+    def test_manifest_becomes_absolute_include_list(self, tmp_path):
+        pro, root_sch, nested_sch, pcb, state_file = self._project(tmp_path)
+
+        assert llm_client._snapshot_include_files(str(pro), str(nested_sch), str(state_file)) == [
+            str(pcb),
+            str(root_sch),
+            str(nested_sch),
+        ]
+
+    def test_missing_state_record_falls_back_to_touched_file(self, tmp_path):
+        pro, _root_sch, nested_sch, _pcb, _state_file = self._project(tmp_path)
+
+        assert llm_client._snapshot_include_files(str(pro), str(nested_sch), None) == [
+            str(nested_sch)
+        ]
+
+    def test_state_record_for_another_root_is_ignored(self, tmp_path):
+        pro, _root_sch, nested_sch, _pcb, state_file = self._project(tmp_path)
+        other = tmp_path / "other"
+        other.mkdir()
+        payload = json.loads(state_file.read_text(encoding="utf-8"))
+        payload["project_root"] = str(other)
+        payload["profile_file"] = "other.kicad_pro"
+        (other / "other.kicad_pro").write_text("{}\n")
+        state_file.write_text(json.dumps(payload), encoding="utf-8")
+
+        assert llm_client._snapshot_include_files(str(pro), str(nested_sch), str(state_file)) == [
+            str(nested_sch)
+        ]
+
+    def test_snapshot_call_covers_the_whole_project(self, tmp_path):
+        pro, root_sch, nested_sch, pcb, state_file = self._project(tmp_path)
+        client = _make_client()
+        client._state_file = str(state_file)
+        tool_response = {
+            "finish_reason": "tool_calls",
+            "message": {
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "tc1",
+                        "type": "function",
+                        "function": {
+                            "name": "set_symbol_property",
+                            "arguments": json.dumps({"schematic_path": str(nested_sch)}),
+                        },
+                    }
+                ],
+            },
+        }
+        final_response = {"finish_reason": "stop", "message": {"content": "done"}}
+        client._call_llm = MagicMock(side_effect=[tool_response, final_response])
+        client._enabled_tools = {"set_symbol_property"}
+
+        with patch("kicad_plugin.llm_client.call_mcp_tool") as mock_call_tool:
+            mock_call_tool.side_effect = [
+                {"success": True},  # save_document
+                {"success": True, "version_id": "v1"},
+                {"success": True},
+                {"success": True, "reloaded": [str(nested_sch)], "failed": []},
+            ]
+            result = client.run("edit nested sheet", context_block="")
+
+        assert result == "done"
+        assert mock_call_tool.call_args_list[1].args == (
+            client._mcp_base_url,
+            "save_project_version",
+            {
+                "project_file": str(pro),
+                "include_files": [str(pcb), str(root_sch), str(nested_sch)],
+            },
+        )

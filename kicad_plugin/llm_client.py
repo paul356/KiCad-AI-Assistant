@@ -78,6 +78,30 @@ def _resolve_project(
     )
 
 
+def _snapshot_include_files(
+    project_file: str, touched: str, state_file: str | None = None
+) -> list[str]:
+    """Return the absolute files a pre-edit snapshot must cover.
+
+    The canonical project record lists every board and sheet under
+    ``project_root``.  When it names the same root as *project_file*, those
+    files are returned so one archive holds the whole project; *touched* is
+    always appended for the file about to change.  A missing, invalid or
+    empty record degrades to *touched* alone, leaving the default trio
+    (``.kicad_pro`` + same-stem root sch/pcb) exactly as before.
+    """
+    files: list[str] = []
+    record = project_state.read_state(state_file)
+    if record is not None and os.path.realpath(record["project_root"]) == os.path.realpath(
+        os.path.dirname(project_file)
+    ):
+        root = record["project_root"]
+        by_kind = record["pcb_files"] + record["schematic_files"]
+        files.extend(os.path.join(root, rel) for rel in by_kind)
+    files.append(os.path.abspath(touched))
+    return list(dict.fromkeys(files))
+
+
 def _project_path_for(file_path: str, state_file: str | None = None) -> str | None:
     """Return the .kicad_pro path of the project owning *file_path*, or None.
 
@@ -3153,7 +3177,7 @@ class LLMClient:
 
                 snapshot_args = {
                     "project_file": project_path,
-                    "include_files": [path],
+                    "include_files": _snapshot_include_files(project_path, path, self._state_file),
                 }
                 snapshot_result = self._call_mcp_tool_guarded(
                     "save_project_version", snapshot_args, cancel_event

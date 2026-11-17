@@ -242,18 +242,33 @@ uses its `profile_file`; a path outside that root is refused with an error
 naming the active project. When the record's `profile_file` has gone stale,
 the upward search may supply a replacement only from the same
 `project_root`; with no valid record the upward search decides. The snapshot
-call receives that project file plus `include_files=[<file being edited>]`.
-The snapshot therefore targets the resolved project — never a fabricated
-sibling — and always contains the nested sheet or board about to be modified.
-When no project can be resolved, the tool call fails before the document is
-touched; the snapshot is not skipped silently.
+call receives that project file plus `include_files` naming **the whole
+project**: every `pcb_files` and `schematic_files` entry from the state
+record, converted to absolute paths under `project_root`, together with the
+file about to be edited. A missing, invalid or empty record degrades to the
+touched file alone, which is exactly the default trio (`.kicad_pro`,
+same-stem root `.kicad_sch`, same-stem `.kicad_pcb`) — the snapshot never
+fails because the state is unavailable. When no project can be resolved,
+the tool call fails before the document is touched; the snapshot is not
+skipped silently.
+
+The same rule backs the Auto Route pre-routing snapshot, so FreeRouting
+cannot change a nested board that the archive does not cover.
 
 Snapshot state is keyed by **(project, file) per turn**: editing file A and
-then file B in the same project within one turn produces two archives, each
-containing the edited file's pre-edit content (the archive is taken after
-`save_document`, immediately before the first edit). Repeated edits to the
-same file reuse that turn's snapshot. An explicit `save_project_version` or
-`restore_project_version` suppresses the per-file snapshot only for the
-project-relative files it reports covering — the default trio for a save
-without `include_files`, or the restored members for a restore. Any other
+then file B in the same project within one turn produces a snapshot before
+each file's first edit, and every such snapshot archives the whole project.
+Repeated edits to the same file reuse that turn's snapshot. An explicit
+`save_project_version` or `restore_project_version` suppresses the per-file
+snapshot only for the project-relative files it reports covering — the
+archived set for a save, or the restored members for a restore. Any other
 file in the same project still gets its own pre-edit archive.
+
+Because one archive holds the whole project, changing any sub-sheet, board
+or the project file changes the manifest hashes and produces a new archive;
+an unchanged project reuses the latest one. Disk use is approximately the
+project size times `MAX_PROJECT_VERSIONS` (10 by default), since each archive
+is a full compressed copy rather than a delta. Restoring an archive extracts
+every member it contains, so a sub-sheet that was deleted after the snapshot
+is recreated, and the pre-restore backup covers every archived member that
+still exists on disk — the restore is undoable for nested files too.

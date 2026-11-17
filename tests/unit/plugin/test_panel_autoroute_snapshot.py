@@ -65,3 +65,54 @@ def test_unsaved_board_aborts_before_snapshot_or_routing(tmp_path):
         assert error is not None
         assert "Save the .kicad_pcb" in error
         assert calls == []
+
+
+def test_snapshot_includes_every_project_file_from_state(tmp_path):
+    import json
+
+    pro = tmp_path / "aria.kicad_pro"
+    pro.write_text("{}\n")
+    root_sch = tmp_path / "aria.kicad_sch"
+    root_sch.write_text("(kicad_sch)\n")
+    hardware = tmp_path / "hardware"
+    hardware.mkdir()
+    board = hardware / "main_bus.kicad_pcb"
+    board.write_text("(kicad_pcb)\n")
+    nested_sch = hardware / "main_bus.kicad_sch"
+    nested_sch.write_text("(kicad_sch)\n")
+    state_file = tmp_path / "project_state.json"
+    state_file.write_text(
+        json.dumps(
+            {
+                "version": 2,
+                "written_at": "2026-11-17T09:12:33Z",
+                "project_root": str(tmp_path),
+                "profile_file": pro.name,
+                "pcb_files": ["hardware/main_bus.kicad_pcb"],
+                "schematic_files": ["aria.kicad_sch", "hardware/main_bus.kicad_sch"],
+            }
+        ),
+        encoding="utf-8",
+    )
+    calls = []
+
+    def call_tool(base_url, name, args):
+        calls.append((base_url, name, args))
+        return {"success": True, "archive_path": str(tmp_path / "archive.tar.gz")}
+
+    backup_path, error = _take_autoroute_snapshot(
+        str(board), "http://mcp", call_tool, str(state_file)
+    )
+
+    assert error is None
+    assert backup_path == str(tmp_path / "archive.tar.gz")
+    assert calls == [
+        (
+            "http://mcp",
+            "save_project_version",
+            {
+                "project_file": str(pro),
+                "include_files": [str(board), str(root_sch), str(nested_sch)],
+            },
+        )
+    ]

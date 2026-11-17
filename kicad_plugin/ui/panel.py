@@ -57,7 +57,7 @@ def _take_autoroute_snapshot(
             "then retry."
         )
 
-    from ..llm_client import _resolve_project
+    from ..llm_client import _resolve_project, _snapshot_include_files
 
     project_path, project_error = _resolve_project(board_path, state_file)
     if project_path is None:
@@ -73,7 +73,10 @@ def _take_autoroute_snapshot(
         result = call_tool(
             base_url,
             "save_project_version",
-            {"project_file": project_path, "include_files": [board_path]},
+            {
+                "project_file": project_path,
+                "include_files": _snapshot_include_files(project_path, board_path, state_file),
+            },
         )
     except Exception as exc:  # noqa: BLE001 -- snapshot must not crash the UI
         log.warning("autoroute: version snapshot failed: %s", exc)
