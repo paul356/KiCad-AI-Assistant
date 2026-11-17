@@ -8416,6 +8416,27 @@ class TestWholeProjectSnapshot:
 
         assert str(unlisted) not in files
 
+    def test_touched_file_outside_root_raises(self, tmp_path):
+        pro, _root_sch, _nested_sch, _pcb, state_file = self._project(tmp_path)
+        other = tmp_path / "other"
+        other.mkdir()
+        touched = other / "elsewhere.kicad_sch"
+        touched.write_text("(kicad_sch)\n")
+
+        with pytest.raises(
+            llm_client.ProjectSnapshotUnavailable, match="outside the current project"
+        ):
+            llm_client._snapshot_include_files(str(pro), str(touched), str(state_file))
+
+    def test_touched_file_inside_root_is_included(self, tmp_path):
+        pro, _root_sch, _nested_sch, _pcb, state_file = self._project(tmp_path)
+        touched = pro.parent / "late.kicad_sch"
+        touched.write_text("(kicad_sch)\n")
+
+        files = llm_client._snapshot_include_files(str(pro), str(touched), str(state_file))
+
+        assert str(touched) in files
+
     def test_missing_state_record_raises(self, tmp_path):
         pro, _root_sch, nested_sch, _pcb, _state_file = self._project(tmp_path)
 
@@ -8483,6 +8504,49 @@ class TestWholeProjectSnapshot:
         assert failed["success"] is False
         assert "Failed to save project version before set_symbol_property" in failed["error"]
         assert "state disagrees" in failed["error"]
+
+    def test_touched_outside_project_aborts_before_snapshot(self, tmp_path, monkeypatch):
+        pro, _root_sch, _nested_sch, _pcb, state_file = self._project(tmp_path)
+        other = tmp_path / "other"
+        other.mkdir()
+        touched = other / "elsewhere.kicad_sch"
+        touched.write_text("(kicad_sch)\n")
+        client = _make_client()
+        client._state_file = str(state_file)
+        # Simulate a resolver that let the outside path through; the snapshot
+        # must still refuse it before save_project_version or the edit runs.
+        monkeypatch.setattr(
+            llm_client, "_resolve_project", lambda path, state_file=None: (str(pro), None)
+        )
+        tool_response = {
+            "finish_reason": "tool_calls",
+            "message": {
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "tc1",
+                        "type": "function",
+                        "function": {
+                            "name": "set_symbol_property",
+                            "arguments": json.dumps({"schematic_path": str(touched)}),
+                        },
+                    }
+                ],
+            },
+        }
+        final_response = {"finish_reason": "stop", "message": {"content": "done"}}
+        client._call_llm = MagicMock(side_effect=[tool_response, final_response])
+        client._enabled_tools = {"set_symbol_property"}
+
+        with patch("kicad_plugin.llm_client.call_mcp_tool") as mock_call_tool:
+            mock_call_tool.return_value = {"success": True}
+            result = client.run("edit elsewhere", context_block="")
+
+        assert result == "done"
+        assert [c.args[1] for c in mock_call_tool.call_args_list] == ["save_document"]
+        failed = json.loads([m for m in client._history if m["role"] == "tool"][0]["content"])
+        assert failed["success"] is False
+        assert "outside the current project" in failed["error"]
 
     def test_snapshot_call_covers_the_whole_project(self, tmp_path):
         pro, root_sch, nested_sch, pcb, state_file = self._project(tmp_path)

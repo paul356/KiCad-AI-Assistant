@@ -95,8 +95,9 @@ def _snapshot_include_files(
     always appended and duplicates are dropped in insertion order.
 
     Raises :class:`ProjectSnapshotUnavailable` instead of degrading to
-    *touched* whenever the record is missing, describes another root, or
-    the project file has disappeared.
+    *touched* whenever the record is missing, describes another root, the
+    project file has disappeared, or *touched* itself is outside
+    ``project_root``.
     """
     record = project_state.read_state(state_file)
     if record is None:
@@ -111,6 +112,11 @@ def _snapshot_include_files(
     if not os.path.isfile(project_file):
         raise ProjectSnapshotUnavailable(
             f"The project file <{project_file}> no longer exists; reopen the panel and retry."
+        )
+    if not project_state.is_within(root, touched):
+        raise ProjectSnapshotUnavailable(
+            f"The file to edit <{touched}> is outside the current project <{root}>; "
+            "reopen the plugin panel and retry."
         )
     files = [os.path.join(root, rel) for rel in record["pcb_files"] + record["schematic_files"]]
     files.append(os.path.abspath(touched))
