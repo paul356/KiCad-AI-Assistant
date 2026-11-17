@@ -26,6 +26,7 @@ import threading
 import time
 from typing import Any
 
+from . import project_state
 from .project_resolution import find_project_file
 from .tool_registry import TOOL_POLICIES, get_missing_tool_policies, get_tool_policy
 
@@ -36,14 +37,54 @@ from .ui.colors import WARN_HEX as _STATUS_EVENT_COLOR_HEX
 log = logging.getLogger(__name__)
 
 
-def _project_path_for(file_path: str) -> str | None:
+def _resolve_project(
+    file_path: str, state_file: str | None = None
+) -> tuple[str | None, str | None]:
+    """Resolve the project owning *file_path* against the canonical state.
+
+    The published record wins over the filesystem search:
+
+    * a valid record with a usable ``profile_file`` owns every path inside
+      ``project_root`` — a path outside the root is refused, never resolved
+      to a different project;
+    * when the record's ``profile_file`` is stale (renamed/deleted), the
+      upward search may still find the replacement, but only when it lives
+      in that same ``project_root``;
+    * with no usable record (missing/corrupt/old schema/null), the canonical
+      upward search decides.
+
+    Returns ``(project_file, error)``.  *error* is set only when the state
+    record itself explains the refusal; callers keep their own message
+    otherwise.
+    """
+    hint = project_state.read_state_hint(state_file)
+    if hint is None:
+        return find_project_file(file_path), None
+    root, profile = hint
+    if profile is not None:
+        if project_state.is_within(root, file_path):
+            return profile, None
+        return None, (
+            f"{file_path!r} is outside the active KiCad project <{root}>; "
+            "refusing to resolve a project for it."
+        )
+    candidate = find_project_file(file_path)
+    if candidate is not None and os.path.realpath(
+        os.path.dirname(os.path.abspath(candidate))
+    ) == os.path.realpath(root):
+        return candidate, None
+    return None, (
+        f"No .kicad_pro project file found in the active project <{root}> for {file_path!r}."
+    )
+
+
+def _project_path_for(file_path: str, state_file: str | None = None) -> str | None:
     """Return the .kicad_pro path of the project owning *file_path*, or None.
 
-    Searches the file's directory and its ancestors for the real project
-    file; the project stem may differ from the edited file's stem and the
-    file may live in a subdirectory.  Never fabricates a sibling path.
+    See :func:`_resolve_project` for the precedence rules.  Never fabricates
+    a sibling path.
     """
-    return find_project_file(file_path)
+    return _resolve_project(file_path, state_file)[0]
 
 
 def _searched_directories(file_path: str) -> list[str]:
@@ -1865,6 +1906,14 @@ class LLMClient:
     def __init__(self, settings, mcp_base_url: str) -> None:
         self._settings = settings
         self._mcp_base_url = mcp_base_url
+        config_dir = getattr(settings, "config_dir", None)
+        # Canonical project record written by the panel.  Every project
+        # resolution in this process reads the same file the server does.
+        self._state_file: str | None = (
+            project_state.state_path(config_dir)
+            if config_dir
+            else project_state.state_file_from_env()
+        )
         self._context_tokens: int = getattr(settings, "llm_context_tokens", 128_000)
         self._compact_threshold: float = getattr(settings, "llm_compact_threshold", 0.70)
         self._compact_target_threshold: float = getattr(
@@ -2571,13 +2620,12 @@ class LLMClient:
         if annotated:
             log.info("_annotate_stale_queries: tagged %d stale query result(s)", annotated)
 
-    @staticmethod
-    def _tool_touches_project(args: dict[str, Any], project_file: str) -> bool:
+    def _tool_touches_project(self, args: dict[str, Any], project_file: str) -> bool:
         """Return True if *args* reference any file of *project_file*'s project."""
         target = os.path.abspath(project_file)
         for key in ("file_path", "schematic_path", "pcb_path", "project_path"):
             value = args.get(key)
-            resolved = _project_path_for(value) if value else None
+            resolved = _project_path_for(value, self._state_file) if value else None
             if resolved is not None and resolved == target:
                 return True
         return False
@@ -3067,14 +3115,13 @@ class LLMClient:
                         f"{policy.path_arg!r} argument."
                     ),
                 }
-            project_path = _project_path_for(path)
+            project_path, project_error = _resolve_project(path, self._state_file)
             if project_path is None:
                 searched = ", ".join(_searched_directories(path))
                 return {
                     "success": False,
-                    "error": (
-                        f"No .kicad_pro project file found for {path!r}; searched: {searched}"
-                    ),
+                    "error": project_error
+                    or (f"No .kicad_pro project file found for {path!r}; searched: {searched}"),
                 }
             file_key = (project_path, os.path.abspath(path))
             file_relative = _project_relative_path(project_path, path)
@@ -3152,7 +3199,7 @@ class LLMClient:
             return result
 
         if policy.track_snapshot and path:
-            resolved_project = _project_path_for(path)
+            resolved_project = _project_path_for(path, self._state_file)
             if resolved_project is not None:
                 covered = state.covered_files.setdefault(resolved_project, set())
                 reported = result.get("files") if isinstance(result, dict) else None

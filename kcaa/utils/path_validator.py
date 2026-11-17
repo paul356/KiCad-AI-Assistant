@@ -22,23 +22,19 @@ The process working directory is deliberately NOT a root: it is unrelated to
 the open project and to KiCad, and under the plugin it is the plugin data
 directory. The rest of the kcaa data directory — settings, session records,
 the server ``.env`` — is outside the trust boundary. The project root is
-optional (it may be ``None``) and is re-read from a state file the plugin
-publishes on every validation call (see ``PathValidator``).
+optional (it may be ``None``) and is re-read from the plugin's canonical
+``project_state.json`` on every validation call (see ``PathValidator``).
 """
 
-import json
 import logging
 import os
 import tempfile
 import threading
 
+from kcaa.utils import project_state
 from kcaa.utils.config import config
 
 log = logging.getLogger(__name__)
-
-# Set by the plugin launcher; names the state file the panel writes whenever
-# the open project changes. Missing/unreadable/malformed state is not fatal.
-_PROJECT_STATE_ENV = "KCAA_PROJECT_STATE_FILE"
 
 # Private server temp directory, created below the kcaa data directory.
 _TEMP_DIR_NAME = "tmp"
@@ -67,13 +63,13 @@ class PathValidator:
     The project root is **optional**. When it is ``None``, matching is done
     by the KiCad roots alone, which is normal for a standalone server with no
     plugin publishing a project. In plugin mode the root is re-set in place
-    whenever the active project changes: the panel atomically writes
-    ``<kcaa data dir>/active_project.json`` containing
-    ``{"project_root": "<abs path>"}`` (or ``null``), and each ``validate_*``
+    whenever the open project changes: the panel atomically writes
+    ``<kcaa data dir>/project_state.json`` (schema v2) and each ``validate_*``
     call re-reads that file and applies a changed value in place. The state
     file is a trusted channel written by the plugin, never by the model;
     ``KCAA_PROJECT_STATE_FILE`` tells the server where it lives. A missing,
-    unreadable or malformed file keeps the current root.
+    unreadable, malformed or otherwise invalid record clears the project root,
+    leaving only the static KiCad roots.
     """
 
     def __init__(self, trusted_roots: set[str] | None = None):
@@ -88,7 +84,7 @@ class PathValidator:
         """
         self._lock = threading.Lock()
         self._project_root: str | None = None
-        self._state_file = os.environ.get(_PROJECT_STATE_ENV)
+        self._state_file = os.environ.get(project_state.PROJECT_STATE_ENV)
         self._data_dir = config.get_kcaa_data_dir()
         # The fixed roots are resolved once: realpath may touch a stalled
         # network mount, and it must never run while holding the lock.
@@ -170,41 +166,41 @@ class PathValidator:
         return roots
 
     def _refresh_project_root(self) -> None:
-        """Reload the project root from the plugin-published state file.
+        """Reload the project root from the plugin's canonical state file.
 
         The file is tiny, so it is re-read and parsed on every validation call
-        (no mtime tracking). Any failure — missing/unreadable file, malformed
-        JSON, wrong type (including a transient Windows ``os.replace``
-        collision with an open handle) — keeps the current root and never
-        raises.
+        (no mtime tracking). An invalid record — missing/unreadable file,
+        malformed JSON, wrong schema version, wrong types, a profile outside
+        the root — clears the project root; only the static KiCad roots stay.
+        A valid record is resolved exactly once and installed in place.
         """
         state_file = self._state_file
         if not state_file:
             return
-        try:
-            with open(state_file, encoding="utf-8") as f:
-                payload = json.load(f)
-            root = payload["project_root"]
-            if root is not None and not isinstance(root, str):
-                raise TypeError("project_root must be a string or null")
-            normalized = _normalize(root) if root else None
-        except (OSError, ValueError, TypeError, KeyError, AttributeError) as exc:
-            log.debug(
-                "Ignoring unreadable project state file %s (%s); keeping project root %r",
-                state_file,
-                exc,
-                self._project_root,
-            )
-            return
+        state = project_state.read_state(state_file)
+        normalized: str | None = None
+        if state is not None:
+            try:
+                normalized = _normalize(state["project_root"])
+            except (OSError, ValueError) as exc:
+                # The record is valid but the filesystem refused to resolve
+                # it; keep whatever root the last successful read installed.
+                log.debug(
+                    "Could not resolve project root from %s (%s); keeping %r",
+                    state_file,
+                    exc,
+                    self._project_root,
+                )
+                return
 
         if normalized == self._project_root:
             return
-        log.debug("Project state file %s: project_root=%r", state_file, root)
+        log.debug("Project state file %s: project_root=%r", state_file, normalized)
         try:
             self._install_root(normalized)
         except (PathValidationError, OSError, ValueError) as exc:
             log.debug(
-                "Ignoring unusable project root from %s (%s); keeping %r",
+                "Could not install project root from %s (%s); keeping %r",
                 state_file,
                 exc,
                 self._project_root,
