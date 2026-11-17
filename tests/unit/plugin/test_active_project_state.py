@@ -166,6 +166,34 @@ class TestCurrentProjectPath:
         assert sstore.is_project_session(data, obj._current_project_path())
 
 
+class TestSessionProjectPath:
+    def test_disk_record_wins_over_the_previous_run(self, panel, tmp_path):
+        root_a, pro_a = _project(tmp_path, "a")
+        root_b, pro_b = _project(tmp_path, "b")
+        cfg = tmp_path / "cfg"
+        obj = _fake_panel(panel, cfg)
+        _publish(obj, pro_a)
+        _publish(_fake_panel(panel, cfg), pro_b)
+
+        assert obj._session_project_path() == str(pro_b)
+
+    @pytest.mark.parametrize("content", [None, "{not json"])
+    def test_previous_run_record_is_used_when_the_file_is_unreadable(
+        self, panel, tmp_path, content
+    ):
+        root, pro = _project(tmp_path)
+        cfg = tmp_path / "cfg"
+        obj = _fake_panel(panel, cfg)
+        _publish(obj, pro)
+        state_file = cfg / pstate.PROJECT_STATE_FILENAME
+        if content is None:
+            state_file.unlink()
+        else:
+            state_file.write_text(content, encoding="utf-8")
+
+        assert obj._session_project_path() == str(pro)
+
+
 class TestSessionGating:
     def test_autoload_ignores_project_session_when_state_invalid(self, panel, tmp_path):
         root, pro = _project(tmp_path)

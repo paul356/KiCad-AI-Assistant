@@ -3441,11 +3441,15 @@ if _WX_AVAILABLE:
         def _session_project_path(self) -> str | None:
             """Project stamp for a saved session.
 
-            Prefer the record this panel last published — it survives
-            teardown, when pcbnew no longer returns a board — and fall back to
-            the canonical state file when nothing has been written yet.
+            The canonical state file is authoritative.  Only when it is
+            missing or unreadable does the session stamp fall back to the
+            record this panel last published — it survives teardown, when
+            pcbnew no longer returns a board.
             """
-            return _pstate.project_file_path(self._published) or self._current_project_path()
+            state = _pstate.read_state(self._state_path())
+            if state is not None:
+                return _pstate.project_file_path(state)
+            return _pstate.project_file_path(self._published)
 
         def _probe_project(self) -> str | None:
             """Absolute ``.kicad_pro`` path of the open board, or None.
