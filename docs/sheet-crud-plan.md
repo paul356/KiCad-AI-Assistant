@@ -474,19 +474,22 @@ The `instances` path is the path of the *containing* sheet.  For a root
 schematic its UUID is the project root sheet UUID from the owning
 `.kicad_pro` (`schematic.top_level_sheets[]`): each entry's `filename` is
 resolved relative to the project directory and compared with the edited
-schematic by real path, so files in different directories that share a
-basename never claim each other.  Exactly one distinct matching UUID is
-required.  When no project file exists the schematic is standalone and is
-keyed by its own `(uuid ...)`, then by an existing sheet's instance path
-(preferring the clause for this schematic's stem).  When a project file
-exists but cannot confirm the schematic — unreadable or invalid JSON, a
-missing `schematic` object, absent/empty/non-list `top_level_sheets`, no
-matching entry, a matching entry without a non-blank string `uuid` (blank
-and whitespace-only values are rejected, never stripped), or several
-distinct matching UUIDs — the call fails and writes nothing.  The page is
-the lowest positive integer not used anywhere in the project's sheet
-hierarchy.  Only root schematics can be extended; adding a sheet to a child
-schematic fails because the tool cannot know its enclosing path.
+schematic by real path (case-insensitively on Windows), so files in
+different directories that share a basename never claim each other.
+Exactly one distinct matching UUID is required.  When no project file
+exists the schematic is standalone and is keyed by its own `(uuid ...)`,
+then by an existing sheet's instance path (preferring the clause for this
+schematic's stem).  If neither source exists the call fails and writes
+nothing.  When a project file exists but cannot confirm the schematic —
+unreadable or invalid JSON, a missing `schematic` object,
+absent/empty/non-list `top_level_sheets`, no matching entry, a matching
+entry whose `uuid` is not a non-blank, unpadded string (blank,
+whitespace-only and padded values are rejected, never silently stripped),
+or several distinct matching UUIDs — the call fails and writes nothing.
+The page is the lowest positive integer not used anywhere in the project's
+sheet hierarchy.  Only root schematics can be extended;
+adding a sheet to a child schematic fails because the tool cannot know
+its enclosing path.
 
 ---
 

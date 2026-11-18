@@ -94,7 +94,7 @@ def load_project_json(project_path: str) -> dict[str, Any] | None:
         Parsed JSON data or None if parsing failed
     """
     try:
-        with open(project_path) as f:
+        with open(project_path, encoding="utf-8") as f:
             return json.load(f)
     except Exception:
         return None

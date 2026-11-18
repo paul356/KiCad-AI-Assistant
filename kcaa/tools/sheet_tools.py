@@ -282,14 +282,15 @@ def _project_root_sheet_uuid(schematic_path: str) -> tuple[str | None, str | Non
     standalone document and the caller may fall back to its own UUID.  When
     a project file exists but does not confirm this exact file (invalid JSON,
     missing or empty ``top_level_sheets``, no matching entry, a matching
-    entry without a non-blank string UUID, or several distinct matching
-    UUIDs), the error names the file and the reason, and the caller must
-    write nothing.  A blank or whitespace-only UUID is rejected, never
-    stripped and accepted.
+    entry whose UUID is not a non-blank, unpadded string, or several
+    distinct matching UUIDs), the error names the file and the reason, and
+    the caller must write nothing.  A UUID that is not already exactly its
+    stripped form (blank, whitespace-only, or padded) is rejected, never
+    silently stripped.
 
-    Entries are matched by real path: each ``filename`` is resolved relative
-    to the project directory, so files in other directories with the same
-    basename never claim each other.
+    Entries are matched by real path (with ``normcase`` for Windows): each
+    ``filename`` is resolved relative to the project directory, so files in
+    other directories with the same basename never claim each other.
     """
     project_file = find_project_file(schematic_path)
     if not project_file:
@@ -322,7 +323,9 @@ def _project_root_sheet_uuid(schematic_path: str) -> tuple[str | None, str | Non
         )
 
     project_dir = os.path.dirname(project_file)
-    target = os.path.realpath(schematic_path)
+    # normcase is identity on POSIX; on Windows it folds case and separators,
+    # so a project entry that differs only in letter case still matches.
+    target = os.path.normcase(os.path.realpath(schematic_path))
     matches: list[str] = []
     for entry in sheets:
         if not isinstance(entry, dict):
@@ -330,14 +333,18 @@ def _project_root_sheet_uuid(schematic_path: str) -> tuple[str | None, str | Non
         filename = entry.get("filename")
         if not isinstance(filename, str):
             continue
-        entry_path = os.path.realpath(os.path.join(project_dir, filename))
+        entry_path = os.path.normcase(os.path.realpath(os.path.join(project_dir, filename)))
         if entry_path != target:
             continue
         entry_uuid = entry.get("uuid")
-        if not isinstance(entry_uuid, str) or not entry_uuid.strip():
+        if (
+            not isinstance(entry_uuid, str)
+            or not entry_uuid.strip()
+            or entry_uuid != entry_uuid.strip()
+        ):
             return fail(
                 f"its {os.path.basename(project_file)!r} 'schematic.top_level_sheets' "
-                "entry has no string 'uuid' or its 'uuid' is blank"
+                "entry has no string 'uuid', or its 'uuid' is blank or padded"
             )
         matches.append(entry_uuid)
 
@@ -387,9 +394,8 @@ def _resolve_sheet_parent_path(schematic_path: str, tree: list) -> tuple[str | N
     project_uuid, project_error = _project_root_sheet_uuid(schematic_path)
     if project_error:
         return None, project_error
-    # The tri-state, not truthiness, decides: a confirmed project UUID is
-    # used even for a value truthiness would reject, and only (None, None)
-    # (no project file at all) reaches the standalone fallback.
+    # The tri-state, not truthiness, decides: only (None, None) — no project
+    # file at all — reaches the standalone fallback.
     if project_uuid is not None:
         return "/" + project_uuid, None
 

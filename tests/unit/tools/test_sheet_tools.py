@@ -8,6 +8,7 @@ from pathlib import Path
 import shutil
 import subprocess
 import tempfile
+from unittest.mock import patch
 
 import pytest
 import sexpdata
@@ -687,6 +688,23 @@ class TestInstancePathResolution:
         assert "could not be read or is not valid JSON" in result["error"]
         _assert_nothing_written(before, root, tmp_path / "orphan.kicad_sch")
 
+    def test_unreadable_project_file_is_an_error(self, tools, tmp_path):
+        # Raise at the read (works under root CI), not via permissions.
+        root = tmp_path / "root.kicad_sch"
+        _write_schematic(root, root_uuid=ROOT_UUID, pages=(2,))
+        _write_project(
+            tmp_path / "root.kicad_pro",
+            [{"filename": "root.kicad_sch", "uuid": PROJECT_UUID}],
+        )
+        before = _snapshot(root)
+
+        with patch("kcaa.utils.file_utils.open", side_effect=PermissionError("denied")):
+            result = _add_sheet(tools, str(root), create_child=True, sheet_file="orphan.kicad_sch")
+
+        assert "error" in result
+        assert "could not be read" in result["error"]
+        _assert_nothing_written(before, root, tmp_path / "orphan.kicad_sch")
+
     @pytest.mark.parametrize(
         "payload",
         [
@@ -716,12 +734,22 @@ class TestInstancePathResolution:
             {"filename": "root.kicad_sch", "name": "Top"},
             {"filename": "root.kicad_sch", "name": "Top", "uuid": ""},
             {"filename": "root.kicad_sch", "name": "Top", "uuid": "   "},
+            {"filename": "root.kicad_sch", "name": "Top", "uuid": f"  {PROJECT_UUID}"},
+            {"filename": "root.kicad_sch", "name": "Top", "uuid": f"{PROJECT_UUID}  "},
+            {"filename": "root.kicad_sch", "name": "Top", "uuid": f"  {PROJECT_UUID}  "},
         ],
-        ids=["absent", "empty", "whitespace"],
+        ids=[
+            "absent",
+            "empty",
+            "whitespace",
+            "leading-padding",
+            "trailing-padding",
+            "both-padding",
+        ],
     )
     def test_matching_entry_without_uuid_is_an_error(self, tools, tmp_path, entry):
-        # A blank UUID must fail closed, never reach the file-UUID fallback
-        # (empty) or be written verbatim (whitespace).
+        # A blank or padded UUID must fail closed, never reach the file-UUID
+        # fallback or be written verbatim into the instance path.
         root = tmp_path / "root.kicad_sch"
         _write_schematic(root, root_uuid=ROOT_UUID, pages=(2,))
         _write_project(tmp_path / "root.kicad_pro", [entry])
@@ -744,20 +772,33 @@ class TestInstancePathResolution:
         assert _instance_path(sheet) == "/existing-root"
 
     def test_root_without_uuid_or_instances_is_rejected(self, tools, tmp_path):
+        # Standalone file with neither its own (uuid ...) nor a sheet whose
+        # instances block records a path: the resolver has no source at all.
         root = tmp_path / "root.kicad_sch"
         _write_schematic(root, root_uuid=None, pages=())
-        (tmp_path / "root.kicad_pro").write_text(
-            json.dumps({"sheets": [[PROJECT_UUID, "root"]]}), encoding="utf-8"
-        )
-        before = root.read_text(encoding="utf-8")
+        before = _snapshot(root)
 
         result = _add_sheet(tools, str(root), create_child=True, sheet_file="orphan.kicad_sch")
 
         assert "error" in result
-        assert "Cannot resolve the root sheet UUID" in result["error"]
-        assert root.read_text(encoding="utf-8") == before
-        assert not (tmp_path / "root.kicad_sch.bak").exists()
-        assert not (tmp_path / "orphan.kicad_sch").exists()
+        assert "no (uuid ...) and no existing sheet instances" in result["error"]
+        _assert_nothing_written(before, root, tmp_path / "orphan.kicad_sch")
+
+    def test_legacy_project_payload_is_not_a_uuid_fallback(self, tools, tmp_path):
+        # KiCad <=9 projects used a top-level "sheets" array; it must keep
+        # failing closed rather than seeding an instance path.
+        root = tmp_path / "root.kicad_sch"
+        _write_schematic(root, root_uuid=ROOT_UUID, pages=(2,))
+        (tmp_path / "root.kicad_pro").write_text(
+            json.dumps({"sheets": [[PROJECT_UUID, "root"]]}), encoding="utf-8"
+        )
+        before = _snapshot(root)
+
+        result = _add_sheet(tools, str(root), create_child=True, sheet_file="orphan.kicad_sch")
+
+        assert "error" in result
+        assert "no 'schematic' object" in result["error"]
+        _assert_nothing_written(before, root, tmp_path / "orphan.kicad_sch")
 
     def test_unresolvable_parent_path_fails_without_writing(self, tools, tmp_path):
         root = tmp_path / "root.kicad_sch"
