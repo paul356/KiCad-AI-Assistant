@@ -5603,23 +5603,6 @@ def _tool_result(tcid, content):
 class TestPruneRollbackHistory:
     """Unit tests for rollback-aware history pruning."""
 
-    @pytest.fixture(autouse=True)
-    def _resolve_synthetic_projects(self, monkeypatch):
-        """Stub project resolution for synthetic (nonexistent) history paths.
-
-        The canonical resolver requires a real ``.kicad_pro`` on disk;
-        pruning only needs the path-to-project mapping, so these tests keep
-        the original same-stem rule.
-        """
-
-        def fake_project_path(file_path, record):
-            directory = os.path.dirname(os.path.abspath(file_path))
-            name = os.path.basename(file_path)
-            stem = name.split(".kicad_")[0] if ".kicad_" in name else os.path.splitext(name)[0]
-            return os.path.join(directory, f"{stem}.kicad_pro")
-
-        monkeypatch.setattr(llm_client, "_project_path_from_record", fake_project_path)
-
     # ---- Helpers ---------------------------------------------------------------
 
     @staticmethod
@@ -5743,55 +5726,14 @@ class TestPruneRollbackHistory:
         client._prune_rollback_history()
         roles = [m["role"] for m in client._history]
         assert roles == ["user", "assistant", "tool", "assistant", "tool", "user"]
-        # The pruned history should contain: save user+assistant+save_result, restore user+restore_result, final user
-        # (empty assistant removed since all its tool_calls pruned)
+        # Only the save and restore turns remain between the two user messages.
 
-    def test_prune_reads_the_state_file_once(self, monkeypatch):
-        history = self._make_history(
-            [
-                ("user", "start"),
-                (
-                    "assistant+tc",
-                    [_tool_call("s1", "save_project_version", {"project_file": "f.kicad_pro"})],
-                ),
-                ("tool+save", "f.sch", "v1", "s1"),
-                (
-                    "assistant+tc",
-                    [_tool_call("tcA", "add_symbol_to_schematic", {"file_path": "f.sch"})],
-                ),
-                ("tool", "tcA", '{"uuid": "A"}'),
-                ("assistant+tc", [_tool_call("tcB", "move_component", {"file_path": "f.sch"})]),
-                ("tool", "tcB", '{"ok": true}'),
-                (
-                    "assistant+tc",
-                    [
-                        _tool_call(
-                            "rst",
-                            "restore_project_version",
-                            {"project_file": "f.kicad_pro", "version_id": "v1"},
-                        )
-                    ],
-                ),
-                ("tool+restore", "f.sch", "v1", "rst"),
-            ]
-        )
-        client = _make_client()
-        client._history = history
-        reads = []
-        real_read = llm_client.project_state.read_state
+    def test_non_project_turns_in_interval_are_cleared(self):
+        """The whole rollback interval is stale, not just project touches.
 
-        def counting_read(path):
-            reads.append(path)
-            return real_read(path)
-
-        monkeypatch.setattr(llm_client.project_state, "read_state", counting_read)
-
-        client._prune_rollback_history()
-
-        assert len(client._history) < len(history)  # pruning actually ran
-        assert len(reads) == 1
-
-    def test_non_file_touching_turns_preserved(self):
+        User turns, assistant text, and unrelated tool calls between the save
+        point and the restore are dropped with it.
+        """
         history = self._make_history(
             [
                 ("user", "start"),
@@ -5806,7 +5748,9 @@ class TestPruneRollbackHistory:
                     [_tool_call("tcA", "add_symbol_to_schematic", {"file_path": "f.sch"})],
                 ),
                 ("tool", "tcA", '{"ok": true}'),
-                # Turn touches OTHER file
+                # User follow-up and a turn touching an unrelated file
+                ("user", "also move that part"),
+                ("assistant", "Working on the unrelated board."),
                 (
                     "assistant+tc",
                     [_tool_call("tcB", "add_symbol_to_schematic", {"file_path": "other.sch"})],
@@ -5829,24 +5773,17 @@ class TestPruneRollbackHistory:
         client = _make_client()
         client._history = history
         client._prune_rollback_history()
-        # other.sch turn should survive; f.sch turn should be pruned
-        # Find the surviving add_symbol_to_schematic assistant
-        surviving = [
-            m
-            for m in client._history
-            if m["role"] == "assistant"
-            and m.get("tool_calls")
-            and any(tc["function"]["name"] == "add_symbol_to_schematic" for tc in m["tool_calls"])
-        ]
-        assert len(surviving) == 1
-        for tc in surviving[0]["tool_calls"]:
-            args = json.loads(tc["function"]["arguments"])
-            if tc["function"]["name"] == "add_symbol_to_schematic":
-                assert args["file_path"] == "other.sch"
+        roles = [m["role"] for m in client._history]
+        assert roles == ["user", "assistant", "tool", "assistant", "tool"]
+        assert client._history[1]["tool_calls"][0]["function"]["name"] == "save_project_version"
+        assert client._history[3]["tool_calls"][0]["function"]["name"] == (
+            "restore_project_version"
+        )
 
-    # ---- Partial pruning within a turn ---------------------------------------
+    # ---- Boundary handling ----------------------------------------------------
 
-    def test_partial_turn_pruning(self):
+    def test_turn_spanning_the_interval_is_removed_with_it(self):
+        """A turn inside the interval goes away even if it also touched other files."""
         history = self._make_history(
             [
                 ("user", "start"),
@@ -5883,15 +5820,20 @@ class TestPruneRollbackHistory:
         client = _make_client()
         client._history = history
         client._prune_rollback_history()
-        # The pruned assistant should still have tcOther but NOT tcSchema
-        assistants = [
-            m for m in client._history if m["role"] == "assistant" and m.get("tool_calls")
+        assert [m["role"] for m in client._history] == [
+            "user",
+            "assistant",
+            "tool",
+            "assistant",
+            "tool",
         ]
-        for a in assistants:
-            names = [tc["function"]["name"] for tc in a["tool_calls"]]
-            if "add_symbol_to_schematic" in names:
-                assert len(a["tool_calls"]) == 1  # only tcOther remains
-                assert a["tool_calls"][0]["id"] == "tcOther"
+        names = [
+            tc["function"]["name"]
+            for m in client._history
+            if m["role"] == "assistant"
+            for tc in m.get("tool_calls") or []
+        ]
+        assert names == ["save_project_version", "restore_project_version"]
 
     # ---- Nested restore ------------------------------------------------------
 
@@ -5970,7 +5912,8 @@ class TestPruneRollbackHistory:
 
     # ---- Multiple file paths -------------------------------------------------
 
-    def test_restore_only_affects_matching_file(self):
+    def test_restore_clears_only_from_its_own_save_point(self):
+        """The interval starts at the save point named by the restore."""
         history = self._make_history(
             [
                 ("user", "start"),
@@ -5981,14 +5924,14 @@ class TestPruneRollbackHistory:
                 ("tool+save", "a.sch", "vA", "s1"),
                 (
                     "assistant+tc",
-                    [_tool_call("s2", "save_project_version", {"project_file": "b.kicad_pro"})],
-                ),
-                ("tool+save", "b.sch", "vB", "s2"),
-                (
-                    "assistant+tc",
                     [_tool_call("tcA", "add_symbol_to_schematic", {"file_path": "a.sch"})],
                 ),
                 ("tool", "tcA", '{"ok": true}'),
+                (
+                    "assistant+tc",
+                    [_tool_call("s2", "save_project_version", {"project_file": "b.kicad_pro"})],
+                ),
+                ("tool+save", "b.sch", "vB", "s2"),
                 (
                     "assistant+tc",
                     [_tool_call("tcB", "add_symbol_to_schematic", {"file_path": "b.sch"})],
@@ -6000,23 +5943,36 @@ class TestPruneRollbackHistory:
                         _tool_call(
                             "rst",
                             "restore_project_version",
-                            {"project_file": "a.kicad_pro", "version_id": "vA"},
+                            {"project_file": "b.kicad_pro", "version_id": "vB"},
                         )
                     ],
                 ),
-                ("tool+restore", "a.sch", "vA", "rst"),
+                ("tool+restore", "b.sch", "vB", "rst"),
             ]
         )
         client = _make_client()
         client._history = history
         client._prune_rollback_history()
-        # b.sch turn should survive
-        for m in client._history:
-            if m["role"] == "assistant" and m.get("tool_calls"):
-                for tc in m["tool_calls"]:
-                    args = json.loads(tc["function"]["arguments"])
-                    if tc["function"]["name"] == "add_symbol_to_schematic":
-                        assert args["file_path"] == "b.sch"
+        # Work performed before b's save point survives; only turn B is stale.
+        add_calls = [
+            json.loads(tc["function"]["arguments"])["file_path"]
+            for m in client._history
+            if m["role"] == "assistant"
+            for tc in m.get("tool_calls") or []
+            if tc["function"]["name"] == "add_symbol_to_schematic"
+        ]
+        assert add_calls == ["a.sch"]
+        assert [m["role"] for m in client._history] == [
+            "user",
+            "assistant",
+            "tool",
+            "assistant",
+            "tool",
+            "assistant",
+            "tool",
+            "assistant",
+            "tool",
+        ]
 
     def test_restore_project_prunes_all_project_files(self):
         """Restoring a project prunes turns touching ANY bundled file (sch or PCB).
@@ -6076,52 +6032,30 @@ class TestPruneRollbackHistory:
                 assert "add_symbol_to_schematic" not in names
                 assert "add_footprint" not in names
 
-    def test_restore_shares_only_same_full_path(self):
-        """Files with same stem but different paths are treated independently."""
-        history = self._make_history(
-            [
-                ("user", "start"),
-                (
-                    "assistant+tc",
-                    [
-                        _tool_call(
-                            "s1",
-                            "save_project_version",
-                            {"project_file": "proj/sub/leaf.kicad_pro"},
-                        )
-                    ],
-                ),
-                ("tool+save", "proj/sub/leaf.sch", "v1", "s1"),
-                # Change to leaf.sch in a different directory
-                (
-                    "assistant+tc",
-                    [_tool_call("tc1", "add_symbol_to_schematic", {"file_path": "other/leaf.sch"})],
-                ),
-                ("tool", "tc1", '{"ok": true}'),
-                # Restore proj/sub/leaf.sch
-                (
-                    "assistant+tc",
-                    [
-                        _tool_call(
-                            "rst",
-                            "restore_project_version",
-                            {"project_file": "proj/sub/leaf.kicad_pro", "version_id": "v1"},
-                        )
-                    ],
-                ),
-                ("tool+restore", "proj/sub/leaf.sch", "v1", "rst"),
-            ]
-        )
+
+class TestValidateHistoryEmptyToolCalls:
+    """Legacy sessions may persist ``tool_calls: []``; it must be repaired."""
+
+    def test_empty_tool_calls_stripped_keeping_text(self):
         client = _make_client()
-        client._history = history
-        client._prune_rollback_history()
-        # other/leaf.sch survives – only same full path is pruned
-        for m in client._history:
-            if m["role"] == "assistant" and m.get("tool_calls"):
-                for tc in m["tool_calls"]:
-                    if tc["function"]["name"] == "add_symbol_to_schematic":
-                        args = json.loads(tc["function"]["arguments"])
-                        assert args["file_path"] == "other/leaf.sch"
+        client._history = [
+            {"role": "user", "content": "start"},
+            {"role": "assistant", "content": "Adding a resistor.", "tool_calls": []},
+            {"role": "user", "content": "continue"},
+        ]
+        client._validate_history()
+        assert client._history[1] == {"role": "assistant", "content": "Adding a resistor."}
+        assert "tool_calls" not in llm_client._wire_message(client._history[1])
+
+    def test_empty_tool_calls_message_without_text_dropped(self):
+        client = _make_client()
+        client._history = [
+            {"role": "user", "content": "start"},
+            {"role": "assistant", "content": "", "tool_calls": []},
+            {"role": "user", "content": "continue"},
+        ]
+        client._validate_history()
+        assert [m["role"] for m in client._history] == ["user", "user"]
 
 
 # ---------------------------------------------------------------------------
@@ -8698,37 +8632,3 @@ class TestProjectResolvedOncePerToolCall:
         assert resolutions == [str(sheet_a)]
         assert list(exec_state.covered_files) == [str(pro_a)]
         assert exec_state.covered_files[str(pro_a)] == {"a.kicad_sch"}
-
-    def test_touch_check_reads_state_once(self, tmp_path, monkeypatch):
-        pro = tmp_path / "a.kicad_pro"
-        pro.write_text("{}\n")
-        sheet = tmp_path / "a.kicad_sch"
-        sheet.write_text("(kicad_sch)\n")
-        state_file = tmp_path / "project_state.json"
-        record = pstate.build_record(str(pro))
-        assert record is not None
-        assert pstate.write_state(str(state_file), record)
-        client = _make_client()
-        client._state_file = str(state_file)
-
-        reads = []
-        real_read = pstate.read_state
-
-        def counting_read(path):
-            reads.append(path)
-            return real_read(path)
-
-        monkeypatch.setattr(llm_client.project_state, "read_state", counting_read)
-
-        touches = client._tool_touches_project(
-            {
-                "file_path": str(sheet),
-                "schematic_path": str(sheet),
-                "pcb_path": str(sheet),
-                "project_path": str(pro),
-            },
-            str(pro),
-        )
-
-        assert touches is True
-        assert reads == [str(state_file)]

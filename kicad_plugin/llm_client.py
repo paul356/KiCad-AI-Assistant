@@ -74,20 +74,6 @@ def _resolve_project(
     return project_file, None
 
 
-def _project_path_from_record(file_path: str, record: dict | None) -> str | None:
-    """Return the ``.kicad_pro`` path *record* assigns to *file_path*, or None.
-
-    Pure resolver for callers that read the state file once and reuse the
-    record (history pruning).  It performs no disk read itself.
-    """
-    if record is None:
-        return None
-    root = record["project_root"]
-    if not project_state.is_within(root, file_path):
-        return None
-    return os.path.join(root, record["profile_file"])
-
-
 def _snapshot_include_files(
     project_file: str, touched: str, state_file: str | None = None
 ) -> list[str]:
@@ -220,7 +206,7 @@ def _wire_message(msg: dict[str, Any]) -> dict[str, Any]:
     return {
         key: msg[key]
         for key in ("role", "content", "name", "tool_calls", "tool_call_id")
-        if key in msg
+        if key in msg and not (key == "tool_calls" and not msg[key])
     }
 
 
@@ -2449,16 +2435,18 @@ class LLMClient:
         return True
 
     def _prune_rollback_history(self) -> None:
-        """Prune tool-call turns invalidated by restore_project_version.
+        """Prune the history interval invalidated by restore_project_version.
 
-        When the LLM restores a project to an earlier version, every tool
-        call that mutated or queried any of its files between the save point
-        and the restore is now based on stale state — prune those turns.
+        When the LLM restores a project to an earlier version, everything that
+        happened between the save point and the restore is based on state that
+        no longer exists.  The whole interval — user turns, assistant text, and
+        tool calls/results — is dropped; keeping fragments of it leaves stale
+        instructions and orphaned tool calls in the prompt.  The save and
+        restore turns themselves stay so the model can see the rollback.
 
-        Handles nested restores: starts from the most recent restore and skips
-        any restore whose messages fall inside an already-pruned range.
+        Nested restores inside the interval are removed with it; the most
+        recent resolvable restore wins.
         """
-        record = project_state.read_state(self._state_file)
 
         # ---- Build save-point lookup ------------------------------------------
         # For each save_project_version result, record (project_file, version_id) → index.
@@ -2487,20 +2475,13 @@ class LLMClient:
                     pass
 
         # ---- Scan from tail for restore_project_version ----------------------
-        marked: set[int] = set()  # indices to remove  (tool results)
-        tool_call_removals: dict[int, list[str]] = {}  # assistant_idx → [tc_id, ...]
-        i = len(self._history) - 1
-        while i >= 0:
-            if i in marked:
-                i -= 1
-                continue
+        stale: range | None = None
+        for i in range(len(self._history) - 1, -1, -1):
             msg = self._history[i]
             if msg.get("role") != "tool":
-                i -= 1
                 continue
             p_idx = self._find_parent_assistant(i)
-            if p_idx is None or p_idx in marked:
-                i -= 1
+            if p_idx is None:
                 continue
             parent = self._history[p_idx]
             tc_id = msg.get("tool_call_id")
@@ -2511,67 +2492,24 @@ class LLMClient:
                     continue
                 try:
                     args = json.loads(tc["function"].get("arguments", "{}"))
-                    project_file = args.get("project_file", "")
-                    version_id = args.get("version_id", "")
                 except (json.JSONDecodeError, KeyError, TypeError):
-                    break
-
-                save_idx = save_points.get((project_file, version_id))
-                if save_idx is None or save_idx >= i:
-                    break  # Can't locate save point
-
-                # Mark file-touching tool turns inside (save_idx, i]
-                for j in range(save_idx + 1, i):
-                    if j in marked:
-                        continue
-                    mj = self._history[j]
-                    if mj.get("role") != "tool":
-                        continue
-                    pj = self._find_parent_assistant(j)
-                    if pj is None:
-                        continue
-                    # Check the specific tool_call (not whole turn)
-                    tcj_id = mj.get("tool_call_id")
-                    parent_j = self._history[pj]
-                    for tcj in parent_j.get("tool_calls") or []:
-                        if tcj.get("id") != tcj_id:
-                            continue
-                        try:
-                            tcj_args = json.loads(tcj["function"].get("arguments", "{}"))
-                        except (json.JSONDecodeError, KeyError, TypeError):
-                            continue
-                        if self._tool_touches_project_record(tcj_args, project_file, record):
-                            marked.add(j)
-                            tool_call_removals.setdefault(pj, []).append(tcj_id)
+                    continue
+                save_idx = save_points.get(
+                    (args.get("project_file", ""), args.get("version_id", ""))
+                )
+                if save_idx is not None and save_idx + 1 < p_idx:
+                    # Everything between the save result and the restore call
+                    # describes state that the restore rolled back.
+                    stale = range(save_idx + 1, p_idx)
                 break
-            i -= 1
+            if stale is not None:
+                break
 
-        if not marked:
+        if stale is None:
             return
 
-        # ---- Rebuild history --------------------------------------------------
-        # 1. Strip removed tool_calls from assistant messages.
-        # 2. Remove assistant messages with no remaining content or tool_calls.
-        # 3. Remove marked tool_result messages.
-        new_history: list[dict[str, Any]] = []
-        for idx, msg in enumerate(self._history):
-            if idx in marked:
-                continue  # drop tool_result
-            if msg.get("role") == "assistant" and idx in tool_call_removals:
-                removed_ids = set(tool_call_removals[idx])
-                new_tcs = [
-                    tc for tc in (msg.get("tool_calls") or []) if tc.get("id") not in removed_ids
-                ]
-                if not new_tcs and not msg.get("content"):
-                    continue  # drop empty assistant message
-                msg = dict(msg)  # shallow copy before mutating
-                msg["tool_calls"] = new_tcs
-            new_history.append(msg)
-
-        pruned = len(self._history) - len(new_history)
-        if pruned:
-            log.info("_prune_rollback_history: pruned %d stale messages", pruned)
-        self._history = new_history
+        self._history = self._history[: stale.start] + self._history[stale.stop :]
+        log.info("_prune_rollback_history: pruned %d stale messages", len(stale))
 
     def _find_parent_assistant(self, tool_result_index: int) -> int | None:
         """Return the index of the assistant message that issued the tool call
@@ -2660,25 +2598,6 @@ class LLMClient:
         if annotated:
             log.info("_annotate_stale_queries: tagged %d stale query result(s)", annotated)
 
-    @staticmethod
-    def _tool_touches_project_record(
-        args: dict[str, Any], project_file: str, record: dict | None
-    ) -> bool:
-        """Return True if *args* reference any file of *project_file*'s project."""
-        target = os.path.abspath(project_file)
-        for key in ("file_path", "schematic_path", "pcb_path", "project_path"):
-            value = args.get(key)
-            resolved = _project_path_from_record(value, record) if value else None
-            if resolved is not None and resolved == target:
-                return True
-        return False
-
-    def _tool_touches_project(self, args: dict[str, Any], project_file: str) -> bool:
-        """Return True if *args* reference any file of *project_file*'s project."""
-        return self._tool_touches_project_record(
-            args, project_file, project_state.read_state(self._state_file)
-        )
-
     def _validate_history(self) -> None:
         """Repair orphaned tool_calls in self._history.
 
@@ -2692,6 +2611,7 @@ class LLMClient:
         * If ALL tool_calls are orphaned → drop the entire assistant message.
         * If SOME are orphaned → strip only the orphaned entries from
           ``tool_calls``, keeping the valid ones and any text content.
+        * An empty ``tool_calls`` list is stripped (it is invalid on the wire).
         """
         i = 0
         removed_count = 0
@@ -2699,6 +2619,18 @@ class LLMClient:
             msg = self._history[i]
             tool_calls = msg.get("tool_calls") if msg.get("role") == "assistant" else None
             if not tool_calls:
+                if tool_calls == []:
+                    # ``"tool_calls": []`` is rejected by OpenAI-compatible
+                    # APIs (min length 1); old sessions may still carry it.
+                    # Keep any text as a plain assistant turn.
+                    msg = dict(msg)
+                    msg.pop("tool_calls", None)
+                    removed_count += 1
+                    log.warning("_validate_history: removed empty tool_calls at history[%d]", i)
+                    if not msg.get("content"):
+                        del self._history[i]
+                        continue
+                    self._history[i] = msg
                 i += 1
                 continue
 
@@ -2807,8 +2739,9 @@ class LLMClient:
         returns an error string and the caller must not send the request.
 
         The one exception is ``_prune_rollback_history``: restoring an earlier
-        file version invalidates prior tool turns, so those are removed every
-        turn for correctness regardless of budget (rare, restore-only).
+        file version invalidates the whole interval since its save point, so
+        those messages are removed every turn for correctness regardless of
+        budget (rare, restore-only).
         """
         self._prune_rollback_history()
 
