@@ -282,8 +282,10 @@ def _project_root_sheet_uuid(schematic_path: str) -> tuple[str | None, str | Non
     standalone document and the caller may fall back to its own UUID.  When
     a project file exists but does not confirm this exact file (invalid JSON,
     missing or empty ``top_level_sheets``, no matching entry, a matching
-    entry without a string UUID, or several distinct matching UUIDs), the
-    error names the file and the reason, and the caller must write nothing.
+    entry without a non-blank string UUID, or several distinct matching
+    UUIDs), the error names the file and the reason, and the caller must
+    write nothing.  A blank or whitespace-only UUID is rejected, never
+    stripped and accepted.
 
     Entries are matched by real path: each ``filename`` is resolved relative
     to the project directory, so files in other directories with the same
@@ -301,7 +303,10 @@ def _project_root_sheet_uuid(schematic_path: str) -> tuple[str | None, str | Non
 
     data = load_project_json(project_file)
     if not isinstance(data, dict):
-        return fail(f"the project file {os.path.basename(project_file)!r} is not valid JSON")
+        return fail(
+            f"the project file {os.path.basename(project_file)!r} could not be read "
+            "or is not valid JSON"
+        )
 
     schematic = data.get("schematic")
     if not isinstance(schematic, dict):
@@ -329,10 +334,10 @@ def _project_root_sheet_uuid(schematic_path: str) -> tuple[str | None, str | Non
         if entry_path != target:
             continue
         entry_uuid = entry.get("uuid")
-        if not isinstance(entry_uuid, str):
+        if not isinstance(entry_uuid, str) or not entry_uuid.strip():
             return fail(
                 f"its {os.path.basename(project_file)!r} 'schematic.top_level_sheets' "
-                "entry has no string 'uuid'"
+                "entry has no string 'uuid' or its 'uuid' is blank"
             )
         matches.append(entry_uuid)
 
@@ -382,7 +387,10 @@ def _resolve_sheet_parent_path(schematic_path: str, tree: list) -> tuple[str | N
     project_uuid, project_error = _project_root_sheet_uuid(schematic_path)
     if project_error:
         return None, project_error
-    if project_uuid:
+    # The tri-state, not truthiness, decides: a confirmed project UUID is
+    # used even for a value truthiness would reject, and only (None, None)
+    # (no project file at all) reaches the standalone fallback.
+    if project_uuid is not None:
         return "/" + project_uuid, None
 
     root_uuid = _top_level_string(tree, "uuid")
@@ -1163,8 +1171,8 @@ def _do_update_sheet_symbol(
     if x is not None or y is not None:
         old_x = target_sheet.get("position", {}).get("x", 0)
         old_y = target_sheet.get("position", {}).get("y", 0)
-        new_x = _align_to_grid(x) if x is not None else old_x
-        new_y = _align_to_grid(y) if y is not None else old_y
+        new_x = round(_align_to_grid(x), 6) if x is not None else old_x
+        new_y = round(_align_to_grid(y), 6) if y is not None else old_y
         dx = new_x - old_x
         dy = new_y - old_y
 
@@ -1196,12 +1204,12 @@ def _do_update_sheet_symbol(
     # Update size if provided
     if width is not None or height is not None:
         new_width = (
-            _align_to_grid(width)
+            round(_align_to_grid(width), 6)
             if width is not None
             else target_sheet.get("size", {}).get("width", 0)
         )
         new_height = (
-            _align_to_grid(height)
+            round(_align_to_grid(height), 6)
             if height is not None
             else target_sheet.get("size", {}).get("height", 0)
         )

@@ -481,7 +481,8 @@ keyed by its own `(uuid ...)`, then by an existing sheet's instance path
 (preferring the clause for this schematic's stem).  When a project file
 exists but cannot confirm the schematic — unreadable or invalid JSON, a
 missing `schematic` object, absent/empty/non-list `top_level_sheets`, no
-matching entry, a matching entry without a string `uuid`, or several
+matching entry, a matching entry without a non-blank string `uuid` (blank
+and whitespace-only values are rejected, never stripped), or several
 distinct matching UUIDs — the call fails and writes nothing.  The page is
 the lowest positive integer not used anywhere in the project's sheet
 hierarchy.  Only root schematics can be extended; adding a sheet to a child

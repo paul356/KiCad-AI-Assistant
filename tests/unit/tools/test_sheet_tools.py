@@ -684,7 +684,7 @@ class TestInstancePathResolution:
         result = _add_sheet(tools, str(root), create_child=True, sheet_file="orphan.kicad_sch")
 
         assert "error" in result
-        assert "not valid JSON" in result["error"]
+        assert "could not be read or is not valid JSON" in result["error"]
         _assert_nothing_written(before, root, tmp_path / "orphan.kicad_sch")
 
     @pytest.mark.parametrize(
@@ -710,13 +710,21 @@ class TestInstancePathResolution:
         assert "Cannot resolve the root sheet UUID" in result["error"]
         _assert_nothing_written(before, root, tmp_path / "orphan.kicad_sch")
 
-    def test_matching_entry_without_uuid_is_an_error(self, tools, tmp_path):
+    @pytest.mark.parametrize(
+        "entry",
+        [
+            {"filename": "root.kicad_sch", "name": "Top"},
+            {"filename": "root.kicad_sch", "name": "Top", "uuid": ""},
+            {"filename": "root.kicad_sch", "name": "Top", "uuid": "   "},
+        ],
+        ids=["absent", "empty", "whitespace"],
+    )
+    def test_matching_entry_without_uuid_is_an_error(self, tools, tmp_path, entry):
+        # A blank UUID must fail closed, never reach the file-UUID fallback
+        # (empty) or be written verbatim (whitespace).
         root = tmp_path / "root.kicad_sch"
         _write_schematic(root, root_uuid=ROOT_UUID, pages=(2,))
-        _write_project(
-            tmp_path / "root.kicad_pro",
-            [{"filename": "root.kicad_sch", "name": "Top"}],
-        )
+        _write_project(tmp_path / "root.kicad_pro", [entry])
         before = _snapshot(root)
 
         result = _add_sheet(tools, str(root), create_child=True, sheet_file="orphan.kicad_sch")
@@ -866,6 +874,33 @@ class TestEmittedPrecision:
         assert pin_at[1] == 88.9
         assert pin_at[2] == 25.6
         for value in self._at_size_numbers(_child(sheet, "pin")):
+            assert value == round(value, 6), value
+
+    def test_updated_sheet_coordinates_have_no_float_noise(self, tools, tmp_path):
+        # 41.91 is 33 grid steps; the raw grid product is 41.910000000000004.
+        root = tmp_path / "root.kicad_sch"
+        _write_schematic(root, root_uuid=ROOT_UUID, pages=(2,))
+
+        result = asyncio.run(
+            tools["update_sheet_symbol"](
+                schematic_path=str(root),
+                sheet_identifier="00000000-0000-0000-0000-000000000001",
+                x=41.91,
+                y=41.91,
+                width=41.91,
+                height=41.91,
+            )
+        )
+        assert result.get("success") is True, result
+
+        sheet = _sheet_node(_load(str(root)), result["sheet_uuid"])
+        at = _child(sheet, "at")
+        size = _child(sheet, "size")
+        assert (at[1], at[2]) == (41.91, 41.91)
+        assert (size[1], size[2]) == (41.91, 41.91)
+        assert result["position"] == {"x": 41.91, "y": 41.91}
+        assert result["size"] == {"width": 41.91, "height": 41.91}
+        for value in self._at_size_numbers(sheet):
             assert value == round(value, 6), value
 
 
