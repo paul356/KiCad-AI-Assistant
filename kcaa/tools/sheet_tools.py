@@ -282,11 +282,12 @@ def _project_root_sheet_uuid(schematic_path: str) -> tuple[str | None, str | Non
     standalone document and the caller may fall back to its own UUID.  When
     a project file exists but does not confirm this exact file (invalid JSON,
     missing or empty ``top_level_sheets``, no matching entry, a matching
-    entry whose UUID is not a non-blank, unpadded string, or several
-    distinct matching UUIDs), the error names the file and the reason, and
-    the caller must write nothing.  A UUID that is not already exactly its
-    stripped form (blank, whitespace-only, or padded) is rejected, never
-    silently stripped.
+    entry whose UUID is not a non-blank string without whitespace, or
+    several distinct matching UUIDs), the error names the file and the
+    reason, and the caller must write nothing.  A matched UUID is rejected
+    in three separate cases: it is blank after stripping, it differs from
+    its stripped form, or it contains whitespace anywhere.  The value is
+    never silently stripped.
 
     Entries are matched by real path (with ``normcase`` for Windows): each
     ``filename`` is resolved relative to the project directory, so files in
@@ -341,10 +342,11 @@ def _project_root_sheet_uuid(schematic_path: str) -> tuple[str | None, str | Non
             not isinstance(entry_uuid, str)
             or not entry_uuid.strip()
             or entry_uuid != entry_uuid.strip()
+            or any(ch.isspace() for ch in entry_uuid)
         ):
             return fail(
                 f"its {os.path.basename(project_file)!r} 'schematic.top_level_sheets' "
-                "entry has no string 'uuid', or its 'uuid' is blank or padded"
+                "entry has no string 'uuid', or its 'uuid' is blank or contains whitespace"
             )
         matches.append(entry_uuid)
 

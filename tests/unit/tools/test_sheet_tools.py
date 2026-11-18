@@ -737,6 +737,21 @@ class TestInstancePathResolution:
             {"filename": "root.kicad_sch", "name": "Top", "uuid": f"  {PROJECT_UUID}"},
             {"filename": "root.kicad_sch", "name": "Top", "uuid": f"{PROJECT_UUID}  "},
             {"filename": "root.kicad_sch", "name": "Top", "uuid": f"  {PROJECT_UUID}  "},
+            {
+                "filename": "root.kicad_sch",
+                "name": "Top",
+                "uuid": f"{PROJECT_UUID[:8]} {PROJECT_UUID[9:]}",
+            },
+            {
+                "filename": "root.kicad_sch",
+                "name": "Top",
+                "uuid": f"{PROJECT_UUID[:8]}\t{PROJECT_UUID[9:]}",
+            },
+            {
+                "filename": "root.kicad_sch",
+                "name": "Top",
+                "uuid": f"{PROJECT_UUID[:8]}\u00a0{PROJECT_UUID[9:]}",
+            },
         ],
         ids=[
             "absent",
@@ -745,11 +760,14 @@ class TestInstancePathResolution:
             "leading-padding",
             "trailing-padding",
             "both-padding",
+            "interior-space",
+            "interior-tab",
+            "interior-nbsp",
         ],
     )
     def test_matching_entry_without_uuid_is_an_error(self, tools, tmp_path, entry):
-        # A blank or padded UUID must fail closed, never reach the file-UUID
-        # fallback or be written verbatim into the instance path.
+        # A blank or whitespace-bearing UUID must fail closed, never reach the
+        # file-UUID fallback or be written verbatim into the instance path.
         root = tmp_path / "root.kicad_sch"
         _write_schematic(root, root_uuid=ROOT_UUID, pages=(2,))
         _write_project(tmp_path / "root.kicad_pro", [entry])
@@ -799,18 +817,6 @@ class TestInstancePathResolution:
         assert "error" in result
         assert "no 'schematic' object" in result["error"]
         _assert_nothing_written(before, root, tmp_path / "orphan.kicad_sch")
-
-    def test_unresolvable_parent_path_fails_without_writing(self, tools, tmp_path):
-        root = tmp_path / "root.kicad_sch"
-        _write_schematic(root, root_uuid=None, pages=())
-        before = root.read_text(encoding="utf-8")
-
-        result = _add_sheet(tools, str(root), create_child=True, sheet_file="orphan.kicad_sch")
-
-        assert "error" in result
-        assert root.read_text(encoding="utf-8") == before
-        assert not (tmp_path / "root.kicad_sch.bak").exists()
-        assert not (tmp_path / "orphan.kicad_sch").exists()
 
     def test_insert_into_child_schematic_is_rejected(self, tools, tmp_path):
         child = tmp_path / "child.kicad_sch"

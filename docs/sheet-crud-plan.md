@@ -483,10 +483,11 @@ schematic's stem).  If neither source exists the call fails and writes
 nothing.  When a project file exists but cannot confirm the schematic —
 unreadable or invalid JSON, a missing `schematic` object,
 absent/empty/non-list `top_level_sheets`, no matching entry, a matching
-entry whose `uuid` is not a non-blank, unpadded string (blank,
-whitespace-only and padded values are rejected, never silently stripped),
-or several distinct matching UUIDs — the call fails and writes nothing.
-The page is the lowest positive integer not used anywhere in the project's
+entry whose `uuid` is not a non-blank string without whitespace (blank
+strings and values containing whitespace anywhere — padded, interior, or
+otherwise — are rejected, never silently stripped), or several distinct
+matching UUIDs — the call fails and writes nothing.  The page is the
+lowest positive integer not used anywhere in the project's
 sheet hierarchy.  Only root schematics can be extended;
 adding a sheet to a child schematic fails because the tool cannot know
 its enclosing path.
