@@ -1,12 +1,14 @@
 """Unit tests for sheet_tools.py."""
 
 import asyncio
+import hashlib
 import json
 import os
 from pathlib import Path
 import shutil
 import subprocess
 import tempfile
+from unittest.mock import patch
 
 import pytest
 import sexpdata
@@ -17,6 +19,7 @@ SCHEMATIC_PATH = str(Path(__file__).parent / "fixtures/tools_test.kicad_sch")
 ROOT_UUID = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
 CHILD_UUID = "cccccccc-dddd-eeee-ffff-000000000000"
 PROJECT_UUID = "99999999-8888-7777-6666-555555555555"
+OTHER_UUID = "11111111-2222-3333-4444-555555555555"
 LEGACY_SHEET_UUID = "dddddddd-0000-0000-0000-000000000000"
 
 
@@ -111,6 +114,28 @@ def _write_schematic(
     Path(path).write_text("".join(parts), encoding="utf-8")
 
 
+def _write_project(path, entries) -> None:
+    """Write a project whose ``top_level_sheets`` are *entries*."""
+    Path(path).write_text(
+        json.dumps({"schematic": {"top_level_sheets": entries}}), encoding="utf-8"
+    )
+
+
+def _snapshot(path) -> tuple[str, int]:
+    """Return the content hash and mtime of *path*."""
+    stat = os.stat(path)
+    return hashlib.sha256(Path(path).read_bytes()).hexdigest(), stat.st_mtime_ns
+
+
+def _assert_nothing_written(before, schematic_path, child_path) -> None:
+    """Assert *schematic_path* is byte-identical and no new files appeared."""
+    before_hash, before_mtime = before
+    after_hash, after_mtime = _snapshot(schematic_path)
+    assert (after_hash, after_mtime) == (before_hash, before_mtime)
+    assert not Path(str(schematic_path) + ".bak").exists()
+    assert not Path(child_path).exists()
+
+
 def _add_sheet(tools: dict, schematic_path: str, **kwargs):
     params = {
         "schematic_path": schematic_path,
@@ -150,6 +175,12 @@ def _make_temp_copy() -> str:
     tmp.close()
     shutil.copy(SCHEMATIC_PATH, tmp.name)
     return tmp.name
+
+
+@pytest.fixture(autouse=True)
+def _scoped_project_lookup(isolated_project_search):
+    """Keep the upward project walk inside each test's tmp_path tree."""
+    return isolated_project_search
 
 
 @pytest.fixture(scope="module")
@@ -207,11 +238,14 @@ class TestAddSheetSymbol:
 
     def test_instances_use_owning_project_name(self, tools, tmp_path, isolated_project_search):
         """A nested sheet records the root project's name, not its own stem."""
-        (tmp_path / "aria.kicad_pro").write_text("{}")
         hardware = tmp_path / "hardware"
         hardware.mkdir()
         schematic = hardware / "main_bus.kicad_sch"
         shutil.copy(SCHEMATIC_PATH, schematic)
+        _write_project(
+            tmp_path / "aria.kicad_pro",
+            [{"filename": "hardware/main_bus.kicad_sch", "uuid": PROJECT_UUID}],
+        )
 
         result = asyncio.run(
             tools["add_sheet_symbol"](
@@ -489,15 +523,261 @@ class TestPageAllocation:
 class TestInstancePathResolution:
     """D1: resolve the parent path from real project data, never guess it."""
 
-    def test_root_uuid_wins_over_stale_sheet_path(self, tools, tmp_path):
+    def test_project_root_sheet_uuid_wins_over_file_uuid(self, tools, tmp_path):
+        # KiCad keys instance paths by the project's top_level_sheets UUID,
+        # which may differ from the schematic file's own (uuid ...).
         root = tmp_path / "root.kicad_sch"
         _write_schematic(root, root_uuid=ROOT_UUID, instance_path="/stale", pages=(2,))
+        (tmp_path / "root.kicad_pro").write_text(
+            json.dumps(
+                {
+                    "schematic": {
+                        "top_level_sheets": [
+                            {"filename": "root.kicad_sch", "name": "Top", "uuid": PROJECT_UUID}
+                        ]
+                    }
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        result = _add_sheet(tools, str(root))
+        assert result.get("success") is True, result
+
+        sheet = _sheet_node(_load(str(root)), result["sheet_uuid"])
+        assert _instance_path(sheet) == f"/{PROJECT_UUID}"
+
+    def test_project_not_listing_schematic_is_an_error(self, tools, tmp_path):
+        # A project file exists, so the schematic is not standalone.  If the
+        # project does not list this exact file its root UUID is unknown, and
+        # falling back to the file UUID is the silent guess from #324.
+        root = tmp_path / "root.kicad_sch"
+        _write_schematic(root, root_uuid=ROOT_UUID, instance_path="/stale", pages=(2,))
+        _write_project(
+            tmp_path / "root.kicad_pro",
+            [{"filename": "other.kicad_sch", "name": "Top", "uuid": PROJECT_UUID}],
+        )
+        before = _snapshot(root)
+
+        result = _add_sheet(tools, str(root), create_child=True, sheet_file="orphan.kicad_sch")
+
+        assert "error" in result
+        assert "does not list this schematic" in result["error"]
+        _assert_nothing_written(before, root, tmp_path / "orphan.kicad_sch")
+
+    def test_renamed_copy_is_not_attributed_to_the_project(self, tools, tmp_path):
+        # The #324 reproduction: the copy sits next to the project, which
+        # lists only the original file.
+        original = tmp_path / "two_ax_PCB.kicad_sch"
+        _write_schematic(original, root_uuid=ROOT_UUID, pages=(2,))
+        copy = tmp_path / "two_ax_PCB (Copy).kicad_sch"
+        _write_schematic(copy, root_uuid=ROOT_UUID, pages=(2,))
+        _write_project(
+            tmp_path / "two_ax_PCB.kicad_pro",
+            [{"filename": "two_ax_PCB.kicad_sch", "name": "Top", "uuid": PROJECT_UUID}],
+        )
+        before = _snapshot(copy)
+
+        result = _add_sheet(tools, str(copy))
+
+        assert "error" in result
+        _assert_nothing_written(before, copy, tmp_path / "new_sheet.kicad_sch")
+
+    def test_file_uuid_used_when_schematic_is_standalone(self, tools, tmp_path):
+        # No .kicad_pro anywhere in the tree (the module fixture confines the
+        # upward walk to tmp_path): the file's own UUID keys its instances.
+        root = tmp_path / "root.kicad_sch"
+        _write_schematic(root, root_uuid=ROOT_UUID, instance_path="/stale", pages=(2,))
+        assert not list(tmp_path.glob("*.kicad_pro"))
 
         result = _add_sheet(tools, str(root))
         assert result.get("success") is True, result
 
         sheet = _sheet_node(_load(str(root)), result["sheet_uuid"])
         assert _instance_path(sheet) == f"/{ROOT_UUID}"
+
+    def test_matching_entry_need_not_be_first(self, tools, tmp_path):
+        root = tmp_path / "root.kicad_sch"
+        _write_schematic(root, root_uuid=ROOT_UUID, pages=(2,))
+        _write_project(
+            tmp_path / "root.kicad_pro",
+            [
+                {"filename": "other.kicad_sch", "name": "Other", "uuid": OTHER_UUID},
+                {"filename": "root.kicad_sch", "name": "Top", "uuid": PROJECT_UUID},
+            ],
+        )
+
+        result = _add_sheet(tools, str(root))
+        assert result.get("success") is True, result
+
+        sheet = _sheet_node(_load(str(root)), result["sheet_uuid"])
+        assert _instance_path(sheet) == f"/{PROJECT_UUID}"
+
+    def test_project_relative_filename_in_subdirectory(self, tools, tmp_path):
+        # The project lives in an ancestor directory and records the path
+        # relative to itself, not to the schematic.
+        hardware = tmp_path / "hardware"
+        hardware.mkdir()
+        root = hardware / "main.kicad_sch"
+        _write_schematic(root, root_uuid=ROOT_UUID, pages=(2,))
+        _write_project(
+            tmp_path / "board.kicad_pro",
+            [{"filename": "hardware/main.kicad_sch", "name": "Main", "uuid": PROJECT_UUID}],
+        )
+
+        result = _add_sheet(tools, str(root))
+        assert result.get("success") is True, result
+
+        sheet = _sheet_node(_load(str(root)), result["sheet_uuid"])
+        assert _instance_path(sheet) == f"/{PROJECT_UUID}"
+
+    def test_identical_basenames_resolve_independently(self, tools, tmp_path):
+        hardware = tmp_path / "hardware"
+        scratch = tmp_path / "scratch"
+        hardware.mkdir()
+        scratch.mkdir()
+        main_hw = hardware / "main.kicad_sch"
+        main_scratch = scratch / "main.kicad_sch"
+        _write_schematic(main_hw, root_uuid=ROOT_UUID, pages=(2,))
+        _write_schematic(main_scratch, root_uuid=ROOT_UUID, pages=(2,))
+        _write_project(
+            tmp_path / "board.kicad_pro",
+            [
+                {"filename": "hardware/main.kicad_sch", "uuid": PROJECT_UUID},
+                {"filename": "scratch/main.kicad_sch", "uuid": OTHER_UUID},
+            ],
+        )
+
+        hw_result = _add_sheet(tools, str(main_hw))
+        scratch_result = _add_sheet(tools, str(main_scratch))
+        assert hw_result.get("success") is True, hw_result
+        assert scratch_result.get("success") is True, scratch_result
+
+        hw_sheet = _sheet_node(_load(str(main_hw)), hw_result["sheet_uuid"])
+        scratch_sheet = _sheet_node(_load(str(main_scratch)), scratch_result["sheet_uuid"])
+        assert _instance_path(hw_sheet) == f"/{PROJECT_UUID}"
+        assert _instance_path(scratch_sheet) == f"/{OTHER_UUID}"
+
+    def test_duplicate_entries_with_different_uuids_are_an_error(self, tools, tmp_path):
+        root = tmp_path / "root.kicad_sch"
+        _write_schematic(root, root_uuid=ROOT_UUID, pages=(2,))
+        _write_project(
+            tmp_path / "root.kicad_pro",
+            [
+                {"filename": "root.kicad_sch", "uuid": PROJECT_UUID},
+                {"filename": "./root.kicad_sch", "uuid": OTHER_UUID},
+            ],
+        )
+        before = _snapshot(root)
+
+        result = _add_sheet(tools, str(root), create_child=True, sheet_file="orphan.kicad_sch")
+
+        assert "error" in result
+        assert "more than one distinct" in result["error"]
+        _assert_nothing_written(before, root, tmp_path / "orphan.kicad_sch")
+
+    def test_malformed_project_json_is_an_error(self, tools, tmp_path):
+        root = tmp_path / "root.kicad_sch"
+        _write_schematic(root, root_uuid=ROOT_UUID, pages=(2,))
+        (tmp_path / "root.kicad_pro").write_text("{not json", encoding="utf-8")
+        before = _snapshot(root)
+
+        result = _add_sheet(tools, str(root), create_child=True, sheet_file="orphan.kicad_sch")
+
+        assert "error" in result
+        assert "could not be read or is not valid JSON" in result["error"]
+        _assert_nothing_written(before, root, tmp_path / "orphan.kicad_sch")
+
+    def test_unreadable_project_file_is_an_error(self, tools, tmp_path):
+        # Raise at the read (works under root CI), not via permissions.
+        root = tmp_path / "root.kicad_sch"
+        _write_schematic(root, root_uuid=ROOT_UUID, pages=(2,))
+        _write_project(
+            tmp_path / "root.kicad_pro",
+            [{"filename": "root.kicad_sch", "uuid": PROJECT_UUID}],
+        )
+        before = _snapshot(root)
+
+        with patch("kcaa.utils.file_utils.open", side_effect=PermissionError("denied")):
+            result = _add_sheet(tools, str(root), create_child=True, sheet_file="orphan.kicad_sch")
+
+        assert "error" in result
+        assert "could not be read" in result["error"]
+        _assert_nothing_written(before, root, tmp_path / "orphan.kicad_sch")
+
+    @pytest.mark.parametrize(
+        "payload",
+        [
+            {},
+            {"schematic": []},
+            {"schematic": {}},
+            {"schematic": {"top_level_sheets": []}},
+            {"schematic": {"top_level_sheets": {}}},
+        ],
+        ids=["no-data", "schematic-not-object", "no-sheets", "empty-sheets", "sheets-not-list"],
+    )
+    def test_project_without_top_level_sheets_is_an_error(self, tools, tmp_path, payload):
+        root = tmp_path / "root.kicad_sch"
+        _write_schematic(root, root_uuid=ROOT_UUID, pages=(2,))
+        (tmp_path / "root.kicad_pro").write_text(json.dumps(payload), encoding="utf-8")
+        before = _snapshot(root)
+
+        result = _add_sheet(tools, str(root), create_child=True, sheet_file="orphan.kicad_sch")
+
+        assert "error" in result
+        assert "Cannot resolve the root sheet UUID" in result["error"]
+        _assert_nothing_written(before, root, tmp_path / "orphan.kicad_sch")
+
+    @pytest.mark.parametrize(
+        "entry",
+        [
+            {"filename": "root.kicad_sch", "name": "Top"},
+            {"filename": "root.kicad_sch", "name": "Top", "uuid": ""},
+            {"filename": "root.kicad_sch", "name": "Top", "uuid": "   "},
+            {"filename": "root.kicad_sch", "name": "Top", "uuid": f"  {PROJECT_UUID}"},
+            {"filename": "root.kicad_sch", "name": "Top", "uuid": f"{PROJECT_UUID}  "},
+            {"filename": "root.kicad_sch", "name": "Top", "uuid": f"  {PROJECT_UUID}  "},
+            {
+                "filename": "root.kicad_sch",
+                "name": "Top",
+                "uuid": f"{PROJECT_UUID[:8]} {PROJECT_UUID[9:]}",
+            },
+            {
+                "filename": "root.kicad_sch",
+                "name": "Top",
+                "uuid": f"{PROJECT_UUID[:8]}\t{PROJECT_UUID[9:]}",
+            },
+            {
+                "filename": "root.kicad_sch",
+                "name": "Top",
+                "uuid": f"{PROJECT_UUID[:8]}\u00a0{PROJECT_UUID[9:]}",
+            },
+        ],
+        ids=[
+            "absent",
+            "empty",
+            "whitespace",
+            "leading-padding",
+            "trailing-padding",
+            "both-padding",
+            "interior-space",
+            "interior-tab",
+            "interior-nbsp",
+        ],
+    )
+    def test_matching_entry_without_uuid_is_an_error(self, tools, tmp_path, entry):
+        # A blank or whitespace-bearing UUID must fail closed, never reach the
+        # file-UUID fallback or be written verbatim into the instance path.
+        root = tmp_path / "root.kicad_sch"
+        _write_schematic(root, root_uuid=ROOT_UUID, pages=(2,))
+        _write_project(tmp_path / "root.kicad_pro", [entry])
+        before = _snapshot(root)
+
+        result = _add_sheet(tools, str(root), create_child=True, sheet_file="orphan.kicad_sch")
+
+        assert "error" in result
+        assert "no string 'uuid'" in result["error"]
+        _assert_nothing_written(before, root, tmp_path / "orphan.kicad_sch")
 
     def test_existing_sheet_instance_path_is_the_fallback(self, tools, tmp_path):
         root = tmp_path / "root.kicad_sch"
@@ -510,32 +790,33 @@ class TestInstancePathResolution:
         assert _instance_path(sheet) == "/existing-root"
 
     def test_root_without_uuid_or_instances_is_rejected(self, tools, tmp_path):
+        # Standalone file with neither its own (uuid ...) nor a sheet whose
+        # instances block records a path: the resolver has no source at all.
         root = tmp_path / "root.kicad_sch"
         _write_schematic(root, root_uuid=None, pages=())
+        before = _snapshot(root)
+
+        result = _add_sheet(tools, str(root), create_child=True, sheet_file="orphan.kicad_sch")
+
+        assert "error" in result
+        assert "no (uuid ...) and no existing sheet instances" in result["error"]
+        _assert_nothing_written(before, root, tmp_path / "orphan.kicad_sch")
+
+    def test_legacy_project_payload_is_not_a_uuid_fallback(self, tools, tmp_path):
+        # KiCad <=9 projects used a top-level "sheets" array; it must keep
+        # failing closed rather than seeding an instance path.
+        root = tmp_path / "root.kicad_sch"
+        _write_schematic(root, root_uuid=ROOT_UUID, pages=(2,))
         (tmp_path / "root.kicad_pro").write_text(
             json.dumps({"sheets": [[PROJECT_UUID, "root"]]}), encoding="utf-8"
         )
-        before = root.read_text(encoding="utf-8")
+        before = _snapshot(root)
 
         result = _add_sheet(tools, str(root), create_child=True, sheet_file="orphan.kicad_sch")
 
         assert "error" in result
-        assert "Cannot resolve the root sheet UUID" in result["error"]
-        assert root.read_text(encoding="utf-8") == before
-        assert not (tmp_path / "root.kicad_sch.bak").exists()
-        assert not (tmp_path / "orphan.kicad_sch").exists()
-
-    def test_unresolvable_parent_path_fails_without_writing(self, tools, tmp_path):
-        root = tmp_path / "root.kicad_sch"
-        _write_schematic(root, root_uuid=None, pages=())
-        before = root.read_text(encoding="utf-8")
-
-        result = _add_sheet(tools, str(root), create_child=True, sheet_file="orphan.kicad_sch")
-
-        assert "error" in result
-        assert root.read_text(encoding="utf-8") == before
-        assert not (tmp_path / "root.kicad_sch.bak").exists()
-        assert not (tmp_path / "orphan.kicad_sch").exists()
+        assert "no 'schematic' object" in result["error"]
+        _assert_nothing_written(before, root, tmp_path / "orphan.kicad_sch")
 
     def test_insert_into_child_schematic_is_rejected(self, tools, tmp_path):
         child = tmp_path / "child.kicad_sch"
@@ -577,6 +858,97 @@ class TestInstancePathResolution:
 
         assert _first_instance_path(node, "root") == "/root"
         assert _first_instance_path(node, "unrelated") == "/other"
+
+
+class TestEmittedPrecision:
+    """#324 item 4: emitted coordinates carry no float noise."""
+
+    @staticmethod
+    def _at_size_numbers(node) -> list[float]:
+        """Collect numeric values of every nested ``(at ...)`` / ``(size ...)``."""
+        numbers: list[float] = []
+        for child in node:
+            if not isinstance(child, list) or not child:
+                continue
+            if _tag(child) in ("at", "size"):
+                numbers.extend(v for v in child[1:] if isinstance(v, (int, float)))
+            numbers.extend(TestEmittedPrecision._at_size_numbers(child))
+        return numbers
+
+    def test_added_sheet_and_pin_coordinates_have_no_float_noise(self, tools, tmp_path):
+        # 41.91 is 33 grid steps; the raw grid product is 41.910000000000004.
+        root = tmp_path / "root.kicad_sch"
+        _write_schematic(root, root_uuid=ROOT_UUID)
+
+        result = _add_sheet(
+            tools,
+            str(root),
+            x=41.91,
+            y=300.0,
+            width=41.91,
+            height=25.4,
+            pins=[{"name": "P", "edge": "right", "distance_mm": 41.91}],
+        )
+        assert result.get("success") is True, result
+
+        sheet = _sheet_node(_load(str(root)), result["sheet_uuid"])
+        assert _child(sheet, "at")[1] == 41.91
+        assert _child(sheet, "size")[1] == 41.91
+        pin_at = _child(_child(sheet, "pin"), "at")
+        assert pin_at[1] == 83.82
+        assert pin_at[2] == 341.63
+        for value in self._at_size_numbers(sheet):
+            assert value == round(value, 6), value
+
+    def test_added_pin_coordinates_have_no_float_noise(self, tools, tmp_path):
+        root = tmp_path / "root.kicad_sch"
+        _write_schematic(root, root_uuid=ROOT_UUID, pages=(2,))
+
+        result = asyncio.run(
+            tools["add_sheet_pin"](
+                schematic_path=str(root),
+                sheet_identifier="00000000-0000-0000-0000-000000000001",
+                pin_name="P",
+                edge="left",
+                distance_mm=0.2,
+            )
+        )
+        assert result.get("success") is True, result
+        assert result["position"] == {"x": 88.9, "y": 25.6}
+
+        sheet = _sheet_node(_load(str(root)), result["sheet_uuid"])
+        pin_at = _child(_child(sheet, "pin"), "at")
+        assert pin_at[1] == 88.9
+        assert pin_at[2] == 25.6
+        for value in self._at_size_numbers(_child(sheet, "pin")):
+            assert value == round(value, 6), value
+
+    def test_updated_sheet_coordinates_have_no_float_noise(self, tools, tmp_path):
+        # 41.91 is 33 grid steps; the raw grid product is 41.910000000000004.
+        root = tmp_path / "root.kicad_sch"
+        _write_schematic(root, root_uuid=ROOT_UUID, pages=(2,))
+
+        result = asyncio.run(
+            tools["update_sheet_symbol"](
+                schematic_path=str(root),
+                sheet_identifier="00000000-0000-0000-0000-000000000001",
+                x=41.91,
+                y=41.91,
+                width=41.91,
+                height=41.91,
+            )
+        )
+        assert result.get("success") is True, result
+
+        sheet = _sheet_node(_load(str(root)), result["sheet_uuid"])
+        at = _child(sheet, "at")
+        size = _child(sheet, "size")
+        assert (at[1], at[2]) == (41.91, 41.91)
+        assert (size[1], size[2]) == (41.91, 41.91)
+        assert result["position"] == {"x": 41.91, "y": 41.91}
+        assert result["size"] == {"width": 41.91, "height": 41.91}
+        for value in self._at_size_numbers(sheet):
+            assert value == round(value, 6), value
 
 
 class TestChildSchematic:

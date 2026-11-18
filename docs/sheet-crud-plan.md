@@ -470,14 +470,27 @@ The node matches the KiCad 10 dialect exactly, so KiCad does not rewrite it
 on load or save: solid stroke (sheet symbols have no line style), colour
 fill, all four flags, and canonical property names.
 
-The `instances` path is the path of the *containing* sheet, resolved only
-from the schematic itself: the root schematic's own `(uuid ...)`, then an
-existing sheet's instance path (preferring the clause for this schematic's
-stem).  There is no project-file fallback; if neither source exists the
-call fails and writes nothing.  The page is the lowest positive integer not
-used anywhere in the project's sheet hierarchy.  Only root schematics can
-be extended; adding a sheet to a child schematic fails because the tool
-cannot know its enclosing path.
+The `instances` path is the path of the *containing* sheet.  For a root
+schematic its UUID is the project root sheet UUID from the owning
+`.kicad_pro` (`schematic.top_level_sheets[]`): each entry's `filename` is
+resolved relative to the project directory and compared with the edited
+schematic by real path (case-insensitively on Windows), so files in
+different directories that share a basename never claim each other.
+Exactly one distinct matching UUID is required.  When no project file
+exists the schematic is standalone and is keyed by its own `(uuid ...)`,
+then by an existing sheet's instance path (preferring the clause for this
+schematic's stem).  If neither source exists the call fails and writes
+nothing.  When a project file exists but cannot confirm the schematic —
+unreadable or invalid JSON, a missing `schematic` object,
+absent/empty/non-list `top_level_sheets`, no matching entry, a matching
+entry whose `uuid` is not a non-blank string without whitespace (blank
+strings and values containing whitespace anywhere — padded, interior, or
+otherwise — are rejected, never silently stripped), or several distinct
+matching UUIDs — the call fails and writes nothing.  The page is the
+lowest positive integer not used anywhere in the project's
+sheet hierarchy.  Only root schematics can be extended;
+adding a sheet to a child schematic fails because the tool cannot know
+its enclosing path.
 
 ---
 
