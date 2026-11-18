@@ -1,5 +1,6 @@
 """Tests for LLMClient history management (dedup + compaction)."""
 
+import copy
 import datetime
 import http.client
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -5664,27 +5665,39 @@ class TestPruneRollbackHistory:
         client._prune_rollback_history()
         assert len(client._history) == 3
 
-    def test_save_not_found_no_pruning(self):
+    def test_unresolvable_restore_leaves_history_identical(self):
+        """A save exists, but not for this (project, version): no guessing."""
         history = self._make_history(
             [
-                ("user", "restore to version we never saved"),
+                ("user", "start"),
+                (
+                    "assistant+tc",
+                    [_tool_call("s1", "save_project_version", {"project_file": "f.kicad_pro"})],
+                ),
+                ("tool+save", "f.sch", "v1", "s1"),
+                (
+                    "assistant+tc",
+                    [_tool_call("tcA", "add_symbol_to_schematic", {"file_path": "f.sch"})],
+                ),
+                ("tool", "tcA", '{"uuid": "A"}'),
                 (
                     "assistant+tc",
                     [
                         _tool_call(
-                            "tc1",
+                            "rst",
                             "restore_project_version",
                             {"project_file": "f.kicad_pro", "version_id": "v999"},
                         )
                     ],
                 ),
-                ("tool+restore", "f.sch", "v999", "tc1"),
+                ("tool+restore", "f.sch", "v999", "rst"),
             ]
         )
         client = _make_client()
         client._history = history
+        before = copy.deepcopy(history)
         client._prune_rollback_history()
-        assert len(client._history) == 3
+        assert client._history == before
 
     # ---- Basic restore --------------------------------------------------------
 
@@ -5727,6 +5740,57 @@ class TestPruneRollbackHistory:
         roles = [m["role"] for m in client._history]
         assert roles == ["user", "assistant", "tool", "assistant", "tool", "user"]
         # Only the save and restore turns remain between the two user messages.
+
+    def test_batched_save_turn_drops_calls_cut_with_interval(self, caplog):
+        """A sibling call after the save result loses its result; drop the call.
+
+        The rebuilt history must already be pairing-valid: pruning must not
+        rely on a later ``_validate_history`` pass to strip the orphan.
+        """
+        history = [
+            {"role": "user", "content": "start"},
+            _assistant_tc(
+                "",
+                [
+                    _tool_call("s1", "save_project_version", {"project_file": "f.kicad_pro"}),
+                    _tool_call("t1", "add_symbol_to_schematic", {"file_path": "f.sch"}),
+                ],
+            ),
+            _tool_result("s1", {"success": True, "version_id": "v1"}),
+            _tool_result("t1", {"success": True, "uuid": "R1"}),
+            _assistant_tc(
+                "",
+                [
+                    _tool_call(
+                        "rst",
+                        "restore_project_version",
+                        {"project_file": "f.kicad_pro", "version_id": "v1"},
+                    )
+                ],
+            ),
+            _tool_result("rst", {"success": True, "restored_from": "v1"}),
+        ]
+        client = _make_client()
+        client._history = history
+        with caplog.at_level(logging.WARNING, logger=llm_client.__name__):
+            client._prune_rollback_history()
+            after_prune = copy.deepcopy(client._history)
+            client._validate_history()
+
+        assert client._history == after_prune  # validation is a no-op
+        assert not [r for r in caplog.records if r.name == llm_client.__name__]
+
+        assert [m["role"] for m in client._history] == [
+            "user",
+            "assistant",
+            "tool",
+            "assistant",
+            "tool",
+        ]
+        assert [tc["id"] for tc in client._history[1]["tool_calls"]] == ["s1"]
+        assert client._history[2] == _tool_result("s1", {"success": True, "version_id": "v1"})
+        assert [tc["id"] for tc in client._history[3]["tool_calls"]] == ["rst"]
+        assert all(tc["id"] != "t1" for m in client._history for tc in (m.get("tool_calls") or []))
 
     def test_non_project_turns_in_interval_are_cleared(self):
         """The whole rollback interval is stale, not just project touches.
@@ -5837,7 +5901,8 @@ class TestPruneRollbackHistory:
 
     # ---- Nested restore ------------------------------------------------------
 
-    def test_nested_restore_skipped(self):
+    def test_nested_restore_turns_removed_with_interval(self):
+        """The outer restore's interval swallows the inner save/restore turns."""
         history = self._make_history(
             [
                 ("user", "start"),
@@ -5900,15 +5965,114 @@ class TestPruneRollbackHistory:
         client = _make_client()
         client._history = history
         client._prune_rollback_history()
-        # T1, T2, T3 and both restore results should all be pruned
-        # Only save results and user messages survive
-        for m in client._history:
-            if m["role"] == "tool":
-                content = json.loads(m["content"])
-                assert "version_id" in content or "restored_from" in content
-            if m["role"] == "assistant" and m.get("tool_calls"):
-                names = [tc["function"]["name"] for tc in m["tool_calls"]]
-                assert all(n in ("save_project_version", "restore_project_version") for n in names)
+        # Everything after the v1 save result up to the outer restore turn is
+        # stale, including the inner restore turn and its result.
+        assert [m["role"] for m in client._history] == [
+            "user",
+            "assistant",
+            "tool",
+            "assistant",
+            "tool",
+        ]
+        calls = [tc["id"] for m in client._history for tc in (m.get("tool_calls") or [])]
+        assert calls == ["s1", "rst1"]
+
+    def test_later_unresolvable_restore_does_not_hide_earlier_one(self):
+        """The tail scan skips a later restore with no save point."""
+        history = self._make_history(
+            [
+                ("user", "start"),
+                (
+                    "assistant+tc",
+                    [_tool_call("s1", "save_project_version", {"project_file": "f.kicad_pro"})],
+                ),
+                ("tool+save", "f.sch", "v1", "s1"),
+                (
+                    "assistant+tc",
+                    [_tool_call("t1", "add_symbol_to_schematic", {"file_path": "f.sch"})],
+                ),
+                ("tool", "t1", '{"uuid": "T1"}'),
+                (
+                    "assistant+tc",
+                    [
+                        _tool_call(
+                            "rst1",
+                            "restore_project_version",
+                            {"project_file": "f.kicad_pro", "version_id": "v1"},
+                        )
+                    ],
+                ),
+                ("tool+restore", "f.sch", "v1", "rst1"),
+                (
+                    "assistant+tc",
+                    [_tool_call("t2", "add_symbol_to_schematic", {"file_path": "f.sch"})],
+                ),
+                ("tool", "t2", '{"uuid": "T2"}'),
+                (
+                    "assistant+tc",
+                    [
+                        _tool_call(
+                            "rst9",
+                            "restore_project_version",
+                            {"project_file": "f.kicad_pro", "version_id": "v9"},
+                        )
+                    ],
+                ),
+                ("tool+restore", "f.sch", "v9", "rst9"),
+            ]
+        )
+        client = _make_client()
+        client._history = history
+        client._prune_rollback_history()
+        # Only rst1's interval is stale; the later unresolvable restore stays.
+        calls = [tc["id"] for m in client._history for tc in (m.get("tool_calls") or [])]
+        assert calls == ["s1", "rst1", "t2", "rst9"]
+        assert "t1" not in calls
+
+    def test_duplicate_save_after_restore_keeps_history(self):
+        """A newer save with the same key must not make the old interval overlap."""
+        history = self._make_history(
+            [
+                ("user", "start"),
+                (
+                    "assistant+tc",
+                    [_tool_call("s1", "save_project_version", {"project_file": "f.kicad_pro"})],
+                ),
+                ("tool+save", "f.sch", "v1", "s1"),
+                (
+                    "assistant+tc",
+                    [_tool_call("tcA", "add_symbol_to_schematic", {"file_path": "f.sch"})],
+                ),
+                ("tool", "tcA", '{"ok": true}'),
+                (
+                    "assistant+tc",
+                    [
+                        _tool_call(
+                            "rst",
+                            "restore_project_version",
+                            {"project_file": "f.kicad_pro", "version_id": "v1"},
+                        )
+                    ],
+                ),
+                ("tool+restore", "f.sch", "v1", "rst"),
+                (
+                    "assistant+tc",
+                    [_tool_call("tcB", "add_symbol_to_schematic", {"file_path": "f.sch"})],
+                ),
+                ("tool", "tcB", '{"ok": true}'),
+                # Dedup returns the same id for an unchanged file set.
+                (
+                    "assistant+tc",
+                    [_tool_call("s2", "save_project_version", {"project_file": "f.kicad_pro"})],
+                ),
+                ("tool+save", "f.sch", "v1", "s2"),
+            ]
+        )
+        client = _make_client()
+        client._history = history
+        before = copy.deepcopy(history)
+        client._prune_rollback_history()
+        assert client._history == before
 
     # ---- Multiple file paths -------------------------------------------------
 
@@ -5974,11 +6138,96 @@ class TestPruneRollbackHistory:
             "tool",
         ]
 
-    def test_restore_project_prunes_all_project_files(self):
-        """Restoring a project prunes turns touching ANY bundled file (sch or PCB).
+    def test_save_point_key_distinguishes_projects_sharing_version_id(self):
+        """Two projects saved as ``v1``: the restore uses its own project's save."""
+        history = self._make_history(
+            [
+                ("user", "start"),
+                (
+                    "assistant+tc",
+                    [_tool_call("sA", "save_project_version", {"project_file": "a.kicad_pro"})],
+                ),
+                ("tool+save", "a.sch", "v1", "sA"),
+                (
+                    "assistant+tc",
+                    [_tool_call("tcA", "add_symbol_to_schematic", {"file_path": "a.sch"})],
+                ),
+                ("tool", "tcA", '{"ok": true}'),
+                (
+                    "assistant+tc",
+                    [_tool_call("sB", "save_project_version", {"project_file": "b.kicad_pro"})],
+                ),
+                ("tool+save", "b.sch", "v1", "sB"),
+                (
+                    "assistant+tc",
+                    [_tool_call("tcB", "add_symbol_to_schematic", {"file_path": "b.sch"})],
+                ),
+                ("tool", "tcB", '{"ok": true}'),
+                (
+                    "assistant+tc",
+                    [
+                        _tool_call(
+                            "rst",
+                            "restore_project_version",
+                            {"project_file": "a.kicad_pro", "version_id": "v1"},
+                        )
+                    ],
+                ),
+                ("tool+restore", "a.sch", "v1", "rst"),
+            ]
+        )
+        client = _make_client()
+        client._history = history
+        client._prune_rollback_history()
+        assert [m["role"] for m in client._history] == [
+            "user",
+            "assistant",
+            "tool",
+            "assistant",
+            "tool",
+        ]
+        calls = [tc["id"] for m in client._history for tc in (m.get("tool_calls") or [])]
+        assert calls == ["sA", "rst"]
+
+    def test_restore_without_matching_project_save_point_is_ignored(self):
+        """Another project's save with the same version id must not match."""
+        history = self._make_history(
+            [
+                ("user", "start"),
+                (
+                    "assistant+tc",
+                    [_tool_call("sB", "save_project_version", {"project_file": "b.kicad_pro"})],
+                ),
+                ("tool+save", "b.sch", "v1", "sB"),
+                (
+                    "assistant+tc",
+                    [_tool_call("tcB", "add_symbol_to_schematic", {"file_path": "b.sch"})],
+                ),
+                ("tool", "tcB", '{"ok": true}'),
+                (
+                    "assistant+tc",
+                    [
+                        _tool_call(
+                            "rst",
+                            "restore_project_version",
+                            {"project_file": "a.kicad_pro", "version_id": "v1"},
+                        )
+                    ],
+                ),
+                ("tool+restore", "a.sch", "v1", "rst"),
+            ]
+        )
+        client = _make_client()
+        client._history = history
+        before = copy.deepcopy(history)
+        client._prune_rollback_history()
+        assert client._history == before
+
+    def test_restore_project_prunes_whole_interval_across_files(self):
+        """Restoring a project drops the whole interval, whatever file it touched.
 
         The archive bundles the same-stem schematic + PCB + project file, so
-        a project restore invalidates tool calls against either file.
+        the cut is not limited to calls that name the restored file.
         """
         history = self._make_history(
             [
@@ -6032,6 +6281,136 @@ class TestPruneRollbackHistory:
                 assert "add_symbol_to_schematic" not in names
                 assert "add_footprint" not in names
 
+    # ---- Result-body guards ---------------------------------------------------
+
+    def test_failed_restore_does_not_prune(self):
+        """``success: false`` means nothing was rolled back; keep the turns."""
+        history = self._make_history(
+            [
+                ("user", "start"),
+                (
+                    "assistant+tc",
+                    [_tool_call("s1", "save_project_version", {"project_file": "f.kicad_pro"})],
+                ),
+                ("tool+save", "f.sch", "v1", "s1"),
+                (
+                    "assistant+tc",
+                    [_tool_call("tcA", "add_symbol_to_schematic", {"file_path": "f.sch"})],
+                ),
+                ("tool", "tcA", '{"ok": true}'),
+                (
+                    "assistant+tc",
+                    [
+                        _tool_call(
+                            "rst",
+                            "restore_project_version",
+                            {"project_file": "f.kicad_pro", "version_id": "v1"},
+                        )
+                    ],
+                ),
+                ("tool", "rst", json.dumps({"success": False, "error": "disk full"})),
+            ]
+        )
+        client = _make_client()
+        client._history = history
+        before = copy.deepcopy(history)
+        client._prune_rollback_history()
+        assert client._history == before
+
+    def test_non_dict_save_arguments_do_not_raise(self):
+        history = self._make_history(
+            [
+                ("user", "start"),
+                # arguments serialize to "[]"
+                ("assistant+tc", [_tool_call("s1", "save_project_version", [])]),
+                ("tool+save", "f.sch", "v1", "s1"),
+                (
+                    "assistant+tc",
+                    [
+                        _tool_call(
+                            "rst",
+                            "restore_project_version",
+                            {"project_file": "f.kicad_pro", "version_id": "v1"},
+                        )
+                    ],
+                ),
+                ("tool+restore", "f.sch", "v1", "rst"),
+            ]
+        )
+        client = _make_client()
+        client._history = history
+        before = copy.deepcopy(history)
+        client._maybe_compact("system")
+        assert client._history == before  # no save point was recognised
+
+    def test_non_dict_save_result_does_not_raise(self):
+        history = self._make_history(
+            [
+                ("user", "start"),
+                (
+                    "assistant+tc",
+                    [_tool_call("s1", "save_project_version", {"project_file": "f.kicad_pro"})],
+                ),
+                # result content serializes to "[]"
+                ("tool", "s1", "[]"),
+                (
+                    "assistant+tc",
+                    [
+                        _tool_call(
+                            "rst",
+                            "restore_project_version",
+                            {"project_file": "f.kicad_pro", "version_id": "v1"},
+                        )
+                    ],
+                ),
+                ("tool+restore", "f.sch", "v1", "rst"),
+            ]
+        )
+        client = _make_client()
+        client._history = history
+        before = copy.deepcopy(history)
+        client._maybe_compact("system")
+        assert client._history == before  # no save point was recognised
+
+    def test_non_dict_restore_result_does_not_raise(self):
+        history = self._make_history(
+            [
+                ("user", "start"),
+                (
+                    "assistant+tc",
+                    [_tool_call("s1", "save_project_version", {"project_file": "f.kicad_pro"})],
+                ),
+                ("tool+save", "f.sch", "v1", "s1"),
+                (
+                    "assistant+tc",
+                    [_tool_call("tcA", "add_symbol_to_schematic", {"file_path": "f.sch"})],
+                ),
+                ("tool", "tcA", '{"ok": true}'),
+                (
+                    "assistant+tc",
+                    [
+                        _tool_call(
+                            "rst",
+                            "restore_project_version",
+                            {"project_file": "f.kicad_pro", "version_id": "v1"},
+                        )
+                    ],
+                ),
+                # result content serializes to "[]"; no failure signal, so prune
+                ("tool", "rst", "[]"),
+            ]
+        )
+        client = _make_client()
+        client._history = history
+        client._maybe_compact("system")
+        assert [m["role"] for m in client._history] == [
+            "user",
+            "assistant",
+            "tool",
+            "assistant",
+            "tool",
+        ]
+
 
 class TestValidateHistoryEmptyToolCalls:
     """Legacy sessions may persist ``tool_calls: []``; it must be repaired."""
@@ -6045,17 +6424,51 @@ class TestValidateHistoryEmptyToolCalls:
         ]
         client._validate_history()
         assert client._history[1] == {"role": "assistant", "content": "Adding a resistor."}
-        assert "tool_calls" not in llm_client._wire_message(client._history[1])
 
     def test_empty_tool_calls_message_without_text_dropped(self):
         client = _make_client()
         client._history = [
             {"role": "user", "content": "start"},
             {"role": "assistant", "content": "", "tool_calls": []},
+            {"role": "tool", "tool_call_id": "z", "content": "orphan"},
             {"role": "user", "content": "continue"},
         ]
         client._validate_history()
-        assert [m["role"] for m in client._history] == ["user", "user"]
+        # The assistant declared no id, so the following tool result has no
+        # parent: dropping only the assistant would leave it orphaned.
+        assert client._history == [
+            {"role": "user", "content": "start"},
+            {"role": "user", "content": "continue"},
+        ]
+
+    def test_empty_tool_calls_with_text_drops_orphaned_tool_result(self):
+        client = _make_client()
+        client._history = [
+            {"role": "user", "content": "start"},
+            {"role": "assistant", "content": "Adding a resistor.", "tool_calls": []},
+            {"role": "tool", "tool_call_id": "z", "content": "orphan"},
+            {"role": "user", "content": "continue"},
+        ]
+        client._validate_history()
+        assert client._history == [
+            {"role": "user", "content": "start"},
+            {"role": "assistant", "content": "Adding a resistor."},
+            {"role": "user", "content": "continue"},
+        ]
+
+
+class TestWireMessageToolCalls:
+    """``tool_calls`` reaches the provider only as a non-empty list."""
+
+    @pytest.mark.parametrize("empty", [None, {}, (), [], 0, ""])
+    def test_falsy_shapes_are_omitted(self, empty):
+        wire = llm_client._wire_message({"role": "assistant", "content": "x", "tool_calls": empty})
+        assert wire == {"role": "assistant", "content": "x"}
+
+    def test_non_empty_list_passes_through(self):
+        call = _tool_call("tc1", "add_symbol_to_schematic", {"file_path": "f.sch"})
+        wire = llm_client._wire_message({"role": "assistant", "content": "", "tool_calls": [call]})
+        assert wire["tool_calls"] == [call]
 
 
 # ---------------------------------------------------------------------------

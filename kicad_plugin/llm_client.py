@@ -2445,7 +2445,14 @@ class LLMClient:
         restore turns themselves stay so the model can see the rollback.
 
         Nested restores inside the interval are removed with it; the most
-        recent resolvable restore wins.
+        recent resolvable restore wins.  A restore whose result reports an
+        error is ignored — nothing was rolled back.
+
+        The cut starts right after the save *result*, so a save batched with
+        later calls in the same assistant turn loses those calls' results.
+        They are dropped from the save turn in the same pass, keeping the
+        rebuilt history pairing-valid without relying on
+        ``_validate_history``.
         """
 
         # ---- Build save-point lookup ------------------------------------------
@@ -2467,15 +2474,20 @@ class LLMClient:
                 try:
                     args = json.loads(tc["function"].get("arguments", "{}"))
                     result = json.loads(msg.get("content", "{}"))
-                    fp = args.get("project_file", "")
-                    vid = result.get("version_id", "")
-                    if fp and vid:
-                        save_points[(fp, vid)] = i
                 except (json.JSONDecodeError, KeyError, TypeError):
-                    pass
+                    continue
+                if not isinstance(args, dict) or not isinstance(result, dict):
+                    continue
+                fp = args.get("project_file", "")
+                vid = result.get("version_id", "")
+                if fp and vid:
+                    save_points[(fp, vid)] = i
 
         # ---- Scan from tail for restore_project_version ----------------------
+        # An unresolvable or failed restore must not stop the scan: an earlier
+        # restore may still have a usable save point.
         stale: range | None = None
+        save_idx: int | None = None
         for i in range(len(self._history) - 1, -1, -1):
             msg = self._history[i]
             if msg.get("role") != "tool":
@@ -2492,24 +2504,63 @@ class LLMClient:
                     continue
                 try:
                     args = json.loads(tc["function"].get("arguments", "{}"))
+                    result = json.loads(msg.get("content", "{}"))
                 except (json.JSONDecodeError, KeyError, TypeError):
-                    continue
-                save_idx = save_points.get(
-                    (args.get("project_file", ""), args.get("version_id", ""))
-                )
-                if save_idx is not None and save_idx + 1 < p_idx:
+                    break
+                if not isinstance(args, dict):
+                    break
+                if isinstance(result, dict) and (
+                    result.get("success") is False or "error" in result
+                ):
+                    break  # The restore failed; the interval is still valid.
+                found = save_points.get((args.get("project_file", ""), args.get("version_id", "")))
+                if found is not None and found + 1 < p_idx:
                     # Everything between the save result and the restore call
                     # describes state that the restore rolled back.
-                    stale = range(save_idx + 1, p_idx)
+                    stale = range(found + 1, p_idx)
+                    save_idx = found
                 break
             if stale is not None:
                 break
 
-        if stale is None:
+        if stale is None or save_idx is None:
             return
 
+        save_turn_idx = self._find_parent_assistant(save_idx)
         self._history = self._history[: stale.start] + self._history[stale.stop :]
+        if save_turn_idx is not None:
+            self._trim_save_turn_calls(save_turn_idx)
         log.info("_prune_rollback_history: pruned %d stale messages", len(stale))
+
+    def _trim_save_turn_calls(self, turn_idx: int) -> None:
+        """Drop calls of *turn_idx* whose tool results the interval cut removed.
+
+        The interval starts after the save result, so any sibling call issued
+        later in the same assistant turn loses its result with the interval.
+        Leaving the declaration behind would make pruning depend on a later
+        ``_validate_history`` pass to repair its own output.
+        """
+        msg = self._history[turn_idx]
+        tool_calls = msg.get("tool_calls")
+        if msg.get("role") != "assistant" or not tool_calls:
+            return
+        surviving_ids: set[Any] = set()
+        j = turn_idx + 1
+        while j < len(self._history) and self._history[j].get("role") == "tool":
+            surviving_ids.add(self._history[j].get("tool_call_id"))
+            j += 1
+        kept = [tc for tc in tool_calls if tc.get("id") in surviving_ids]
+        if len(kept) == len(tool_calls):
+            return
+        updated = dict(msg)
+        if kept:
+            updated["tool_calls"] = kept
+        else:
+            updated.pop("tool_calls", None)
+        if not kept and not updated.get("content"):
+            del self._history[turn_idx]
+            return
+        self._history[turn_idx] = updated
 
     def _find_parent_assistant(self, tool_result_index: int) -> int | None:
         """Return the index of the assistant message that issued the tool call
@@ -2612,6 +2663,9 @@ class LLMClient:
         * If SOME are orphaned → strip only the orphaned entries from
           ``tool_calls``, keeping the valid ones and any text content.
         * An empty ``tool_calls`` list is stripped (it is invalid on the wire).
+          A textless assistant with such a list is dropped.  Either way, any
+          immediately-following ``tool`` messages are dropped too: no id was
+          declared, so they cannot be paired and would become orphans.
         """
         i = 0
         removed_count = 0
@@ -2629,8 +2683,14 @@ class LLMClient:
                     log.warning("_validate_history: removed empty tool_calls at history[%d]", i)
                     if not msg.get("content"):
                         del self._history[i]
-                        continue
-                    self._history[i] = msg
+                    else:
+                        self._history[i] = msg
+                        i += 1
+                    # No id was declared, so following tool messages have no
+                    # parent and must go with the turn (or the stripped key).
+                    while i < len(self._history) and self._history[i].get("role") == "tool":
+                        del self._history[i]
+                    continue
                 i += 1
                 continue
 
