@@ -269,8 +269,8 @@ def _sheet_file_from_node(sheet_node: list) -> str | None:
     return None
 
 
-def _project_root_sheet_uuid(schematic_path: str) -> str | None:
-    """Return the root sheet UUID the owning project records for *schematic_path*.
+def _project_root_sheet_uuid(schematic_path: str) -> tuple[str | None, str | None]:
+    """Return ``(root_sheet_uuid, error)`` for *schematic_path*.
 
     KiCad stores the project root sheet UUID in the project file
     (``schematic.top_level_sheets[].uuid``), not in the schematic.  The
@@ -278,44 +278,90 @@ def _project_root_sheet_uuid(schematic_path: str) -> str | None:
     may legitimately differ from the root sheet UUID (which is what every
     instance path in the hierarchy starts with).
 
-    Only a project entry naming *schematic_path* counts: a schematic copied
-    under another name is a standalone document to KiCad, and its instances
-    are keyed by its own UUID.
+    ``(None, None)`` means no owning project file exists: the schematic is a
+    standalone document and the caller may fall back to its own UUID.  When
+    a project file exists but does not confirm this exact file (invalid JSON,
+    missing or empty ``top_level_sheets``, no matching entry, a matching
+    entry without a string UUID, or several distinct matching UUIDs), the
+    error names the file and the reason, and the caller must write nothing.
+
+    Entries are matched by real path: each ``filename`` is resolved relative
+    to the project directory, so files in other directories with the same
+    basename never claim each other.
     """
     project_file = find_project_file(schematic_path)
     if not project_file:
-        return None
+        return None, None
+
+    def fail(reason: str) -> tuple[None, str]:
+        return None, (
+            f"Cannot resolve the root sheet UUID for {os.path.basename(schematic_path)!r}: "
+            f"{reason}.  Nothing was written."
+        )
 
     data = load_project_json(project_file)
     if not isinstance(data, dict):
-        return None
+        return fail(f"the project file {os.path.basename(project_file)!r} is not valid JSON")
 
     schematic = data.get("schematic")
-    sheets = schematic.get("top_level_sheets") if isinstance(schematic, dict) else None
-    if not isinstance(sheets, list):
-        return None
+    if not isinstance(schematic, dict):
+        return fail(
+            f"the project file {os.path.basename(project_file)!r} has no 'schematic' object"
+        )
 
-    target = os.path.basename(schematic_path)
+    sheets = schematic.get("top_level_sheets")
+    if not isinstance(sheets, list) or not sheets:
+        return fail(
+            f"the project file {os.path.basename(project_file)!r} has no "
+            "'schematic.top_level_sheets' entries"
+        )
+
+    project_dir = os.path.dirname(project_file)
+    target = os.path.realpath(schematic_path)
+    matches: list[str] = []
     for entry in sheets:
         if not isinstance(entry, dict):
             continue
         filename = entry.get("filename")
+        if not isinstance(filename, str):
+            continue
+        entry_path = os.path.realpath(os.path.join(project_dir, filename))
+        if entry_path != target:
+            continue
         entry_uuid = entry.get("uuid")
-        if isinstance(filename, str) and isinstance(entry_uuid, str):
-            if os.path.basename(filename) == target:
-                return entry_uuid
-    return None
+        if not isinstance(entry_uuid, str):
+            return fail(
+                f"its {os.path.basename(project_file)!r} 'schematic.top_level_sheets' "
+                "entry has no string 'uuid'"
+            )
+        matches.append(entry_uuid)
+
+    if not matches:
+        return fail(
+            f"the project file {os.path.basename(project_file)!r} does not list this "
+            "schematic in 'schematic.top_level_sheets'"
+        )
+
+    if len(set(matches)) > 1:
+        return fail(
+            f"the project file {os.path.basename(project_file)!r} lists more than one "
+            "distinct root sheet UUID for this schematic"
+        )
+
+    return matches[0], None
 
 
 def _resolve_sheet_parent_path(schematic_path: str, tree: list) -> tuple[str | None, str | None]:
     """Resolve the instance path of the sheet that owns *schematic_path*.
 
     For a root schematic this is ``"/" + <root sheet UUID>``.  The UUID is
-    taken from the owning project's ``top_level_sheets`` entry for this file,
-    because that is the value KiCad writes into every instance path; only a
-    standalone schematic (no project entry) falls back to the file's own
-    ``(uuid ...)``, then to an existing sibling sheet's ``instances`` path
-    (preferring the clause for this schematic's stem).
+    taken from the owning project's ``top_level_sheets`` entry for this exact
+    file, because that is the value KiCad writes into every instance path.
+    Only a standalone schematic (no project file at all) falls back to the
+    file's own ``(uuid ...)``, then to an existing sibling sheet's
+    ``instances`` path (preferring the clause for this schematic's stem).  A
+    project file that exists but cannot confirm this schematic fails the
+    call instead of guessing.
 
     KiCad always writes ``(uuid ...)`` into a saved schematic and assigns one
     on load when it is missing, so a root with neither its own UUID nor an
@@ -333,7 +379,9 @@ def _resolve_sheet_parent_path(schematic_path: str, tree: list) -> tuple[str | N
             "project's root schematic instead."
         )
 
-    project_uuid = _project_root_sheet_uuid(schematic_path)
+    project_uuid, project_error = _project_root_sheet_uuid(schematic_path)
+    if project_error:
+        return None, project_error
     if project_uuid:
         return "/" + project_uuid, None
 
@@ -817,11 +865,12 @@ def _do_add_sheet_symbol(
         except Exception as e:
             return {"error": f"Failed to create child schematic: {e}"}
 
-    # Snap coordinates to grid
-    x = _align_to_grid(x)
-    y = _align_to_grid(y)
-    width = _align_to_grid(width)
-    height = _align_to_grid(height)
+    # Snap coordinates to grid.  The grid product is rounded again so the
+    # emitted numbers carry no float noise (KiCad writes at most 6 decimals).
+    x = round(_align_to_grid(x), 6)
+    y = round(_align_to_grid(y), 6)
+    width = round(_align_to_grid(width), 6)
+    height = round(_align_to_grid(height), 6)
 
     # Generate UUID for the sheet symbol
     sheet_uuid = str(uuid.uuid4())
@@ -902,6 +951,8 @@ def _do_add_sheet_symbol(
                 pin_x, pin_y = x + d, y
             else:  # bottom
                 pin_x, pin_y = x + d, y + height
+            pin_x = round(pin_x, 6)
+            pin_y = round(pin_y, 6)
 
             pin_uuid = str(uuid.uuid4())
             pin_entry = [
@@ -1286,6 +1337,11 @@ def _do_add_sheet_pin(
         pin_angle = 270
     else:
         return {"error": f"Invalid edge: {edge!r}. Must be right/left/top/bottom"}
+
+    # KiCad writes at most 6 decimals; raw float sums would otherwise leak
+    # noise such as 182.88000000000002 into the file.
+    pin_x = round(pin_x, 6)
+    pin_y = round(pin_y, 6)
 
     # Generate UUID for the pin
     pin_uuid = str(uuid.uuid4())
