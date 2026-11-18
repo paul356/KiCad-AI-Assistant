@@ -62,8 +62,10 @@ async def list_sheet_symbols(
             success (bool)
             sheets (list[dict]): each entry has keys:
                 uuid (str)           -- KIID of the sheet symbol
-                sheet_name (str)     -- from ``property "Sheet name"``
-                sheet_file (str)     -- from ``property "Sheet file"``
+                sheet_name (str)     -- from ``property "Sheetname"``
+                                        (legacy ``"Sheet name"`` also read)
+                sheet_file (str)     -- from ``property "Sheetfile"``
+                                        (legacy ``"Sheet file"`` also read)
                 position (dict)      -- ``{x, y}`` in mm
                 size (dict)          -- ``{width, height}`` in mm
                 pin_count (int)      -- number of hierarchical pins
@@ -82,7 +84,7 @@ async def get_sheet_hierarchy(
     """Build a recursive hierarchy tree of all sheets in a project.
 
     Starts at *schematic_path* (the root), reads its ``(sheet ...)`` entries,
-    and recursively follows ``Sheet file`` properties to child ``.kicad_sch``
+    and recursively follows ``Sheetfile`` properties to child ``.kicad_sch``
     files.  Resolves relative sheet-file paths against *project_dir* when
     provided; otherwise resolves relative to the parent file's directory.
 
@@ -138,8 +140,9 @@ async def add_sheet_symbol(
     """Add a hierarchical sheet symbol to a schematic.
 
     Constructs a ``(sheet ...)`` S-expression and inserts it into the
-    schematic.  The tool assigns a UUID, writes the ``Sheet name`` and
-    ``Sheet file`` properties, and sets up the ``(instances ...)`` block.
+    schematic.  The tool assigns a UUID, writes the ``Sheetname`` and
+    ``Sheetfile`` properties, and sets up the ``(instances ...)`` block with
+    the containing sheet's path and the lowest unused page number.
 
     Coordinates are mm in KiCad screen convention (**+Y is down**) and are
     auto-snapped to the 1.27 mm (50-mil) grid.
@@ -154,7 +157,7 @@ async def add_sheet_symbol(
 
     Args:
         schematic_path: Absolute path to the parent .kicad_sch file.
-        sheet_name: Display name for the sheet symbol (becomes ``Sheet name``
+        sheet_name: Display name for the sheet symbol (becomes ``Sheetname``
             property, e.g. "Power Supply").
         sheet_file: Target .kicad_sch filename (e.g. "power.kicad_sch").
             Resolved relative to the parent file's directory.
@@ -221,7 +224,7 @@ async def remove_sheet_symbol(
         identifier: The sheet to remove.  Can be a UUID or a sheet name.
         by: How to interpret *identifier* — ``"uuid"`` (default, matches the
             sheet symbol's ``(uuid ...)`` token) or ``"name"`` (matches the
-            ``Sheet name`` property value, case-sensitive).
+            ``Sheetname`` property value, case-sensitive).
 
     Returns:
         dict with keys:
@@ -263,9 +266,9 @@ async def update_sheet_symbol(
     Args:
         schematic_path: Absolute path to the target .kicad_sch file.
         sheet_uuid: UUID of the sheet symbol to update.
-        sheet_name: New display name (``Sheet name`` property).  If None,
+        sheet_name: New display name (``Sheetname`` property).  If None,
             unchanged.
-        sheet_file: New target filename (``Sheet file`` property).  If None,
+        sheet_file: New target filename (``Sheetfile`` property).  If None,
             unchanged.  WARNING: if the file does not exist and *sheet_name*
             does not change, the tool will still accept the new filename but
             issue a warning.
@@ -447,24 +450,34 @@ Sheet pins are placed on edges rather than raw coordinates.  This is the same ap
 
 ```lisp
 (sheet (at <x_mm> <y_mm>) (size <w_mm> <h_mm>)
-  (stroke (width 0) (type default))
-  (fill (type none))
+  (exclude_from_sim no) (in_bom yes) (on_board yes) (dnp no)
+  (stroke (width 0) (type solid))
+  (fill (color 0 0 0 0))
   (uuid "<generated-uuid>")
-  (property "Sheet name" "<sheet_name>" (at <px> <py> 0)
-    (effects (font (size 1.27 1.27)) (justify left)))
-  (property "Sheet file" "<filename>" (at <fx> <fy> 0)
-    (effects (font (size 1.27 1.27)) (justify left)))
+  (property "Sheetname" "<sheet_name>" (at 0 0 0) (show_name no)
+    (do_not_autoplace yes) (effects (font (size 1.27 1.27)) (justify left)))
+  (property "Sheetfile" "<filename>" (at 0 0 0) (show_name no)
+    (do_not_autoplace yes) (effects (font (size 1.27 1.27)) (justify left)))
   (pin "<name>" <shape> (at <px> <py> <angle>) (uuid "<generated>")
     (effects (font (size 1.27 1.27)) (justify <justify>)))
   (instances
     (project "<project_name>"
-      (path "<uuid-path>" (page "<page_num>"))))
+      (path "/<root-uuid>" (page "<next-free-page>"))))
 )
 ```
 
-Property label positions are offset from the sheet symbol's top-left corner:
-- `Sheet name`: (x + 5, y + 5) mm
-- `Sheet file`: (x + 5, y + 10) mm
+The node matches the KiCad 10 dialect exactly, so KiCad does not rewrite it
+on load or save: solid stroke (sheet symbols have no line style), colour
+fill, all four flags, and canonical property names.
+
+The `instances` path is the path of the *containing* sheet, resolved only
+from the schematic itself: the root schematic's own `(uuid ...)`, then an
+existing sheet's instance path (preferring the clause for this schematic's
+stem).  There is no project-file fallback; if neither source exists the
+call fails and writes nothing.  The page is the lowest positive integer not
+used anywhere in the project's sheet hierarchy.  Only root schematics can
+be extended; adding a sheet to a child schematic fails because the tool
+cannot know its enclosing path.
 
 ---
 
@@ -472,15 +485,18 @@ Property label positions are offset from the sheet symbol's top-left corner:
 
 ```lisp
 (kicad_sch (version 20260306) (generator "kcaa") (generator_version "0.2.0")
-  (uuid "<generated-root-uuid>")
+  (uuid "<generated-file-uuid>")
   (paper "<paper>")
-  (lib_symbols)
-  (sheet_instances
-    (path "/<root-uuid>" (page "1"))
+  (title_block
+    (title "<title>")
   )
-  (embedded_fonts no)
+  (lib_symbols)
 )
 ```
+
+`sheet_instances` and `embedded_fonts` are root-file-only sections and are
+not written into child schematics.  A root schematic would end with
+`(sheet_instances (path "/" (page "1")))` and `(embedded_fonts no)`.
 
 ---
 
