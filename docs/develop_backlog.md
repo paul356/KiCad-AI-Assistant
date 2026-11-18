@@ -288,10 +288,10 @@ default the removed per-file tools used.
    removed — the three project tools are the only versioning surface.
    The plugin framework's auto-snapshot now calls `save_project_version`
    (derived pro path, deduped per project per turn), rollback-history
-   pruning keys on `project_file` + `version_id` and prunes any turn that
-   touched any file of the restored project, the auto-route pre-routing
-   backup uses the project archive, and the tool-policy registry was
-   updated accordingly.
+   pruning keys on `project_file` + `version_id` and drops the whole
+   history interval between the save result and the restore turn, the
+   auto-route pre-routing backup uses the project archive, and the
+   tool-policy registry was updated accordingly.
 5. Old `.versions/<basename>.<ts>` snapshots written by the removed tools
    are no longer readable by any tool; the files are left on disk.
 
