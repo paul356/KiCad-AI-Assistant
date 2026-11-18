@@ -217,11 +217,17 @@ def _wire_message(msg: dict[str, Any]) -> dict[str, Any]:
     provider (#283).  Adding another internal key later must not reach the
     wire by accident.
     """
-    return {
+    wire = {
         key: msg[key]
         for key in ("role", "content", "name", "tool_calls", "tool_call_id")
         if key in msg
     }
+    # OpenAI-style providers reject an empty array (#321):
+    # "Invalid 'messages[N].tool_calls': empty array".
+    tool_calls = wire.get("tool_calls")
+    if not isinstance(tool_calls, list) or not tool_calls:
+        wire.pop("tool_calls", None)
+    return wire
 
 
 def _is_slot_index(value: Any) -> bool:
@@ -2449,129 +2455,97 @@ class LLMClient:
         return True
 
     def _prune_rollback_history(self) -> None:
-        """Prune tool-call turns invalidated by restore_project_version.
+        """Remove history invalidated by restore_project_version.
 
-        When the LLM restores a project to an earlier version, every tool
-        call that mutated or queried any of its files between the save point
-        and the restore is now based on stale state — prune those turns.
+        The interval between a ``save_project_version`` result and the
+        assistant turn that issues the matching ``restore_project_version``
+        is entirely stale: everything in it describes work the restore
+        reverted.  Remove those messages as a block — user turns, assistant
+        text, tool calls and tool results alike — keeping the save turn
+        (through its tool result) and the restore turn onward.
 
-        Handles nested restores: starts from the most recent restore and skips
-        any restore whose messages fall inside an already-pruned range.
+        Nested restores are handled most-recent-first: after each removal the
+        history is rescanned, so shifted indices stay correct.  A restore
+        whose save point cannot be located leaves history untouched rather
+        than cutting at a guessed index.
         """
-        record = project_state.read_state(self._state_file)
+        pruned = 0
+        while True:
+            interval = self._find_rollback_interval()
+            if interval is None:
+                break
+            start, end = interval
+            del self._history[start:end]
+            pruned += end - start
+        if pruned:
+            log.info("_prune_rollback_history: pruned %d stale messages", pruned)
 
-        # ---- Build save-point lookup ------------------------------------------
-        # For each save_project_version result, record (project_file, version_id) → index.
-        save_points: dict[tuple[str, str], int] = {}
+    @staticmethod
+    def _tool_call_for_result(parent: dict[str, Any], tool_call_id: Any) -> dict[str, Any] | None:
+        """Return the tool call of *parent* that produced *tool_call_id*."""
+        for tc in parent.get("tool_calls") or []:
+            if tc.get("id") == tool_call_id:
+                return tc
+        return None
+
+    def _find_rollback_interval(self) -> tuple[int, int] | None:
+        """Return the most recent prunable rollback interval, if any.
+
+        The interval is ``(start, end)``: ``start`` is the message right
+        after the save result, ``end`` the assistant message that issues the
+        restore.  ``None`` means no restore has a locatable save point with
+        a non-empty interval to remove.
+        """
+        # ---- Build save-point lookup --------------------------------------
+        save_points: dict[tuple[str, str], list[int]] = {}
         for i, msg in enumerate(self._history):
             if msg.get("role") != "tool":
                 continue
-            p_idx = self._find_parent_assistant(i)
-            if p_idx is None:
+            parent_idx = self._find_parent_assistant(i)
+            if parent_idx is None:
                 continue
-            parent = self._history[p_idx]
-            tc_id = msg.get("tool_call_id")
-            for tc in parent.get("tool_calls") or []:
-                if tc.get("id") != tc_id:
-                    continue
-                if tc.get("function", {}).get("name") != "save_project_version":
-                    continue
-                try:
-                    args = json.loads(tc["function"].get("arguments", "{}"))
-                    result = json.loads(msg.get("content", "{}"))
-                    fp = args.get("project_file", "")
-                    vid = result.get("version_id", "")
-                    if fp and vid:
-                        save_points[(fp, vid)] = i
-                except (json.JSONDecodeError, KeyError, TypeError):
-                    pass
+            tc = self._tool_call_for_result(self._history[parent_idx], msg.get("tool_call_id"))
+            if tc is None or tc.get("function", {}).get("name") != "save_project_version":
+                continue
+            try:
+                args = json.loads(tc["function"].get("arguments", "{}"))
+                result = json.loads(msg.get("content", "{}"))
+                fp = args.get("project_file", "")
+                vid = result.get("version_id", "")
+                if fp and vid:
+                    save_points.setdefault((fp, vid), []).append(i)
+            except (json.JSONDecodeError, KeyError, TypeError):
+                pass
 
-        # ---- Scan from tail for restore_project_version ----------------------
-        marked: set[int] = set()  # indices to remove  (tool results)
-        tool_call_removals: dict[int, list[str]] = {}  # assistant_idx → [tc_id, ...]
-        i = len(self._history) - 1
-        while i >= 0:
-            if i in marked:
-                i -= 1
-                continue
+        # ---- Scan from tail for restore_project_version --------------------
+        for i in range(len(self._history) - 1, -1, -1):
             msg = self._history[i]
             if msg.get("role") != "tool":
-                i -= 1
                 continue
-            p_idx = self._find_parent_assistant(i)
-            if p_idx is None or p_idx in marked:
-                i -= 1
+            parent_idx = self._find_parent_assistant(i)
+            if parent_idx is None:
                 continue
-            parent = self._history[p_idx]
-            tc_id = msg.get("tool_call_id")
-            for tc in parent.get("tool_calls") or []:
-                if tc.get("id") != tc_id:
-                    continue
-                if tc.get("function", {}).get("name") != "restore_project_version":
-                    continue
-                try:
-                    args = json.loads(tc["function"].get("arguments", "{}"))
-                    project_file = args.get("project_file", "")
-                    version_id = args.get("version_id", "")
-                except (json.JSONDecodeError, KeyError, TypeError):
-                    break
+            tc = self._tool_call_for_result(self._history[parent_idx], msg.get("tool_call_id"))
+            if tc is None or tc.get("function", {}).get("name") != "restore_project_version":
+                continue
+            try:
+                args = json.loads(tc["function"].get("arguments", "{}"))
+                project_file = args.get("project_file", "")
+                version_id = args.get("version_id", "")
+            except (json.JSONDecodeError, KeyError, TypeError):
+                continue
 
-                save_idx = save_points.get((project_file, version_id))
-                if save_idx is None or save_idx >= i:
-                    break  # Can't locate save point
-
-                # Mark file-touching tool turns inside (save_idx, i]
-                for j in range(save_idx + 1, i):
-                    if j in marked:
-                        continue
-                    mj = self._history[j]
-                    if mj.get("role") != "tool":
-                        continue
-                    pj = self._find_parent_assistant(j)
-                    if pj is None:
-                        continue
-                    # Check the specific tool_call (not whole turn)
-                    tcj_id = mj.get("tool_call_id")
-                    parent_j = self._history[pj]
-                    for tcj in parent_j.get("tool_calls") or []:
-                        if tcj.get("id") != tcj_id:
-                            continue
-                        try:
-                            tcj_args = json.loads(tcj["function"].get("arguments", "{}"))
-                        except (json.JSONDecodeError, KeyError, TypeError):
-                            continue
-                        if self._tool_touches_project_record(tcj_args, project_file, record):
-                            marked.add(j)
-                            tool_call_removals.setdefault(pj, []).append(tcj_id)
-                break
-            i -= 1
-
-        if not marked:
-            return
-
-        # ---- Rebuild history --------------------------------------------------
-        # 1. Strip removed tool_calls from assistant messages.
-        # 2. Remove assistant messages with no remaining content or tool_calls.
-        # 3. Remove marked tool_result messages.
-        new_history: list[dict[str, Any]] = []
-        for idx, msg in enumerate(self._history):
-            if idx in marked:
-                continue  # drop tool_result
-            if msg.get("role") == "assistant" and idx in tool_call_removals:
-                removed_ids = set(tool_call_removals[idx])
-                new_tcs = [
-                    tc for tc in (msg.get("tool_calls") or []) if tc.get("id") not in removed_ids
-                ]
-                if not new_tcs and not msg.get("content"):
-                    continue  # drop empty assistant message
-                msg = dict(msg)  # shallow copy before mutating
-                msg["tool_calls"] = new_tcs
-            new_history.append(msg)
-
-        pruned = len(self._history) - len(new_history)
-        if pruned:
-            log.info("_prune_rollback_history: pruned %d stale messages", pruned)
-        self._history = new_history
+            # The save point must precede the restore that reverts to it.
+            candidates = [
+                idx for idx in save_points.get((project_file, version_id), []) if idx < parent_idx
+            ]
+            if not candidates:
+                continue  # Can't locate save point — never guess an index
+            start = candidates[-1] + 1
+            if start >= parent_idx:
+                continue  # Interval already pruned; look for an earlier restore
+            return start, parent_idx
+        return None
 
     def _find_parent_assistant(self, tool_result_index: int) -> int | None:
         """Return the index of the assistant message that issued the tool call
@@ -2689,6 +2663,9 @@ class LLMClient:
         such inconsistencies before they reach the LLM.
 
         Repair strategy for each malformed assistant message:
+        * ``tool_calls == []`` (legacy rollback pruning, #321) → strip the
+          empty key; drop the message when it also has no text, along with
+          any tool results that followed it.
         * If ALL tool_calls are orphaned → drop the entire assistant message.
         * If SOME are orphaned → strip only the orphaned entries from
           ``tool_calls``, keeping the valid ones and any text content.
@@ -2698,6 +2675,31 @@ class LLMClient:
         while i < len(self._history):
             msg = self._history[i]
             tool_calls = msg.get("tool_calls") if msg.get("role") == "assistant" else None
+            if tool_calls == []:
+                # An empty array is rejected by OpenAI-style providers:
+                # "Invalid 'messages[N].tool_calls': empty array" (#321).
+                if msg.get("content"):
+                    msg = dict(msg)
+                    del msg["tool_calls"]
+                    self._history[i] = msg
+                    log.warning(
+                        "_validate_history: stripped empty tool_calls from assistant "
+                        "at history[%d]",
+                        i,
+                    )
+                    i += 1
+                else:
+                    del self._history[i]
+                    log.warning(
+                        "_validate_history: dropped assistant at history[%d] "
+                        "(no text and empty tool_calls)",
+                        i,
+                    )
+                # No call was declared, so a following tool result is orphaned.
+                while i < len(self._history) and self._history[i].get("role") == "tool":
+                    del self._history[i]
+                removed_count += 1
+                continue
             if not tool_calls:
                 i += 1
                 continue
