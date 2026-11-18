@@ -30,10 +30,38 @@ def _inside_kicad_user_dir(*parts: str) -> str:
     return os.path.join(config.kicad_user_dir, *parts)
 
 
-def _write_state(state_file: str, project_root: str | None) -> None:
-    """Write the plugin-published state file (no timestamp manipulation)."""
+def _write_state(
+    state_file: str, project_root: str | None, profile_file: str = "board.kicad_pro", **extra
+) -> None:
+    """Write a schema-v2 project record (creating its profile file).
+
+    ``project_root=None`` writes a ``null`` payload.  An unusable root (e.g.
+    a regular file) is written as-is so the invalid-record paths stay
+    exercisable.
+    """
+    if project_root is None:
+        payload: object = None
+    else:
+        root = os.path.abspath(str(project_root))
+        try:
+            profile_path = os.path.join(root, profile_file)
+            os.makedirs(os.path.dirname(profile_path), exist_ok=True)
+            if not os.path.exists(profile_path):
+                with open(profile_path, "w", encoding="utf-8") as f:
+                    f.write("{}")
+        except OSError:
+            pass
+        payload = {
+            "version": 2,
+            "written_at": "2026-11-17T09:12:33Z",
+            "project_root": root,
+            "profile_file": profile_file,
+            "pcb_files": [],
+            "schematic_files": [],
+        }
+        payload.update(extra)
     with open(state_file, "w", encoding="utf-8") as f:
-        json.dump({"project_root": project_root}, f)
+        json.dump(payload, f)
 
 
 def _make_state_validator(monkeypatch, state_file: str) -> PathValidator:
@@ -182,11 +210,11 @@ class TestProjectRoot:
 
 
 class TestStateFile:
-    """Plugin-published project root: read on validate, keep current on error."""
+    """Canonical project record: valid installs the root, invalid clears it."""
 
     def test_new_project_path_picked_up_on_next_validate(self, tmp_path, monkeypatch):
         """A fresh state value wins even when the file's mtime is unchanged."""
-        state_file = tmp_path / "active_project.json"
+        state_file = tmp_path / "project_state.json"
         project_a = tmp_path / "a"
         project_b = tmp_path / "b"
         project_a.mkdir()
@@ -211,7 +239,7 @@ class TestStateFile:
             validator.validate_path(str(file_a))
 
     def test_null_clears_project_root(self, tmp_path, monkeypatch):
-        state_file = tmp_path / "active_project.json"
+        state_file = tmp_path / "project_state.json"
         project = tmp_path / "project"
         project.mkdir()
         schematic = project / "board.kicad_sch"
@@ -226,8 +254,46 @@ class TestStateFile:
             validator.validate_path(str(schematic))
         assert validator._project_root is None
 
-    def test_malformed_json_keeps_previous_root(self, tmp_path, monkeypatch):
-        state_file = tmp_path / "active_project.json"
+    def test_type_error_clears_project_root(self, tmp_path, monkeypatch):
+        state_file = tmp_path / "project_state.json"
+        project = tmp_path / "project"
+        project.mkdir()
+        schematic = project / "board.kicad_sch"
+        schematic.write_text("", encoding="utf-8")
+
+        _write_state(str(state_file), str(project))
+        validator = _make_state_validator(monkeypatch, str(state_file))
+        assert validator.validate_path(str(schematic), must_exist=True) == str(schematic)
+
+        payload = {
+            "version": 2,
+            "written_at": "2026-11-17T09:12:33Z",
+            "project_root": 123,
+            "profile_file": "board.kicad_pro",
+            "pcb_files": [],
+            "schematic_files": [],
+        }
+        state_file.write_text(json.dumps(payload), encoding="utf-8")
+        with pytest.raises(PathValidationError):
+            validator.validate_path(str(schematic))
+        assert validator._project_root is None
+        assert validator.validate_path(_inside_kicad_user_dir("x.kicad_pcb"))
+
+    def test_unknown_fields_do_not_clear_the_root(self, tmp_path, monkeypatch):
+        state_file = tmp_path / "project_state.json"
+        project = tmp_path / "project"
+        project.mkdir()
+        schematic = project / "board.kicad_sch"
+        schematic.write_text("", encoding="utf-8")
+
+        _write_state(str(state_file), str(project), future_field={"anything": True})
+        validator = _make_state_validator(monkeypatch, str(state_file))
+
+        assert validator.validate_path(str(schematic), must_exist=True) == str(schematic)
+        assert validator._project_root == os.path.realpath(project)
+
+    def test_malformed_json_clears_project_root(self, tmp_path, monkeypatch):
+        state_file = tmp_path / "project_state.json"
         project = tmp_path / "project"
         project.mkdir()
         schematic = project / "board.kicad_sch"
@@ -240,12 +306,14 @@ class TestStateFile:
         with open(state_file, "w", encoding="utf-8") as f:
             f.write("{not json")
 
-        # Re-read fails -> previous root kept, no exception escapes.
-        assert validator.validate_path(str(schematic), must_exist=True) == str(schematic)
-        assert validator._project_root == os.path.realpath(project)
+        # An invalid record clears the project root; only static roots remain.
+        with pytest.raises(PathValidationError):
+            validator.validate_path(str(schematic))
+        assert validator._project_root is None
+        assert validator.validate_path(_inside_kicad_user_dir("x.kicad_pcb"))
 
-    def test_missing_state_file_keeps_previous_root(self, tmp_path, monkeypatch):
-        state_file = tmp_path / "active_project.json"
+    def test_missing_state_file_clears_project_root(self, tmp_path, monkeypatch):
+        state_file = tmp_path / "project_state.json"
         project = tmp_path / "project"
         project.mkdir()
         schematic = project / "board.kicad_sch"
@@ -256,10 +324,13 @@ class TestStateFile:
         assert validator.validate_path(str(schematic), must_exist=True) == str(schematic)
 
         os.unlink(state_file)
-        assert validator.validate_path(str(schematic), must_exist=True) == str(schematic)
+        with pytest.raises(PathValidationError):
+            validator.validate_path(str(schematic))
+        assert validator._project_root is None
+        assert validator.validate_path(_inside_kicad_user_dir("x.kicad_pcb"))
 
-    def test_state_file_pointing_at_regular_file_keeps_previous_root(self, tmp_path, monkeypatch):
-        state_file = tmp_path / "active_project.json"
+    def test_state_file_pointing_at_regular_file_clears_previous_root(self, tmp_path, monkeypatch):
+        state_file = tmp_path / "project_state.json"
         project = tmp_path / "project"
         project.mkdir()
         schematic = project / "board.kicad_sch"
@@ -271,15 +342,16 @@ class TestStateFile:
         validator = _make_state_validator(monkeypatch, str(state_file))
         assert validator.validate_path(str(schematic), must_exist=True) == str(schematic)
 
-        # The published contract is a directory; a .kicad_pro file is refused.
+        # The published contract is a directory; a .kicad_pro is invalid and
+        # clears the root instead of keeping the old one.
         _write_state(str(state_file), str(project_file))
-        assert validator.validate_path(str(schematic), must_exist=True) == os.path.realpath(
-            schematic
-        )
-        assert validator._project_root == os.path.realpath(project)
+        with pytest.raises(PathValidationError):
+            validator.validate_path(str(schematic))
+        assert validator._project_root is None
+        assert validator.validate_path(_inside_kicad_user_dir("x.kicad_pcb"))
 
     def test_state_file_pointing_at_regular_file_with_no_previous_root(self, tmp_path, monkeypatch):
-        state_file = tmp_path / "active_project.json"
+        state_file = tmp_path / "project_state.json"
         project = tmp_path / "project"
         project.mkdir()
         schematic = project / "board.kicad_sch"
@@ -297,11 +369,9 @@ class TestStateFile:
         assert validator.validate_path(_inside_kicad_user_dir("x.kicad_pcb"))
 
     @pytest.mark.parametrize("error_cls", [OSError, ValueError], ids=["oserror", "valueerror"])
-    def test_realpath_failure_after_state_read_never_escapes(
-        self, tmp_path, monkeypatch, error_cls
-    ):
-        """A filesystem change during refresh keeps the root; validate_path does not raise."""
-        state_file = tmp_path / "active_project.json"
+    def test_realpath_failure_clears_project_root(self, tmp_path, monkeypatch, error_cls):
+        """A filesystem failure while resolving a valid record clears the root."""
+        state_file = tmp_path / "project_state.json"
         project_a = tmp_path / "a"
         project_b = tmp_path / "b"
         project_a.mkdir()
@@ -312,7 +382,6 @@ class TestStateFile:
         _write_state(str(state_file), str(project_a))
         validator = _make_state_validator(monkeypatch, str(state_file))
         assert validator.validate_path(str(file_a), must_exist=True) == str(file_a)
-        previous = validator._project_root
 
         _write_state(str(state_file), str(project_b))
 
@@ -321,19 +390,15 @@ class TestStateFile:
 
         monkeypatch.setattr(path_validator_mod, "_normalize", broken_normalize)
 
-        assert validator.validate_path(str(file_a), must_exist=True) == str(file_a)
-        assert validator._project_root == previous
+        with pytest.raises(PathValidationError):
+            validator.validate_path(str(file_a), must_exist=True)
+        assert validator._project_root is None
+        assert validator.validate_path(_inside_kicad_user_dir("x.kicad_pcb"))
 
     @pytest.mark.parametrize("error_cls", [OSError, ValueError], ids=["oserror", "valueerror"])
-    def test_no_second_resolution_when_installing_state_root(
-        self, tmp_path, monkeypatch, error_cls
-    ):
-        """The state value is resolved once; a failure while installing it is guarded.
-
-        Under the old two-realpath design the second resolution raised out of
-        validate_path when the filesystem changed between the calls.
-        """
-        state_file = tmp_path / "active_project.json"
+    def test_install_failure_clears_project_root(self, tmp_path, monkeypatch, error_cls):
+        """The state value is resolved once; a failed install clears the root."""
+        state_file = tmp_path / "project_state.json"
         project_a = tmp_path / "a"
         project_b = tmp_path / "b"
         project_a.mkdir()
@@ -344,7 +409,6 @@ class TestStateFile:
         _write_state(str(state_file), str(project_a))
         validator = _make_state_validator(monkeypatch, str(state_file))
         assert validator.validate_path(str(file_a), must_exist=True) == str(file_a)
-        previous = validator._project_root
 
         _write_state(str(state_file), str(project_b))
         calls = {"n": 0}
@@ -356,15 +420,18 @@ class TestStateFile:
                 raise error_cls("second resolution failed")
             return real_normalize(path)
 
-        def failing_install(_self, _normalized):
-            raise error_cls("filesystem changed while installing the root")
+        def failing_install(_self, normalized):
+            if normalized is not None:
+                raise error_cls("filesystem changed while installing the root")
 
         monkeypatch.setattr(path_validator_mod, "_normalize", normalize_that_fails_on_second_call)
         monkeypatch.setattr(PathValidator, "_install_root", failing_install)
 
-        assert validator.validate_path(str(file_a), must_exist=True) == str(file_a)
-        assert validator._project_root == previous
+        with pytest.raises(PathValidationError):
+            validator.validate_path(str(file_a), must_exist=True)
+        assert validator._project_root is None
         assert calls["n"] == 1
+        assert validator.validate_path(_inside_kicad_user_dir("x.kicad_pcb"))
 
 
 class TestContainment:

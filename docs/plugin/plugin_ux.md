@@ -49,11 +49,12 @@ The plugin opens as a KiCad action panel (docked or floating) with three zones:
 - Previous conversation is preserved in the panel scroll
 
 ### 3.2 Context injection
-Before sending to the LLM, the plugin silently prepends:
-- Active project path
-- Active schematic file path
-- Active editor type (schematic / PCB)
-- Currently selected component references (if any)
+Before sending to the LLM, the plugin silently prepends the canonical project
+record:
+- Project root and project file (absolute)
+- Every schematic file under the project root (absolute)
+- Every PCB file under the project root (absolute)
+- No "current" file: the record does not know which editor has focus
 
 The engineer does not see this context payload; it is added automatically.
 

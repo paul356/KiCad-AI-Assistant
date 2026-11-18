@@ -16,101 +16,98 @@ import datetime
 import json
 import logging
 import os
-import tempfile
 import threading
-import time
 from typing import Any
 
-from ..server_manager import ACTIVE_PROJECT_STATE_FILENAME
+from .. import project_state as _pstate
+from ..project_resolution import find_project_file
 from .colors import ERR_HEX, WARN_HEX
 from .stream_events import apply_stream_event, make_ai_entry
 
 log = logging.getLogger(__name__)
 
-# Windows: the server may hold the state file open for the instant it reads
-# it, so os.replace can transiently fail with PermissionError. Retry briefly
-# before giving up (the caller logs and keeps serving without the switch).
-_REPLACE_ATTEMPTS = 5
-_REPLACE_RETRY_DELAY_S = 0.05
-
-# Consecutive empty project probes before the published root is cleared. Two
-# ticks debounce the empty window during a project switch.
-_PROJECT_GONE_TICKS = 2
+# Project watch: poll the open board every second; rescan the project tree
+# only every fifth tick.  A project switch is noticed on the next tick, a new
+# or removed sub-sheet within five ticks.
+_PROJECT_TICK_MS = 1000
+_PROJECT_SCAN_TICKS = 5
 
 
-def _project_root_for_publish(active_project: str | None) -> str | None:
-    """Directory to publish for *active_project*.
+def _same_project_content(left: dict, right: dict) -> bool:
+    """Compare two state records ignoring the ``written_at`` stamp."""
+    return {k: v for k, v in left.items() if k != "written_at"} == {
+        k: v for k, v in right.items() if k != "written_at"
+    }
 
-    ``active_project`` is the absolute path of the open ``.kicad_pro`` **file**
-    (panel probe, context bridge and session store all use the file path); the
-    trust root is its parent directory. ``None`` publishes ``null``.
+
+def _take_autoroute_snapshot(
+    board_path: str, base_url: str, call_tool, state_file: str | None = None
+) -> tuple[str, str | None]:
+    """Snapshot the project before FreeRouting touches the board.
+
+    Returns ``(backup_path, error)``.  Any failure to save the snapshot —
+    unresolvable project, unavailable include list, or a failing MCP call —
+    yields an actionable *error* and the caller aborts before launching the
+    router, matching the fail-closed pre-edit path.
     """
-    return os.path.dirname(active_project) if active_project else None
+    if not board_path or not os.path.isfile(board_path):
+        return "", (
+            f"Auto Route needs the board saved to disk first: "
+            f"{board_path or '(unsaved board)'}. Save the .kicad_pcb file, "
+            "then retry."
+        )
 
+    from ..llm_client import (
+        ProjectSnapshotUnavailable,
+        _resolve_project,
+        _snapshot_include_files,
+    )
 
-def _project_state_for_tick(
-    active_project: str | None, none_ticks: int, probed_project: str | None
-) -> tuple[int, str | None, bool]:
-    """Decide what one project-watch tick publishes.
-
-    Returns ``(none_ticks, root_to_publish, should_publish)``. A detected
-    switch publishes nothing here — the caller also reloads the session and
-    publishes after updating ``_active_project``.
-
-    A probe that is empty two ticks in a row means the project was closed:
-    publish ``null`` (the panel keeps the last project for session stamps).
-    When a project reappears after that, republish its root.
-    """
-    if probed_project is None:
-        none_ticks += 1
-        if none_ticks == _PROJECT_GONE_TICKS and active_project is not None:
-            return none_ticks, None, True
-        return none_ticks, None, False
-
-    if probed_project == active_project:
-        # Republish only if the previous tick(s) cleared the published root.
-        if none_ticks >= _PROJECT_GONE_TICKS:
-            return 0, _project_root_for_publish(active_project), True
-        return 0, None, False
-
-    return 0, None, False
-
-
-def _write_active_project_state(config_dir: str, project_root: str | None) -> str:
-    """Atomically publish the open project root for the MCP server.
-
-    Writes ``<config_dir>/active_project.json`` with
-    ``{"project_root": "<abs path>"}`` (or ``null`` when no project is open)
-    through a temp file in the same directory followed by ``os.replace``, so
-    the server never observes a partially written file. ``os.replace`` is
-    retried briefly on ``PermissionError`` (a reader may hold the file open on
-    Windows). The server re-reads the file on each path validation and
-    re-points its trust root in place.
-
-    Returns the state-file path.
-    """
-    os.makedirs(config_dir, exist_ok=True)
-    path = os.path.join(config_dir, ACTIVE_PROJECT_STATE_FILENAME)
-    fd, tmp_path = tempfile.mkstemp(prefix=".active_project_", suffix=".json", dir=config_dir)
+    project_path, project_error = _resolve_project(board_path, state_file)
+    if project_path is None:
+        return "", (
+            project_error
+            or (
+                f"Auto Route needs a KiCad project before routing: no .kicad_pro "
+                f"found for {board_path!r}. Save or create a project alongside the "
+                "board (File → Save Project), then retry."
+            )
+        )
     try:
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
-            json.dump({"project_root": project_root}, f)
-            f.write("\n")
-        for attempt in range(_REPLACE_ATTEMPTS):
-            try:
-                os.replace(tmp_path, path)
-                break
-            except PermissionError:
-                if attempt == _REPLACE_ATTEMPTS - 1:
-                    raise
-                time.sleep(_REPLACE_RETRY_DELAY_S)
-    except BaseException:
-        try:
-            os.unlink(tmp_path)
-        except OSError:
-            pass
-        raise
-    return path
+        include_files = _snapshot_include_files(project_path, board_path, state_file)
+    except ProjectSnapshotUnavailable as exc:
+        log.warning("autoroute: project snapshot unavailable: %s", exc)
+        return "", str(exc)
+    try:
+        result = call_tool(
+            base_url,
+            "save_project_version",
+            {
+                "project_file": project_path,
+                "include_files": include_files,
+            },
+        )
+    except Exception as exc:  # noqa: BLE001 -- report instead of crashing the UI
+        log.warning("autoroute: version snapshot failed: %s", exc)
+        return "", f"Auto Route could not save a project snapshot before routing: {exc}"
+    if not isinstance(result, dict):
+        return "", (
+            "Auto Route could not save a project snapshot before routing: "
+            "the server returned an invalid result."
+        )
+    if result.get("success") is False or "error" in result:
+        detail = result.get("error") or "the server reported failure"
+        log.warning("autoroute: version snapshot failed: %s", detail)
+        return "", f"Auto Route could not save a project snapshot before routing: {detail}"
+    archive_path = result.get("archive_path")
+    if not archive_path:
+        log.warning("autoroute: version snapshot returned no archive path")
+        return "", (
+            "Auto Route could not save a project snapshot before routing: "
+            "the server returned no archive path."
+        )
+    log.info("autoroute: project version snapshot saved to %s", archive_path)
+    return archive_path, None
 
 
 try:
@@ -365,8 +362,11 @@ if _WX_AVAILABLE:
             # Project-scoped session watch: tracks the open KiCad project so
             # switching projects can re-offer that project's saved sessions
             # (same flow as startup auto-restore). Started by _init_llm_client.
-            self._active_project: str | None = None
-            self._project_none_ticks = 0
+            # _published is the last valid record this panel wrote; it drives change
+            # detection and is the session-stamp fallback when the state file
+            # is unreadable.
+            self._published: dict | None = None
+            self._ticks_until_scan: int = 0
             self._project_watch_timer = wx.Timer(self)
             # Version-based dirty tracking: _conv_version bumps on every
             # conversation mutation; saves skip the write when the last
@@ -834,12 +834,20 @@ if _WX_AVAILABLE:
                 from ..llm_client import LLMClient
 
                 self._llm_client = LLMClient(self._settings, self._server_mgr.base_url)
-                self._autoload_session()
+                # Publish this run's project record first so auto-restore
+                # judges the session against the project that is open now.
+                # A failed probe must not restore a stale session: only a
+                # record written this run permits auto-restore.
+                record = self._write_project_state()
+                if record is not None:
+                    self._autoload_session()
                 self._start_project_watch()
-                # Auto-sync the footprint index for the current project
-                # (deferred until the backend is up if needed).
-                if self._active_project:
-                    self._request_footprint_sync(self._active_project)
+                # Auto-sync the footprint index for this run's project.  Use
+                # the record written above, not a fresh disk read: a failed
+                # probe must not sync a stale project.
+                project_file = _pstate.project_file_path(record)
+                if project_file:
+                    self._request_footprint_sync(project_file)
             except Exception as e:
                 import traceback
 
@@ -861,24 +869,32 @@ if _WX_AVAILABLE:
                 self._init_llm_client()
             elif event.IsShown():
                 try:
-                    project = self._collect_active_project()
+                    # Probe and publish this display's record first.  Only a
+                    # record written in this run may drive auto-restore; a
+                    # stale on-disk record (or no board) never restores a
+                    # session from another project.
+                    project = self._probe_project()
+                    published_project = _pstate.project_file_path(self._published)
+                    record = self._write_project_state(project) if project is not None else None
+                    current_project = _pstate.project_file_path(record)
                     log.debug(
-                        "panel show: probe=%r active=%r busy=%r",
-                        project,
-                        self._active_project,
+                        "panel show: current=%r published=%r busy=%r",
+                        current_project,
+                        published_project,
                         self._busy,
                     )
-                    if project is not None and project != self._active_project and not self._busy:
+                    if (
+                        current_project is not None
+                        and current_project != published_project
+                        and not self._busy
+                    ):
                         log.info(
                             "panel show: project re-sync %r -> %r; re-running restore flow",
-                            self._active_project,
-                            project,
+                            published_project,
+                            current_project,
                         )
-                        self._active_project = project
-                        self._project_none_ticks = 0
-                        self._publish_active_project()
                         self._autoload_session(prompt_if_missing=True)
-                        self._request_footprint_sync(project)
+                        self._request_footprint_sync(current_project)
                 except Exception:
                     log.debug("project re-sync on panel show failed", exc_info=True)
             if event.IsShown() and not self._recovery_checked:
@@ -1149,11 +1165,11 @@ if _WX_AVAILABLE:
             self._cancel_event = threading.Event()
             self._toggle_send_stop(busy=True)
 
-            from ..context_bridge import collect_context, context_to_system_prompt_block
+            from ..context_bridge import context_to_system_prompt_block
 
             if kind == "chat":
-                ctx = collect_context()
-                context_block = context_to_system_prompt_block(ctx)
+                state = _pstate.read_state(self._state_path())
+                context_block = context_to_system_prompt_block(state)
             else:
                 log.info("_send_request(tool_direct): %s", payload.get("name"))
 
@@ -2882,6 +2898,20 @@ if _WX_AVAILABLE:
 
             # ---- 2. Read design rules for constraint pass-through ----
             board_path = board.GetFileName()
+            if not board_path or not os.path.isfile(board_path):
+                self._append_entry(
+                    {
+                        "type": "status",
+                        "text": (
+                            "⚠ Auto Route needs the board saved to disk first: "
+                            f"{board_path or '(unsaved board)'}. Save the .kicad_pcb "
+                            "file, then retry."
+                        ),
+                        "color_hex": self._C_WARN_HEX,
+                    }
+                )
+                self._render_conversation()
+                return
             constraint_hint = ""
             if board_path and os.path.isfile(board_path):
                 try:
@@ -2960,22 +2990,25 @@ if _WX_AVAILABLE:
             ses_path = os.path.join(tmp_dir, "board.ses")
 
             # ---- Take a version snapshot via MCP tool before routing ----
-            board_path = board.GetFileName()
-            backup_path = ""
-            if board_path and os.path.isfile(board_path):
-                try:
-                    from ..llm_client import _project_path_for, call_mcp_tool
+            from ..llm_client import call_mcp_tool
 
-                    result = call_mcp_tool(
-                        self._server_mgr.base_url,
-                        "save_project_version",
-                        {"project_file": _project_path_for(board_path)},
-                    )
-                    backup_path = result.get("archive_path", "")
-                    log.info("autoroute: project version snapshot saved to %s", backup_path)
-                except Exception as exc:
-                    log.warning("autoroute: version snapshot failed: %s", exc)
-                    backup_path = ""
+            backup_path, snapshot_error = _take_autoroute_snapshot(
+                board_path,
+                self._server_mgr.base_url,
+                call_mcp_tool,
+                self._state_path(),
+            )
+            if snapshot_error:
+                shutil.rmtree(tmp_dir, ignore_errors=True)
+                self._append_entry(
+                    {
+                        "type": "status",
+                        "text": f"⚠ {snapshot_error}",
+                        "color_hex": self._C_WARN_HEX,
+                    }
+                )
+                self._render_conversation()
+                return
 
             try:
                 _pcbnew.ExportSpecctraDSN(board, dsn_path)
@@ -3155,8 +3188,8 @@ if _WX_AVAILABLE:
             Shared by the New Session button and the "New session" entry in
             the project session picker.  The picker path passes
             ``save_first=False``: its session content is already persisted
-            turn-by-turn, and stamping it with the *new* ``_active_project``
-            would rewrite the old project's file ownership.
+            turn-by-turn, and stamping it with the *new* project would rewrite the
+            old project's file ownership.
             """
             saved_previous = False
             if save_first:
@@ -3248,9 +3281,9 @@ if _WX_AVAILABLE:
 
             Sessions are stamped with the currently open KiCad project
             (schema v2), so a session never silently leaks into a different
-            project.  The stamp is the project watch's last-confirmed project
-            (``_active_project``), not a live probe: at teardown KiCad is
-            already exiting and ``pcbnew``/window-title probes return None,
+            project.  The stamp is the project file derived from the record
+            this panel last published — not a live probe: at teardown KiCad
+            is already exiting and ``pcbnew`` no longer returns a board,
             which would clobber the session's project ownership (issue #108).
 
             If ``_current_session_file`` is already set the existing file is
@@ -3285,10 +3318,11 @@ if _WX_AVAILABLE:
                 ts = datetime.datetime.now().strftime("%Y%m%dT%H%M%S")
                 filename = f"session_{ts}.json"
                 self._current_session_file = filename
+            project_stamp = self._session_project_path()
             log.info(
                 "save session: file=%s stamp=%r (conv_version=%d saved=%d)",
                 filename,
-                self._active_project,
+                project_stamp,
                 self._conv_version,
                 self._saved_conv_version,
             )
@@ -3299,7 +3333,7 @@ if _WX_AVAILABLE:
                     if self._llm_client
                     else []
                 ),
-                self._active_project,
+                project_stamp,
                 (self._llm_client.get_enabled_tools() if self._llm_client else []),
             )
             err = _sstore.save_session(self._settings.config_dir, filename, payload)
@@ -3321,7 +3355,7 @@ if _WX_AVAILABLE:
                 return
 
             files = _sstore.list_loadable_sessions(
-                self._settings.config_dir, self._collect_active_project()
+                self._settings.config_dir, self._current_project_path()
             )
             if not files:
                 wx.MessageBox(
@@ -3401,136 +3435,143 @@ if _WX_AVAILABLE:
             self.Layout()
             return True
 
-        def _collect_active_project(self) -> str | None:
-            """Absolute path of the currently open .kicad_pro, or None.
+        def _state_path(self) -> str:
+            """Canonical project-state file path for this plugin install."""
+            return _pstate.state_path(self._settings.config_dir)
 
-            Primary source: pcbnew.GetBoard() — only non-empty once a board
-            is loaded in the PCB Editor.  Fallback: KiCad top-level window
-            titles, which name the project/board/schematic path even while
-            GetBoard() is still settling (e.g. right after opening a project
-            or when only the project manager is open).
+        def _current_project_path(self) -> str | None:
+            """Absolute ``.kicad_pro`` path from the published record, or None.
+
+            This path has no live probe and no in-memory fallback.  A missing,
+            corrupt, ``null`` or otherwise invalid record means "no project"
+            for session restore, the Load dialog and the context block.
+            Session stamps use :meth:`_session_project_path`, which has its
+            own narrow fallback.
+            """
+            state = _pstate.read_state(self._state_path())
+            return _pstate.project_file_path(state)
+
+        def _session_project_path(self) -> str | None:
+            """Project stamp for a saved session.
+
+            The canonical state file is authoritative.  Only when it is
+            missing or unreadable does the session stamp fall back to the
+            record this panel last published — it survives teardown, when
+            pcbnew no longer returns a board.
+            """
+            state = _pstate.read_state(self._state_path())
+            if state is not None:
+                return _pstate.project_file_path(state)
+            return _pstate.project_file_path(self._published)
+
+        def _probe_project(self) -> str | None:
+            """Absolute ``.kicad_pro`` path of the open board, or None.
+
+            Write path only: ``pcbnew.GetBoard()`` followed by the upward
+            project search.  A failed probe changes no state and triggers no
+            write.
             """
             try:
-                from ..context_bridge import collect_context, project_path_from_title
-
-                proj = collect_context().get("active_project")
-                if proj:
-                    return proj
-                for w in wx.GetTopLevelWindows():
-                    title = w.GetTitle()
-                    if not title:
-                        continue
-                    p = project_path_from_title(title)
-                    if p:
-                        log.debug("project from window title %r -> %s", title, p)
-                        return p
+                import pcbnew
+            except ImportError:
+                return None
+            try:
+                board = pcbnew.GetBoard()
+                if not board:
+                    return None
+                board_path = board.GetFileName()
+                if not board_path:
+                    return None
+                return find_project_file(os.path.abspath(board_path))
             except Exception:
-                log.debug("_collect_active_project failed", exc_info=True)
-            return None
+                log.debug("_probe_project failed", exc_info=True)
+                return None
 
-        def _publish_project_state(self, project_root: str | None) -> None:
-            """Write the published project root, never breaking the panel."""
-            try:
-                _write_active_project_state(self._settings.config_dir, project_root)
-            except OSError as e:
-                log.warning("Could not publish active project state: %s", e)
+        def _write_project_state(self, project_file: str | None = None) -> dict | None:
+            """Scan, validate and atomically publish the open project record.
 
-        def _publish_active_project(self) -> None:
-            """Publish the active project's directory for the path validator.
-
-            ``_active_project`` is the ``.kicad_pro`` file; the trust root is
-            its parent directory. No project publishes ``null``.
+            Returns the record now in effect, or None when nothing can be
+            published (no probe result, vanished project file, failed write).
+            The state file is never touched when an invalid record would
+            result, nor when the scanned content matches the record already
+            on disk (so an idle project does not churn its mtime); a state
+            file deleted externally is recreated on the next scan.
             """
-            self._publish_project_state(_project_root_for_publish(self._active_project))
+            project_file = project_file or self._probe_project()
+            if project_file is None:
+                return None
+            record = _pstate.build_record(project_file)
+            if record is None:
+                return None
+            # Compare with what is actually on disk, not with the in-memory
+            # mirror: the state file may have been deleted or replaced
+            # externally, in which case this probe recreates it.
+            published = _pstate.read_state(self._state_path())
+            if published is not None and _same_project_content(record, published):
+                self._published = published
+                return published
+            try:
+                written = _pstate.write_state(self._state_path(), record)
+            except OSError as exc:
+                log.warning("Could not publish project state: %s", exc)
+                return None
+            if not written:
+                return None
+            self._published = record
+            return record
 
         def _start_project_watch(self) -> None:
             """Start polling for KiCad project switches (1 s interval).
 
-            The first snapshot is taken here — after auto-restore — so the
-            watcher only reacts to *later* project changes, never to the
-            project already active at startup.
+            The state file was already written by ``_init_llm_client``; the
+            watcher only reacts to *later* project changes.  Scanning the
+            project tree is throttled to every fifth tick.
             """
             if not self._project_watch_timer:
                 return
-            self._active_project = self._collect_active_project()
-            self._project_none_ticks = 0
-            self._publish_active_project()
-            log.info(
-                "project watch started: active=%r",
-                self._active_project,
-            )
-            self._project_watch_timer.Start(
-                1000
-            )  # 1 s poll: project switch is noticed quickly once a board signal is available
+            self._ticks_until_scan = _PROJECT_SCAN_TICKS if self._published else 0
+            log.info("project watch started: published=%r", self._published)
+            self._project_watch_timer.Start(_PROJECT_TICK_MS)
 
         def _on_project_watch_tick(self, event) -> None:
-            """Close this panel when the open KiCad project changes.
+            """Keep the published project record current.
 
-            The panel binds to the project that was active at startup; when
-            the project switches (or the board/project is closed), this
-            instance is stale.  Tear it down — including its MCP server —
-            instead of lingering; the panel opened in the new project
-            auto-restores the right session on first display.
-
-            A switch is acted on as soon as the probe returns a different
-            non-None project.  A single None reading (mid-switch GetBoard()
-            empty, window-title fallback missing) is ignored; two in a row
-            publish ``null`` so the server stops trusting a closed project,
-            while ``_active_project`` is kept for session stamps.
+            Every tick probes the open board.  A failed probe changes nothing:
+            no scan, no write, no counter movement (the next tick that sees a
+            board resumes normally).  When the project changed or the scan
+            countdown expired, the project tree is rescanned and the record
+            written only if its content differs.  A switch runs the session
+            restore flow once.
             """
             if not self.IsShown():
-                # Panel dismissed: stay silent — no session dialogs from a
-                # hidden frame.  The snapshot resyncs on the next Show
-                # (_on_panel_show), so a project switched while hidden is
-                # applied exactly once, when the user looks at the panel.
+                # Panel dismissed: stay silent.  The tick resumes when the
+                # panel is shown again; a switch made while hidden is applied
+                # then, within one tick.
                 return
             if self._busy:
-                log.debug(
-                    "project watch: busy — skip project poll (active=%r)",
-                    self._active_project,
-                )
+                log.debug("project watch: busy — skip project poll")
                 return
-            project = self._collect_active_project()
-            ticks, publish_root, should_publish = _project_state_for_tick(
-                self._active_project, self._project_none_ticks, project
-            )
-            self._project_none_ticks = ticks
+            project = self._probe_project()
             if project is None:
-                # Probing failed (GetBoard empty / no window-title match) —
-                # e.g. mid-project-switch.  A single empty probe is ignored so
-                # session saves keep their project stamp (issue #108); two in
-                # a row mean the project was closed, so the published trust
-                # root is cleared while _active_project is kept.
-                if should_publish:
-                    log.info("project watch: no project open; clearing published root")
-                    self._publish_project_state(None)
-                log.debug(
-                    "project watch: probe returned None — keeping active=%r",
-                    self._active_project,
-                )
+                log.debug("project watch: no project — no scan, no write")
                 return
-            if project == self._active_project:
-                # Reopened after the published root was cleared.
-                if should_publish:
-                    self._publish_project_state(publish_root)
+            changed = project != _pstate.project_file_path(self._published)
+            self._ticks_until_scan -= 1
+            if not (changed or self._ticks_until_scan <= 0):
                 return
-            log.info(
-                "Project switch detected: %s -> %s; switching session",
-                self._active_project,
-                project,
-            )
-            self._active_project = project
-            self._publish_active_project()
-            # Keep this panel open and re-run the startup restore flow for
-            # the new project: matching current.json is restored in place,
-            # otherwise the new project's sessions are offered.  Never
-            # Destroy() the window — on a top-level wx.Frame that behaves as
-            # a forced Close and cascaded into closing KiCad's project
-            # windows.
-            self._autoload_session(prompt_if_missing=True)
-            # Refresh the footprint index for the newly active project so
-            # find_footprints_not_in_libraries never reads a stale DB.
-            self._request_footprint_sync(project)
+            record = self._write_project_state(project)
+            self._ticks_until_scan = _PROJECT_SCAN_TICKS
+            if changed and record is not None:
+                log.info("Project switch detected: %r; switching session", project)
+                # Keep this panel open and re-run the startup restore flow
+                # for the new project: matching current.json is restored in
+                # place, otherwise the new project's sessions are offered.
+                # Never Destroy() the window — on a top-level wx.Frame that
+                # behaves as a forced Close and closed KiCad's windows.
+                self._autoload_session(prompt_if_missing=True)
+                # Refresh the footprint index for the newly active project so
+                # find_footprints_not_in_libraries never reads a stale DB.
+                self._request_footprint_sync(project)
 
         def _prompt_project_session_choice(self, project_path: str | None) -> None:
             """Offer the open project's saved sessions after a skip.
@@ -3754,7 +3795,7 @@ if _WX_AVAILABLE:
             path = _sstore.resolve_current_session(self._settings.config_dir)
             if path is None:
                 if prompt_if_missing:
-                    self._prompt_project_session_choice(self._collect_active_project())
+                    self._prompt_project_session_choice(self._current_project_path())
                 return  # No current.json and no sessions dir — blank start.
 
             data, err = _sstore.load_session(path)
@@ -3762,7 +3803,7 @@ if _WX_AVAILABLE:
                 log.warning("Auto-load failed: %s (%s)", path, err)
                 return
 
-            current_project = self._collect_active_project()
+            current_project = self._current_project_path()
 
             # Legacy v1 sessions and sessions of other projects must not leak
             # into the open project — skip and offer project sessions instead.

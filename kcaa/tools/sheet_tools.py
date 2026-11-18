@@ -16,6 +16,8 @@ import uuid
 
 from fastmcp import Context, FastMCP
 
+from kcaa.utils.file_utils import load_project_json
+from kcaa.utils.project_resolution import find_project_file, project_name
 from kcaa.utils.skip_compat import safe_schematic
 
 log = logging.getLogger(__name__)
@@ -143,22 +145,364 @@ def _has_position_conflict(
 
 
 # ---------------------------------------------------------------------------
-# S-expression helpers for manual sheet construction
+# S-expression helpers for canonical sheet data
 # ---------------------------------------------------------------------------
 
+# Top-level sections KiCad writes after all schematic items.  Root schematics
+# carry both; child schematics carry neither, so new items must be inserted
+# before them rather than appended.
+_ROOT_ONLY_SECTIONS = frozenset({"sheet_instances", "embedded_fonts"})
 
-def _sexp_line_uuid(tag: str, u: str, indent: int = 2) -> str:
-    return f'{" " * indent}({tag} "{u}")'
+
+def _tag_of(node: Any) -> str | None:
+    """Return the leading symbol of an S-expression node, if it has one."""
+    import sexpdata
+
+    if isinstance(node, list) and node and isinstance(node[0], sexpdata.Symbol):
+        return node[0].value()
+    return None
 
 
-def _sexp_property(name: str, value: str, indent: int = 2) -> str:
-    return (
-        f'{" " * indent}(property "{name}" "{value}"'
-        f" (at 0 0 0)"
-        f" (show_name no)"
-        f" (do_not_autoplace yes)"
-        f" (effects (font (size 1.27 1.27)) (justify left)))"
+def _property_key(name: Any) -> str:
+    """Normalise a sheet property name: ``Sheetname`` and ``Sheet name`` match."""
+    if not isinstance(name, str):
+        return ""
+    return name.replace(" ", "").replace("_", "").lower()
+
+
+def _load_schematic_tree(path: str) -> list:
+    """Parse *path* into its raw ``sexpdata`` tree."""
+    import sexpdata
+
+    with open(path, encoding="utf-8") as fh:
+        return sexpdata.loads(fh.read())
+
+
+def _try_load_schematic_tree(path: str) -> list | None:
+    """Parse *path*, returning ``None`` when the file is unusable.
+
+    Best-effort variant of :func:`_load_schematic_tree` for child sheets an
+    unrelated tool may have left missing or truncated.  ``OSError`` covers
+    missing/unreadable files, ``ValueError`` covers undecodable bytes
+    (``UnicodeDecodeError``), and the ``sexpdata`` parser reports unbalanced
+    or trailing input with its own exception types.
+    """
+    import sexpdata
+
+    try:
+        with open(path, encoding="utf-8") as fh:
+            content = fh.read()
+        if not content.strip():
+            return None
+        return sexpdata.loads(content)
+    except (
+        OSError,
+        ValueError,
+        AssertionError,  # sexpdata.loads asserts on empty parses
+        RecursionError,  # sexpdata recurses once per nesting level
+        sexpdata.ExpectClosingBracket,
+        sexpdata.ExpectNothing,
+        sexpdata.ExpectSExp,
+    ) as exc:
+        log.debug("Skipping unreadable child schematic %s: %s", path, exc)
+        return None
+
+
+def _is_root_schematic(tree: list) -> bool:
+    """Return True when *tree* belongs to a root schematic.
+
+    Only the project root records ``(sheet_instances (path "/" ...))``.
+    Children never carry that section in KiCad 10, but older kcaa releases
+    wrote ``(sheet_instances (path "/<file uuid>" ...))`` into every child,
+    so the root path itself must be checked rather than the section alone.
+    """
+    for node in tree:
+        if _tag_of(node) != "sheet_instances":
+            continue
+        for entry in node[1:]:
+            if _tag_of(entry) == "path" and len(entry) > 1 and entry[1] == "/":
+                return True
+    return False
+
+
+def _top_level_string(tree: list, tag: str) -> str | None:
+    """Return the string value of the first top-level ``(tag "...")`` node."""
+    for node in tree:
+        if _tag_of(node) == tag and len(node) > 1 and isinstance(node[1], str):
+            return node[1]
+    return None
+
+
+def _first_instance_path(sheet_node: list, project_name: str) -> str | None:
+    """Return the ``instances`` path recorded on a sheet node.
+
+    Prefers the ``project`` clause named *project_name* (the schematic stem),
+    since a file may carry clauses for several projects.  When no clause
+    matches, the first path in any clause is returned: the file itself does
+    not identify which clause belongs to it.
+    """
+    fallback: str | None = None
+    for child in sheet_node:
+        if _tag_of(child) != "instances":
+            continue
+        for project in child[1:]:
+            if _tag_of(project) != "project":
+                continue
+            for entry in project[1:]:
+                if _tag_of(entry) == "path" and len(entry) > 1 and isinstance(entry[1], str):
+                    if len(project) > 1 and project[1] == project_name:
+                        return entry[1]
+                    if fallback is None:
+                        fallback = entry[1]
+    return fallback
+
+
+def _sheet_file_from_node(sheet_node: list) -> str | None:
+    """Return the ``Sheetfile`` value of a sheet node (either spelling)."""
+    for child in sheet_node:
+        if (
+            _tag_of(child) == "property"
+            and len(child) > 2
+            and _property_key(child[1]) == "sheetfile"
+        ):
+            return child[2] if isinstance(child[2], str) else None
+    return None
+
+
+def _project_root_sheet_uuid(schematic_path: str) -> tuple[str | None, str | None]:
+    """Return ``(root_sheet_uuid, error)`` for *schematic_path*.
+
+    KiCad stores the project root sheet UUID in the project file
+    (``schematic.top_level_sheets[].uuid``), not in the schematic.  The
+    ``(uuid ...)`` at the top of a ``.kicad_sch`` is the screen/file UUID and
+    may legitimately differ from the root sheet UUID (which is what every
+    instance path in the hierarchy starts with).
+
+    ``(None, None)`` means no owning project file exists: the schematic is a
+    standalone document and the caller may fall back to its own UUID.  When
+    a project file exists but does not confirm this exact file (invalid JSON,
+    missing or empty ``top_level_sheets``, no matching entry, a matching
+    entry whose UUID is not a non-blank string without whitespace, or
+    several distinct matching UUIDs), the error names the file and the
+    reason, and the caller must write nothing.  A matched UUID is rejected
+    in three separate cases: it is blank after stripping, it differs from
+    its stripped form, or it contains whitespace anywhere.  The value is
+    never silently stripped.
+
+    Entries are matched by real path (with ``normcase`` for Windows): each
+    ``filename`` is resolved relative to the project directory, so files in
+    other directories with the same basename never claim each other.
+    """
+    project_file = find_project_file(schematic_path)
+    if not project_file:
+        return None, None
+
+    def fail(reason: str) -> tuple[None, str]:
+        return None, (
+            f"Cannot resolve the root sheet UUID for {os.path.basename(schematic_path)!r}: "
+            f"{reason}.  Nothing was written."
+        )
+
+    data = load_project_json(project_file)
+    if not isinstance(data, dict):
+        return fail(
+            f"the project file {os.path.basename(project_file)!r} could not be read "
+            "or is not valid JSON"
+        )
+
+    schematic = data.get("schematic")
+    if not isinstance(schematic, dict):
+        return fail(
+            f"the project file {os.path.basename(project_file)!r} has no 'schematic' object"
+        )
+
+    sheets = schematic.get("top_level_sheets")
+    if not isinstance(sheets, list) or not sheets:
+        return fail(
+            f"the project file {os.path.basename(project_file)!r} has no "
+            "'schematic.top_level_sheets' entries"
+        )
+
+    project_dir = os.path.dirname(project_file)
+    # normcase is identity on POSIX; on Windows it folds case and separators,
+    # so a project entry that differs only in letter case still matches.
+    target = os.path.normcase(os.path.realpath(schematic_path))
+    matches: list[str] = []
+    for entry in sheets:
+        if not isinstance(entry, dict):
+            continue
+        filename = entry.get("filename")
+        if not isinstance(filename, str):
+            continue
+        entry_path = os.path.normcase(os.path.realpath(os.path.join(project_dir, filename)))
+        if entry_path != target:
+            continue
+        entry_uuid = entry.get("uuid")
+        if (
+            not isinstance(entry_uuid, str)
+            or not entry_uuid.strip()
+            or entry_uuid != entry_uuid.strip()
+            or any(ch.isspace() for ch in entry_uuid)
+        ):
+            return fail(
+                f"its {os.path.basename(project_file)!r} 'schematic.top_level_sheets' "
+                "entry has no string 'uuid', or its 'uuid' is blank or contains whitespace"
+            )
+        matches.append(entry_uuid)
+
+    if not matches:
+        return fail(
+            f"the project file {os.path.basename(project_file)!r} does not list this "
+            "schematic in 'schematic.top_level_sheets'"
+        )
+
+    if len(set(matches)) > 1:
+        return fail(
+            f"the project file {os.path.basename(project_file)!r} lists more than one "
+            "distinct root sheet UUID for this schematic"
+        )
+
+    return matches[0], None
+
+
+def _resolve_sheet_parent_path(schematic_path: str, tree: list) -> tuple[str | None, str | None]:
+    """Resolve the instance path of the sheet that owns *schematic_path*.
+
+    For a root schematic this is ``"/" + <root sheet UUID>``.  The UUID is
+    taken from the owning project's ``top_level_sheets`` entry for this exact
+    file, because that is the value KiCad writes into every instance path.
+    Only a standalone schematic (no project file at all) falls back to the
+    file's own ``(uuid ...)``, then to an existing sibling sheet's
+    ``instances`` path (preferring the clause for this schematic's stem).  A
+    project file that exists but cannot confirm this schematic fails the
+    call instead of guessing.
+
+    KiCad always writes ``(uuid ...)`` into a saved schematic and assigns one
+    on load when it is missing, so a root with neither its own UUID nor an
+    existing sheet instance path is not a state KiCad produces.
+
+    Returns ``(path, error)``; exactly one of the two is set.  A child
+    schematic has no record of its enclosing sheet path, so it is rejected
+    instead of emitting a guessed path.
+    """
+    if not _is_root_schematic(tree):
+        return None, (
+            f"Cannot add a sheet to {os.path.basename(schematic_path)!r}: it is not the "
+            "project root (its (sheet_instances) section does not describe the '/' root "
+            "path), so the enclosing sheet path is unknown.  Add the sheet to the "
+            "project's root schematic instead."
+        )
+
+    project_uuid, project_error = _project_root_sheet_uuid(schematic_path)
+    if project_error:
+        return None, project_error
+    # The tri-state, not truthiness, decides: only (None, None) — no project
+    # file at all — reaches the standalone fallback.
+    if project_uuid is not None:
+        return "/" + project_uuid, None
+
+    root_uuid = _top_level_string(tree, "uuid")
+    if root_uuid:
+        return "/" + root_uuid, None
+
+    stem = os.path.splitext(os.path.basename(schematic_path))[0]
+    for node in tree:
+        if _tag_of(node) == "sheet":
+            instance_path = _first_instance_path(node, stem)
+            if instance_path:
+                return instance_path, None
+
+    return None, (
+        f"Cannot resolve the root sheet UUID for {os.path.basename(schematic_path)!r}: "
+        "the file has no (uuid ...) and no existing sheet instances, so the enclosing "
+        "sheet path cannot be determined.  Nothing was written."
     )
+
+
+def _collect_page_numbers(node: Any, pages: set[int]) -> None:
+    """Add every integer ``(page "...")`` value under *node* to *pages*."""
+    if not isinstance(node, list):
+        return
+    tag = _tag_of(node)
+    if tag == "page":
+        for value in node[1:]:
+            try:
+                pages.add(int(value))
+            except (TypeError, ValueError):
+                continue
+        return
+    for child in node[1:] if tag else node:
+        _collect_page_numbers(child, pages)
+
+
+def _collect_used_page_numbers(
+    schematic_path: str,
+    root_tree: list | None = None,
+    max_depth: int = 64,
+) -> set[int]:
+    """Collect page numbers already used anywhere in the sheet hierarchy.
+
+    Reads the root schematic plus every sheet schematic it references,
+    recursively.  Unreadable children are ignored (best effort).
+    """
+    pages: set[int] = set()
+    visited: set[str] = set()
+
+    def walk(path: str, tree: list, depth: int) -> None:
+        real = os.path.realpath(path)
+        if real in visited:
+            return
+        visited.add(real)
+        _collect_page_numbers(tree, pages)
+        if depth >= max_depth:
+            return
+        base_dir = os.path.dirname(os.path.abspath(path))
+        for node in tree:
+            if _tag_of(node) != "sheet":
+                continue
+            child_file = _sheet_file_from_node(node)
+            if not child_file:
+                continue
+            child_path = (
+                child_file if os.path.isabs(child_file) else os.path.join(base_dir, child_file)
+            )
+            child_tree = _try_load_schematic_tree(child_path)
+            if child_tree is None:
+                continue
+            walk(child_path, child_tree, depth + 1)
+
+    if root_tree is None:
+        try:
+            root_tree = _load_schematic_tree(schematic_path)
+        except Exception:  # caller reports parse errors elsewhere
+            return pages
+    walk(schematic_path, root_tree, 0)
+    return pages
+
+
+def _next_page_number(schematic_path: str, root_tree: list | None = None) -> int:
+    """Return the lowest positive page number unused in the project."""
+    used = _collect_used_page_numbers(schematic_path, root_tree)
+    page = 1
+    while page in used:
+        page += 1
+    return page
+
+
+def _insert_schematic_item(tree: list, entry: list) -> None:
+    """Insert *entry* with the other schematic items.
+
+    KiCad writes ``sheet_instances`` and ``embedded_fonts`` last; appending
+    after them is not canonical.
+    """
+    import copy
+
+    index = len(tree)
+    for i, node in enumerate(tree):
+        if _tag_of(node) in _ROOT_ONLY_SECTIONS:
+            index = i
+            break
+    tree.insert(index, copy.deepcopy(entry))
 
 
 # ---------------------------------------------------------------------------
@@ -175,9 +519,12 @@ def _generate_child_schematic(
     """Create a minimal valid ``.kicad_sch`` file for a hierarchical child sheet.
 
     The file is created in the same directory as *parent_path* (unless
-    *child_filename* is absolute).  It contains the required boilerplate
-    that KiCad expects: ``(kicad_sch ...)`` header, empty ``(lib_symbols)``,
-    ``(sheet_instances)`` with the root path, and ``(embedded_fonts no)``.
+    *child_filename* is absolute).  It contains the boilerplate KiCad expects
+    from a child schematic: ``(kicad_sch ...)`` header, ``(uuid ...)``,
+    ``(paper ...)``, optional ``title_block`` and an empty ``(lib_symbols)``.
+
+    ``sheet_instances`` and ``embedded_fonts`` are root-file-only sections and
+    are deliberately omitted; KiCad drops them from child files on save.
 
     :param parent_path: Absolute path to the parent ``.kicad_sch`` file, used
         to resolve a relative *child_filename* and to infer the project name.
@@ -209,11 +556,11 @@ def _generate_child_schematic(
             (title "My Sheet")
           )
           (lib_symbols)
-          (sheet_instances
-            (path "/aaaa1111-bbbb-cccc-dddd-eeeeeeeeeeee" (page "1"))
-          )
-          (embedded_fonts no)
         )
+
+    A file written as a project root would instead end with
+    ``(sheet_instances (path "/" (page "1")))`` and ``(embedded_fonts no)``;
+    that form is not emitted here.
     """
     if paper not in _PAPER_SIZES:
         raise ValueError(f"Unknown paper size {paper!r}.  Valid: {', '.join(sorted(_PAPER_SIZES))}")
@@ -231,12 +578,13 @@ def _generate_child_schematic(
     if os.path.exists(child_path):
         raise FileExistsError(f"Child schematic already exists: {child_path!r}")
 
-    root_uuid = str(uuid.uuid4())
+    file_uuid = str(uuid.uuid4())
 
-    # Build S-expression lines
+    # Build S-expression lines.  Child schematics stop at (lib_symbols):
+    # sheet_instances/embedded_fonts belong to the project's root file only.
     lines: list[str] = []
     lines.append('(kicad_sch (version 20260306) (generator "kcaa") (generator_version "0.2.0")')
-    lines.append(f'  (uuid "{root_uuid}")')
+    lines.append(f'  (uuid "{file_uuid}")')
     lines.append(f'  (paper "{paper}")')
 
     if title:
@@ -245,10 +593,6 @@ def _generate_child_schematic(
         lines.append("  )")
 
     lines.append("  (lib_symbols)")
-    lines.append("  (sheet_instances")
-    lines.append(f'    (path "/{root_uuid}" (page "1"))')
-    lines.append("  )")
-    lines.append("  (embedded_fonts no)")
     lines.append(")")
 
     with open(child_path, "w", encoding="utf-8") as fh:
@@ -321,9 +665,7 @@ def _sheet_dict_from_wrapper(sheet) -> dict[str, Any]:
             if not isinstance(raw_tree, list) or len(raw_tree) < 3:
                 continue
             prop_name = raw_tree[1]
-            if not isinstance(prop_name, str):
-                continue
-            normalized_name = prop_name.replace(" ", "").replace("_", "").lower()
+            normalized_name = _property_key(prop_name)
             if normalized_name == "sheetname" and sheet_name is None:
                 sheet_name = raw_tree[2]
             elif normalized_name == "sheetfile" and sheet_file is None:
@@ -517,7 +859,15 @@ def _do_add_sheet_symbol(
     if not os.path.isfile(schematic_path):
         return {"error": f"Schematic file not found: {schematic_path!r}"}
 
-    # Optionally create child file first
+    # Resolve canonical instance data before touching the filesystem, so a
+    # failure leaves neither a modified schematic nor an orphan child file.
+    sch = safe_schematic(schematic_path)
+    parent_path, path_error = _resolve_sheet_parent_path(schematic_path, sch.tree)
+    if path_error:
+        return {"error": path_error}
+    page_number = _next_page_number(schematic_path, sch.tree)
+
+    # Optionally create child file
     child_path = None
     if create_child:
         try:
@@ -531,30 +881,39 @@ def _do_add_sheet_symbol(
         except Exception as e:
             return {"error": f"Failed to create child schematic: {e}"}
 
-    # Snap coordinates to grid
-    x = _align_to_grid(x)
-    y = _align_to_grid(y)
-    width = _align_to_grid(width)
-    height = _align_to_grid(height)
+    # Snap coordinates to grid.  The grid product is rounded again so the
+    # emitted numbers carry no float noise (KiCad writes at most 6 decimals).
+    x = round(_align_to_grid(x), 6)
+    y = round(_align_to_grid(y), 6)
+    width = round(_align_to_grid(width), 6)
+    height = round(_align_to_grid(height), 6)
 
     # Generate UUID for the sheet symbol
     sheet_uuid = str(uuid.uuid4())
 
-    # Build the (sheet ...) S-expression as a nested list
+    # Build the (sheet ...) S-expression as a nested list, in the order and
+    # dialect KiCad 10 writes it.
     sheet_entry: list = [
         sexpdata.Symbol("sheet"),
         [sexpdata.Symbol("at"), x, y],
         [sexpdata.Symbol("size"), width, height],
+        [sexpdata.Symbol("exclude_from_sim"), sexpdata.Symbol("no")],
+        [sexpdata.Symbol("in_bom"), sexpdata.Symbol("yes")],
+        [sexpdata.Symbol("on_board"), sexpdata.Symbol("yes")],
+        [sexpdata.Symbol("dnp"), sexpdata.Symbol("no")],
         [
             sexpdata.Symbol("stroke"),
             [sexpdata.Symbol("width"), 0],
-            [sexpdata.Symbol("type"), sexpdata.Symbol("dash")],
+            [sexpdata.Symbol("type"), sexpdata.Symbol("solid")],
         ],
-        [sexpdata.Symbol("fill"), [sexpdata.Symbol("type"), sexpdata.Symbol("none")]],
+        [
+            sexpdata.Symbol("fill"),
+            [sexpdata.Symbol("color"), 0, 0, 0, 0],
+        ],
         [sexpdata.Symbol("uuid"), sheet_uuid],
         [
             sexpdata.Symbol("property"),
-            "Sheet name",
+            "Sheetname",
             sheet_name,
             [sexpdata.Symbol("at"), 0, 0, 0],
             [sexpdata.Symbol("show_name"), sexpdata.Symbol("no")],
@@ -567,7 +926,7 @@ def _do_add_sheet_symbol(
         ],
         [
             sexpdata.Symbol("property"),
-            "Sheet file",
+            "Sheetfile",
             sheet_file,
             [sexpdata.Symbol("at"), 0, 0, 0],
             [sexpdata.Symbol("show_name"), sexpdata.Symbol("no")],
@@ -608,6 +967,8 @@ def _do_add_sheet_symbol(
                 pin_x, pin_y = x + d, y
             else:  # bottom
                 pin_x, pin_y = x + d, y + height
+            pin_x = round(pin_x, 6)
+            pin_y = round(pin_y, 6)
 
             pin_uuid = str(uuid.uuid4())
             pin_entry = [
@@ -626,25 +987,25 @@ def _do_add_sheet_symbol(
             pins_created += 1
 
     # Add instances block
-    # Derive project name from schematic filename
-    project_name = os.path.splitext(os.path.basename(schematic_path))[0]
+    project_stem = (
+        project_name(schematic_path) or os.path.splitext(os.path.basename(schematic_path))[0]
+    )
     instances_entry = [
         sexpdata.Symbol("instances"),
         [
             sexpdata.Symbol("project"),
-            project_name,
+            project_stem,
             [
                 sexpdata.Symbol("path"),
-                f"/{sheet_uuid}",
-                [sexpdata.Symbol("page"), "1"],
+                parent_path,
+                [sexpdata.Symbol("page"), str(page_number)],
             ],
         ],
     ]
     sheet_entry.append(instances_entry)
 
-    # Load schematic and insert the new sheet
-    sch = safe_schematic(schematic_path)
-    sch.new_from_list(sheet_entry)
+    # Insert with the other schematic items, before the root-only sections.
+    _insert_schematic_item(sch.tree, sheet_entry)
 
     # Save the modified schematic
     backup_path = save_schematic(schematic_path, sch)
@@ -818,8 +1179,8 @@ def _do_update_sheet_symbol(
     if x is not None or y is not None:
         old_x = target_sheet.get("position", {}).get("x", 0)
         old_y = target_sheet.get("position", {}).get("y", 0)
-        new_x = _align_to_grid(x) if x is not None else old_x
-        new_y = _align_to_grid(y) if y is not None else old_y
+        new_x = round(_align_to_grid(x), 6) if x is not None else old_x
+        new_y = round(_align_to_grid(y), 6) if y is not None else old_y
         dx = new_x - old_x
         dy = new_y - old_y
 
@@ -851,12 +1212,12 @@ def _do_update_sheet_symbol(
     # Update size if provided
     if width is not None or height is not None:
         new_width = (
-            _align_to_grid(width)
+            round(_align_to_grid(width), 6)
             if width is not None
             else target_sheet.get("size", {}).get("width", 0)
         )
         new_height = (
-            _align_to_grid(height)
+            round(_align_to_grid(height), 6)
             if height is not None
             else target_sheet.get("size", {}).get("height", 0)
         )
@@ -876,7 +1237,7 @@ def _do_update_sheet_symbol(
         for child in sheet_entry:
             if isinstance(child, list) and len(child) > 0:
                 if isinstance(child[0], sexpdata.Symbol) and child[0].value() == "property":
-                    if len(child) > 1 and child[1] == "Sheet name":
+                    if len(child) > 2 and _property_key(child[1]) == "sheetname":
                         child[2] = sheet_name
                         final_sheet_name = sheet_name
                         updated_fields.append("sheet_name")
@@ -887,7 +1248,7 @@ def _do_update_sheet_symbol(
         for child in sheet_entry:
             if isinstance(child, list) and len(child) > 0:
                 if isinstance(child[0], sexpdata.Symbol) and child[0].value() == "property":
-                    if len(child) > 1 and child[1] == "Sheet file":
+                    if len(child) > 2 and _property_key(child[1]) == "sheetfile":
                         child[2] = sheet_file
                         final_sheet_file = sheet_file
                         updated_fields.append("sheet_file")
@@ -992,6 +1353,11 @@ def _do_add_sheet_pin(
         pin_angle = 270
     else:
         return {"error": f"Invalid edge: {edge!r}. Must be right/left/top/bottom"}
+
+    # KiCad writes at most 6 decimals; raw float sums would otherwise leak
+    # noise such as 182.88000000000002 into the file.
+    pin_x = round(pin_x, 6)
+    pin_y = round(pin_y, 6)
 
     # Generate UUID for the pin
     pin_uuid = str(uuid.uuid4())
@@ -1213,6 +1579,19 @@ def register_sheet_tools(mcp: FastMCP) -> None:
         ctx: Context | None = None,
     ) -> dict[str, Any]:
         """Add a hierarchical sheet symbol to a schematic.
+
+        The sheet's node structure, property names, flags, fill and stroke
+        match KiCad 10 (``Sheetname`` / ``Sheetfile`` properties,
+        ``(fill (color 0 0 0 0))``, four
+        ``exclude_from_sim``/``in_bom``/``on_board``/``dnp`` flags and a
+        solid stroke), placed before any ``sheet_instances`` section.  Its
+        ``instances`` path is the containing sheet's path (``/<root uuid>``
+        for a sheet added to the project root) and its page is the lowest
+        unused page number in the project.
+
+        Only root schematics can be extended: a child schematic has no record
+        of its enclosing sheet path, so the call fails rather than writing a
+        guessed instance path.
 
         Args:
             schematic_path: Absolute path to the target ``.kicad_sch`` file.

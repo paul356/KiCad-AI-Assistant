@@ -57,7 +57,7 @@
 
 A typical LLM editing session follows this pattern:
 
-1. **Read current state** — call `extract_schematic_netlist` with the `active_schematic` path from the plugin context. Inspect `analysis.components`, `analysis.power_nets`, and `analysis.signal_nets` to understand what is already present.
+1. **Read current state** — call `extract_schematic_netlist` with the schematic path from the `## Active KiCad Context` block. Inspect `analysis.components`, `analysis.power_nets`, and `analysis.signal_nets` to understand what is already present.
 2. **Find symbols** — if adding a new component, call `search_library_symbols` first to obtain the exact `library_name` and `name` values required by `add_symbol_to_schematic`. Never guess library names.
 3. **Place / edit / connect** — use the symbol-editing and wire-editing tools to make changes. After placing a symbol, call `extract_schematic_netlist` to get the new pin positions before routing wires.
 4. **Verify** — call `extract_schematic_netlist` again after all edits. Confirm expected nets exist in `analysis.signal_nets` or `analysis.power_nets` and that `analysis.floating_nets` is empty.
@@ -590,6 +590,35 @@ Routing is orthogonal (horizontal-vertical). If an endpoint lies on the interior
 
 ---
 
+### 3.6 Version Tools
+
+#### `save_project_version(project_file, keep=None, include_files=None)`
+
+**Purpose:** Saves one project version archive so the whole file set can be restored together.
+
+**Key parameters:**
+- `project_file` (`str`) — absolute path to the owning `.kicad_pro`.
+- `keep` (`int | None`) — number of archives to retain (default 10); oldest are pruned first.
+- `include_files` (`list[str] | None`) — extra files to archive, such as `sym-lib-table`/`fp-lib-table`. A relative entry is resolved against the project directory (the directory containing `project_file`), not the server process cwd; absolute entries are used as given.
+
+**Whole-project merge:** in plugin mode the tool reads the published project state (`KCAA_PROJECT_STATE_FILE`) and, when the record's `project_root` (realpath) equals the project directory and its `profile_file` equals `project_file`'s basename, merges every `pcb_files`/`schematic_files` entry into the archive. A standalone MCP server (no state variable), an invalid record, or a record naming another project silently keeps the explicit list only.
+
+**Containment rule:** every `include_files` entry (explicit or merged) is archived only when it is an existing file whose `realpath` (symlinks resolved) is inside the project directory. A missing file, a non-file, a `..` escape, or an absolute path/symlink outside the root fails the tool call with an error naming the entry as supplied; the snapshot is never silently narrowed. Entries already covered are skipped silently. The resolved `files` list uses project-relative paths, so those names can be passed back as `include_files`.
+
+**Archive layout:** a single `.tar.gz` at `<project_dir>/.versions/project/<project_stem>.project.<timestamp>.tar.gz`. Members are stored under their project-relative paths (`hardware/main_bus.kicad_sch`), plus `.manifest.json` with each member's SHA-256. Restore extracts every member over the project tree, and the `files` result lists the archived relative paths.
+
+**Success response:** `{"success": true, "version_id": "...", "archive_path": "...", "created": true, "files": [...]}`
+
+#### `restore_project_version(project_file, version_id)`
+
+**Purpose:** Restores every file in a saved version archive over the project tree, returning the whole project to one consistent state.
+
+**Pre-restore backup:** before extracting, the tool archives the current on-disk state of every safe file member of the selected archive (manifest, non-files, absolute paths, `..`, symlinked parents and members that resolve outside the project are refused). This is the archive's file set — including nested sheets such as `hardware/main_bus.kicad_sch` — not just the default project trio; safe members that no longer exist on disk are skipped. The backup's path and version id are returned as `backup_of_current` and `backup_version_id`, so restoring that backup rolls the edited nested file back too. Unsafe members are never extracted, cannot abort the restore, and are counted in `backup_skipped`. The source archive is excluded from retention pruning while it is being restored. Archives written before manifests existed are restored from their member list alone.
+
+**Success response:** `{"success": true, "restored_from": "...", "backup_of_current": "...", "backup_version_id": "...", "backup_skipped": 0, "files": [...]}`
+
+---
+
 ## 4. Deferred Capabilities
 
 | Capability | Reason deferred | Target milestone |
@@ -610,18 +639,40 @@ Routing is orthogonal (horizontal-vertical). If an endpoint lies on the interior
 
 ## 5. Context Passed by the Plugin
 
-The plugin inserts a context object into every MCP request:
+The plugin renders the canonical project record (see
+[project_state.md](project_state.md)) into the system prompt:
 
-```json
-{
-  "active_project": "/path/to/project.kicad_pro",
-  "active_schematic": "/path/to/schematic.kicad_sch",
-  "active_editor": "schematic",
-  "selected_refs": ["R1", "C3"]
-}
+```
+## Active KiCad Context
+Project root: /path/to/project
+Project file: /path/to/project/project.kicad_pro
+Schematic files:
+- /path/to/project/project.kicad_sch
+- /path/to/project/hardware/main_bus.kicad_sch
+PCB files:
+- /path/to/project/hardware/main.kicad_pcb
 ```
 
-The LLM **must** use `active_schematic` as the `schematic_path` argument for all editing and inspection tools unless the engineer explicitly specifies a different file. `selected_refs` contains the reference designators currently selected in the KiCad editor and can be used to infer which components the engineer wants to modify.
+Manifest entries are absolute paths under `Project root`. The block names no
+"current" file: the state tracks the project, not editor focus. Pass one of
+the listed schematic/PCB paths as the explicit path argument; the LLM must
+ask the engineer which file to edit when the decision is ambiguous. When the
+record is missing or invalid the whole block is omitted.
+
+### 5.1 Project resolution failures
+
+Project-relative paths are resolved from the same record, with no fallback
+search:
+
+- a path inside `project_root` resolves to the record's `profile_file`;
+- a path outside the current project is refused with an error naming the
+  active `<project_root>` — another project's `.kicad_pro` is never adopted;
+- with no valid record, or when the recorded project file has disappeared,
+  resolution fails with a message telling the user to reopen the panel and
+  retry;
+- the same rules back the pre-edit and Auto Route snapshots: a snapshot that
+  cannot name the whole project fails before any edit instead of degrading
+  to the touched file alone.
 
 ---
 

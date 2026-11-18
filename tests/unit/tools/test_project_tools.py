@@ -77,6 +77,18 @@ class TestGetProjectStructure:
         assert result["files"]["pcb"].endswith("demo.kicad_pcb")
         assert result["metadata"] == {"filename": "demo.kicad_pro", "version": 1}
 
+    def test_non_project_input_uses_basename_as_display_name(
+        self, tools, tmp_path, isolated_project_search
+    ):
+        """A non-project path still yields a non-empty, honest display name."""
+        orphan = tmp_path / "orphan_dir"
+        orphan.mkdir()
+
+        result = self._call(tools, str(orphan))
+
+        assert result["name"] == "orphan_dir"
+        assert result["name"] != ""
+
     def test_sheet_hierarchy_follows_sheetfile_refs(self, tools, tmp_project):
         result = self._call(tools, str(tmp_project))
         assert len(result["sheets"]) == 1
@@ -136,3 +148,20 @@ class TestGetProjectStructure:
 
         result = self._call(tools, str(proj / "bare.kicad_pro"))
         assert result["lib_tables"] == {"sym_lib_table": None, "fp_lib_table": None}
+
+
+def test_project_structure_uses_resolved_project_for_directory_and_metadata(tmp_path, tools):
+    pro = tmp_path / "aria.kicad_pro"
+    pro.write_text(json.dumps({"meta": {"filename": "aria.kicad_pro", "version": 7}}))
+    (tmp_path / "aria.kicad_sch").write_text('(kicad_sch (version 20231120) (generator "test"))\n')
+    hardware = tmp_path / "hardware"
+    hardware.mkdir()
+    nested = hardware / "main_bus.kicad_sch"
+    nested.write_text('(kicad_sch (version 20231120) (generator "test"))\n')
+
+    result = tools["get_project_structure"](project_path=str(nested))
+
+    assert result["name"] == "aria"
+    assert result["files"]["project"] == str(pro)
+    assert result["directory"] == str(tmp_path)
+    assert result["metadata"] == {"filename": "aria.kicad_pro", "version": 7}

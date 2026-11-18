@@ -16,15 +16,13 @@ import subprocess  # nosec B404 -- controlled subprocess execution, no user inpu
 import threading
 import time
 
+from .project_state import PROJECT_STATE_FILENAME
+
 log = logging.getLogger(__name__)
 
 _STARTUP_TIMEOUT_S = 30
 _HEALTH_POLL_INTERVAL_S = 0.3
 _HEALTH_PATH = "/mcp"  # FastMCP's default health-check endpoint
-
-# File under the plugin data directory where the panel publishes the open
-# project root; the server re-reads it on every path validation.
-ACTIVE_PROJECT_STATE_FILENAME = "active_project.json"
 
 
 def _find_free_port() -> int:
@@ -265,7 +263,7 @@ class ServerManager:
         # the panel); the server refreshes its PathValidator project root from
         # it on every validation.
         env["KCAA_PROJECT_STATE_FILE"] = os.path.join(
-            self._settings.config_dir, ACTIVE_PROJECT_STATE_FILENAME
+            self._settings.config_dir, PROJECT_STATE_FILENAME
         )
         env["KCAA_SKILLS_DIR"] = os.path.join(os.path.dirname(os.path.abspath(__file__)), "skills")
         # The model's image capability: image-bearing tool results are

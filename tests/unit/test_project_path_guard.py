@@ -1,0 +1,249 @@
+"""Guard against hand-built .kicad_pro paths in production code.
+
+This is a lint for the historical spelling shapes of manual path
+construction, not a sandbox.  Fragment assembly that never produces a
+literal ending in ``.kicad_pro`` (for example ``".kicad_" + "pro"`` or
+``"".join(["x", ".kicad_", "pro"])``) is outside its coverage.  Constants
+such as ``SUFFIX = ".kicad_pro"`` are allowed as bare assignment values,
+and any later use of such a constant in a concatenation is likewise
+outside the coverage; this is the inherent trade-off of a lint.
+"""
+
+import ast
+import io
+from pathlib import Path
+import re
+import tokenize
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
+PRODUCTION_DIRS = ("kcaa", "kicad_plugin", "scripts")
+
+# Additional textual rules, kept alongside the literal scan.
+FORBIDDEN = (
+    (
+        "pcb-to-project replace",
+        re.compile(r"""replace\s*\(\s*['"]\.kicad_pcb['"]\s*,\s*['"]\.kicad_pro['"]"""),
+    ),
+    (
+        "project suffix concatenation",
+        re.compile(r"""\+\s*['"]\.kicad_pro['"]"""),
+    ),
+    (
+        "extension slice plus project suffix",
+        re.compile(r"""\[:-10\]\s*\+\s*['"]\.kicad_pro['"]"""),
+    ),
+)
+
+
+def _production_files():
+    for directory in PRODUCTION_DIRS:
+        for path in (REPO_ROOT / directory).rglob("*.py"):
+            if "__pycache__" in path.parts or "tests" in path.parts:
+                continue
+            yield path
+
+
+def _docstring_lines(tree: ast.AST) -> set[int]:
+    lines: set[int] = set()
+    for node in ast.walk(tree):
+        if not isinstance(node, (ast.Module, ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        if not node.body:
+            continue
+        first = node.body[0]
+        if (
+            isinstance(first, ast.Expr)
+            and isinstance(first.value, ast.Constant)
+            and isinstance(first.value.value, str)
+        ):
+            lines.add(first.value.lineno)
+    return lines
+
+
+def _is_bare_literal_context(parent: ast.AST, child: ast.AST) -> bool:
+    """Return True for a standalone extension literal, not a construction."""
+    if isinstance(parent, (ast.Assign, ast.AnnAssign)) and parent.value is child:
+        return True
+    if isinstance(parent, ast.Dict) and any(value is child for value in parent.values):
+        return True
+    if isinstance(parent, ast.Call) and any(arg is child for arg in parent.args):
+        return isinstance(parent.func, ast.Attribute) and parent.func.attr == "endswith"
+    return False
+
+
+def _bare_literal_positions(tree: ast.AST) -> set[tuple[int, int]]:
+    """Return ``(line, column)`` of exact ``.kicad_pro`` literals used bare."""
+    allowed: set[tuple[int, int]] = set()
+    for parent in ast.walk(tree):
+        for child in ast.iter_child_nodes(parent):
+            if (
+                isinstance(child, ast.Constant)
+                and isinstance(child.value, str)
+                and child.value.lower() == ".kicad_pro"
+                and _is_bare_literal_context(parent, child)
+            ):
+                allowed.add((child.lineno, child.col_offset))
+    return allowed
+
+
+def _literal_text(token_string: str) -> str | None:
+    try:
+        value = ast.literal_eval(token_string)
+    except (SyntaxError, ValueError):
+        return None
+    return value if isinstance(value, str) else None
+
+
+def _is_fstring_token(token_string: str) -> bool:
+    match = re.match(r"(?i)^([rubf]*)", token_string)
+    return bool(match and "f" in match.group(1).lower())
+
+
+def _ast_suffix_violations(tree: ast.AST) -> list[tuple[int, str]]:
+    """Return f-string / percent-format suffix violations from AST alone.
+
+    PEP 701 (Python 3.12+) tokenizes f-strings as FSTRING_* tokens, so the
+    AST is the authoritative source for them on every interpreter version.
+    """
+    violations: list[tuple[int, str]] = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.JoinedStr) and node.values:
+            last = node.values[-1]
+            if (
+                isinstance(last, ast.Constant)
+                and isinstance(last.value, str)
+                and last.value.lower().endswith(".kicad_pro")
+            ):
+                violations.append((node.lineno, last.value))
+        if (
+            isinstance(node, ast.BinOp)
+            and isinstance(node.op, ast.Mod)
+            and isinstance(node.left, ast.Constant)
+            and isinstance(node.left.value, str)
+            and node.left.value.lower().endswith(".kicad_pro")
+        ):
+            violations.append((node.lineno, node.left.value))
+    return violations
+
+
+def _display_path(path: Path) -> str:
+    try:
+        return str(path.relative_to(REPO_ROOT))
+    except ValueError:
+        return path.name
+
+
+def _literal_suffix_violations(path: Path, text: str) -> list[str]:
+    tree = ast.parse(text)
+    docstrings = _docstring_lines(tree)
+    bare_positions = _bare_literal_positions(tree)
+    violations: list[str] = []
+    seen: set[tuple[int, str]] = set()
+
+    def add(line: int, literal: str) -> None:
+        key = (line, literal)
+        if key in seen:
+            return
+        seen.add(key)
+        violations.append(
+            f"{_display_path(path)}:{line}: string literal ends with .kicad_pro: {literal!r}"
+        )
+
+    for token in tokenize.generate_tokens(io.StringIO(text).readline):
+        if token.type != tokenize.STRING or token.start[0] in docstrings:
+            continue
+        if _is_fstring_token(token.string):
+            continue
+        literal = _literal_text(token.string)
+        if literal is None or not literal.lower().endswith(".kicad_pro"):
+            continue
+        if literal.lower() == ".kicad_pro" and token.start in bare_positions:
+            continue
+        add(token.start[0], literal)
+
+    for line, literal in _ast_suffix_violations(tree):
+        add(line, literal)
+
+    violations.sort(key=lambda item: int(re.search(r":(\d+): ", item).group(1)))
+    return violations
+
+
+def find_violations(path: Path, text: str | None = None) -> list[str]:
+    """Return all guard violations for *path* (literal scan + regex rules)."""
+    source = text if text is not None else path.read_text(encoding="utf-8")
+    violations = _literal_suffix_violations(path, source)
+    for line_number, line in enumerate(source.splitlines(), 1):
+        for label, pattern in FORBIDDEN:
+            if pattern.search(line):
+                violations.append(f"{_display_path(path)}:{line_number}: {label}: {line.strip()}")
+    return violations
+
+
+def test_production_code_has_no_manual_project_path_construction():
+    violations = []
+    for path in _production_files():
+        violations.extend(find_violations(path))
+    assert not violations, "manual .kicad_pro construction found:\n" + "\n".join(violations)
+
+
+def test_literal_scan_flags_fstring_and_percent_with_line_numbers(tmp_path):
+    module = tmp_path / "sample.py"
+    text = (
+        "def build(stem):\n"
+        '    first = f"{stem}.kicad_pro"\n'
+        '    second = "%s.kicad_pro" % stem\n'
+        "    return first, second\n"
+    )
+    module.write_text(text)
+
+    violations = _literal_suffix_violations(module, text)
+
+    assert len(violations) == 2
+    assert ":2:" in violations[0]
+    assert ":3:" in violations[1]
+
+
+def test_literal_scan_skips_docstrings_and_comments(tmp_path):
+    module = tmp_path / "sample.py"
+    text = (
+        "def note():\n"
+        '    """Docstring ends with .kicad_pro"""\n'
+        "    # Comment mentions .kicad_pro\n"
+        "    return 1\n"
+    )
+    module.write_text(text)
+
+    assert _literal_suffix_violations(module, text) == []
+
+
+def test_literal_scan_allows_bare_extension_literals(tmp_path):
+    module = tmp_path / "sample.py"
+    text = (
+        'SUFFIX = ".kicad_pro"\n\ndef is_project(path):\n    return path.endswith(".kicad_pro")\n'
+    )
+    module.write_text(text)
+
+    assert _literal_suffix_violations(module, text) == []
+
+
+def test_fstring_variants_are_flagged(tmp_path):
+    module = tmp_path / "sample.py"
+    text = """def build(stem, inner):
+    nested = f"{stem}-{f'{inner}.kicad_pro'}"
+    middle = f"name-{stem}-tail.kicad_pro"
+    upper = f"name-{stem}.KICAD_PRO"
+    safe = f"prefix .kicad_pro suffix"
+    return nested, middle, upper, safe
+"""
+    module.write_text(text)
+
+    violations = _literal_suffix_violations(module, text)
+    lines = [int(re.search(r":(\d+): ", item).group(1)) for item in violations]
+
+    assert lines == [2, 3, 4]
+
+
+def test_ast_scan_detects_joined_str_without_tokenize():
+    tree = ast.parse('value = f"{stem}.kicad_pro"\n')
+
+    assert _ast_suffix_violations(tree) == [(1, ".kicad_pro")]

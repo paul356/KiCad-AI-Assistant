@@ -26,6 +26,7 @@ import threading
 import time
 from typing import Any
 
+from . import project_state
 from .tool_registry import TOOL_POLICIES, get_missing_tool_policies, get_tool_policy
 
 # Notice colour for wait progress; single source of truth is ui/colors.py
@@ -35,21 +36,109 @@ from .ui.colors import WARN_HEX as _STATUS_EVENT_COLOR_HEX
 log = logging.getLogger(__name__)
 
 
-def _project_path_for(file_path: str) -> str:
-    """Return the .kicad_pro path of the project containing *file_path*.
+class ProjectSnapshotUnavailable(RuntimeError):
+    """The published record cannot back a whole-project snapshot."""
 
-    Accepts a schematic, PCB or project file; the project path shares the
-    directory and the stem up to the ``.kicad_*`` suffix.
+
+def _resolve_project(
+    file_path: str, state_file: str | None = None
+) -> tuple[str | None, str | None]:
+    """Resolve the project owning *file_path* from the published record.
+
+    The state file is the only source: there is no filesystem search
+    fallback.  A missing/invalid record, a path outside the published
+    ``project_root``, or a recorded project file that has disappeared all
+    fail closed with a message telling the user to retry.
+
+    Returns ``(project_file, error)``; exactly one is None.
     """
-    d = os.path.dirname(os.path.abspath(file_path))
-    name = os.path.basename(file_path)
-    for suffix in (".kicad_pro", ".kicad_sch", ".kicad_pcb"):
-        if name.endswith(suffix):
-            stem = name[: -len(suffix)]
-            break
-    else:
-        stem = os.path.splitext(name)[0]
-    return os.path.join(d, f"{stem}.kicad_pro")
+    record = project_state.read_state(state_file)
+    if record is None:
+        return None, (
+            "No KiCad project is published for the plugin. Save the project and open "
+            "its PCB editor so the panel can detect it, then retry; if the panel still "
+            "shows no project, reopen it."
+        )
+    root = record["project_root"]
+    project_file = os.path.join(root, record["profile_file"])
+    if not project_state.is_within(root, file_path):
+        return None, (
+            f"{file_path!r} is outside the active KiCad project <{root}>; "
+            "refusing to resolve a project for it."
+        )
+    if not os.path.isfile(project_file):
+        return None, (
+            f"The project file recorded for <{root}> no longer exists; "
+            "reopen the plugin panel and retry."
+        )
+    return project_file, None
+
+
+def _snapshot_include_files(
+    project_file: str, touched: str, state_file: str | None = None
+) -> list[str]:
+    """Return the absolute files a pre-edit snapshot must cover.
+
+    The canonical project record lists every board and sheet under
+    ``project_root``; when it agrees with *project_file*'s directory those
+    files are returned so one archive holds the whole project.  *touched* is
+    always appended and duplicates are dropped in insertion order.
+
+    Raises :class:`ProjectSnapshotUnavailable` instead of degrading to
+    *touched* whenever the record is missing, describes another root, the
+    project file has disappeared, or *touched* itself is outside
+    ``project_root``.
+    """
+    record = project_state.read_state(state_file)
+    if record is None:
+        raise ProjectSnapshotUnavailable(
+            "No KiCad project is published for the plugin. Save the project and open "
+            "its PCB editor so the panel can detect it, then retry; if the panel still "
+            "shows no project, reopen it."
+        )
+    root = record["project_root"]
+    if os.path.realpath(os.path.dirname(os.path.abspath(project_file))) != os.path.realpath(root):
+        raise ProjectSnapshotUnavailable(
+            "The project state and the resolved project disagree; reopen the panel and retry."
+        )
+    if not os.path.isfile(project_file):
+        raise ProjectSnapshotUnavailable(
+            f"The project file <{project_file}> no longer exists; reopen the panel and retry."
+        )
+    if not project_state.is_within(root, touched):
+        raise ProjectSnapshotUnavailable(
+            f"The file to edit <{touched}> is outside the current project <{root}>; "
+            "reopen the plugin panel and retry."
+        )
+    files = [os.path.join(root, rel) for rel in record["pcb_files"] + record["schematic_files"]]
+    files.append(os.path.abspath(touched))
+    return list(dict.fromkeys(files))
+
+
+def _project_path_for(file_path: str, state_file: str | None = None) -> str | None:
+    """Return the .kicad_pro path of the project owning *file_path*, or None.
+
+    See :func:`_resolve_project`; this never fabricates a sibling path.
+    """
+    return _resolve_project(file_path, state_file)[0]
+
+
+def _project_relative_path(project_file: str, path: str) -> str | None:
+    """Return *path* relative to the project directory, or None if outside.
+
+    Uses the realpath of both ends so a symlinked file is compared by its
+    target, and returns POSIX separators to match ``save_project_version``'s
+    reported ``files`` list.
+    """
+    project_root = os.path.realpath(os.path.dirname(os.path.abspath(project_file)))
+    target = os.path.realpath(os.path.abspath(path))
+    try:
+        rel = os.path.relpath(target, project_root)
+    except ValueError:
+        return None
+    if rel == os.pardir or rel.startswith(os.pardir + os.sep) or os.path.isabs(rel):
+        return None
+    return rel.replace(os.sep, "/")
 
 
 def _normalize_tool_arguments(value: Any) -> str:
@@ -117,7 +206,7 @@ def _wire_message(msg: dict[str, Any]) -> dict[str, Any]:
     return {
         key: msg[key]
         for key in ("role", "content", "name", "tool_calls", "tool_call_id")
-        if key in msg
+        if key in msg and not (key == "tool_calls" and not msg[key])
     }
 
 
@@ -545,7 +634,7 @@ _COMPACTION_SUMMARY_FLOOR_CHARS = 800
 # "python-requests/2.32.3" from PluginSettings ("Don't use kicad plugin as a
 # type of agent" — review on #150). Version literal must stay in sync with
 # pyproject.toml (the plugin package has no __version__).
-_LLM_USER_AGENT = "KiCad-AI-Assistant/0.2.11 (+https://github.com/paul356/KiCad-AI-Assistant)"
+_LLM_USER_AGENT = "KiCad-AI-Assistant/0.2.12 (+https://github.com/paul356/KiCad-AI-Assistant)"
 
 # ------------------------------------------------------------------
 # On-demand tool loading (issue #129)
@@ -1440,8 +1529,8 @@ _PROMPT_SCHEMATIC = """\
 # Hard rules (schematic)
 - Always call extract_schematic_netlist (or get_schematic_sheet_info) for
   state before making spatial changes. Never invent coordinates.
-- Use the active_schematic path from the context block below as the
-  schematic_path argument for every editing tool.
+- Use an absolute path listed under Schematic files in the context block below
+  as the schematic_path argument for every editing tool.
 - Mutations auto-write a .kicad_sch.bak backup; the framework handles the
   version snapshot and final reload automatically.
 - Report errors clearly. Do not silently retry failed tool calls.
@@ -1467,8 +1556,8 @@ _PROMPT_PCB = """\
 # Hard rules (PCB)
 - Always call get_board_info + list_footprints before making spatial changes.
   Never invent footprint coordinates.
-- Use the active_pcb path from the context block below as the pcb_path
-  argument for every PCB editing tool.
+- Use an absolute path listed under PCB files in the context block below as
+  the pcb_path argument for every PCB editing tool.
 - Mutations auto-write a .kicad_pcb.bak backup; the framework handles the
   version snapshot and final reload automatically.
 - Report errors clearly. Do not silently retry failed tool calls.
@@ -1700,7 +1789,12 @@ def _is_retryable_llm_error(error: str) -> bool:
 class _ToolExecutionState:
     """Per-request framework state for snapshot and reload orchestration."""
 
-    snapshotted_paths: set[str] = field(default_factory=set)
+    # One snapshot per (project, file) per turn, so a second file edited in
+    # the same project still gets its own pre-edit archive.
+    snapshotted_paths: set[tuple[str, str]] = field(default_factory=set)
+    # Explicit save_project_version/restore_project_version calls report the
+    # project-relative files they covered; only those files are suppressed.
+    covered_files: dict[str, set[str]] = field(default_factory=dict)
     dirty_paths: set[str] = field(default_factory=set)
 
 
@@ -1836,6 +1930,14 @@ class LLMClient:
     def __init__(self, settings, mcp_base_url: str) -> None:
         self._settings = settings
         self._mcp_base_url = mcp_base_url
+        config_dir = getattr(settings, "config_dir", None)
+        # Canonical project record written by the panel.  Every project
+        # resolution in this process reads the same file the server does.
+        self._state_file: str | None = (
+            project_state.state_path(config_dir)
+            if config_dir
+            else project_state.state_file_from_env()
+        )
         self._context_tokens: int = getattr(settings, "llm_context_tokens", 128_000)
         self._compact_threshold: float = getattr(settings, "llm_compact_threshold", 0.70)
         self._compact_target_threshold: float = getattr(
@@ -2333,15 +2435,26 @@ class LLMClient:
         return True
 
     def _prune_rollback_history(self) -> None:
-        """Prune tool-call turns invalidated by restore_project_version.
+        """Prune the history interval invalidated by restore_project_version.
 
-        When the LLM restores a project to an earlier version, every tool
-        call that mutated or queried any of its files between the save point
-        and the restore is now based on stale state — prune those turns.
+        When the LLM restores a project to an earlier version, everything that
+        happened between the save point and the restore is based on state that
+        no longer exists.  The whole interval — user turns, assistant text, and
+        tool calls/results — is dropped; keeping fragments of it leaves stale
+        instructions and orphaned tool calls in the prompt.  The save and
+        restore turns themselves stay so the model can see the rollback.
 
-        Handles nested restores: starts from the most recent restore and skips
-        any restore whose messages fall inside an already-pruned range.
+        Nested restores inside the interval are removed with it; the most
+        recent resolvable restore wins.  A restore whose result reports an
+        error is ignored — nothing was rolled back.
+
+        The cut starts right after the save *result*, so a save batched with
+        later calls in the same assistant turn loses those calls' results.
+        They are dropped from the save turn in the same pass, keeping the
+        rebuilt history pairing-valid without relying on
+        ``_validate_history``.
         """
+
         # ---- Build save-point lookup ------------------------------------------
         # For each save_project_version result, record (project_file, version_id) → index.
         save_points: dict[tuple[str, str], int] = {}
@@ -2361,28 +2474,26 @@ class LLMClient:
                 try:
                     args = json.loads(tc["function"].get("arguments", "{}"))
                     result = json.loads(msg.get("content", "{}"))
-                    fp = args.get("project_file", "")
-                    vid = result.get("version_id", "")
-                    if fp and vid:
-                        save_points[(fp, vid)] = i
                 except (json.JSONDecodeError, KeyError, TypeError):
-                    pass
+                    continue
+                if not isinstance(args, dict) or not isinstance(result, dict):
+                    continue
+                fp = args.get("project_file", "")
+                vid = result.get("version_id", "")
+                if fp and vid:
+                    save_points[(fp, vid)] = i
 
         # ---- Scan from tail for restore_project_version ----------------------
-        marked: set[int] = set()  # indices to remove  (tool results)
-        tool_call_removals: dict[int, list[str]] = {}  # assistant_idx → [tc_id, ...]
-        i = len(self._history) - 1
-        while i >= 0:
-            if i in marked:
-                i -= 1
-                continue
+        # An unresolvable or failed restore must not stop the scan: an earlier
+        # restore may still have a usable save point.
+        stale: range | None = None
+        save_idx: int | None = None
+        for i in range(len(self._history) - 1, -1, -1):
             msg = self._history[i]
             if msg.get("role") != "tool":
-                i -= 1
                 continue
             p_idx = self._find_parent_assistant(i)
-            if p_idx is None or p_idx in marked:
-                i -= 1
+            if p_idx is None:
                 continue
             parent = self._history[p_idx]
             tc_id = msg.get("tool_call_id")
@@ -2393,67 +2504,63 @@ class LLMClient:
                     continue
                 try:
                     args = json.loads(tc["function"].get("arguments", "{}"))
-                    project_file = args.get("project_file", "")
-                    version_id = args.get("version_id", "")
+                    result = json.loads(msg.get("content", "{}"))
                 except (json.JSONDecodeError, KeyError, TypeError):
                     break
-
-                save_idx = save_points.get((project_file, version_id))
-                if save_idx is None or save_idx >= i:
-                    break  # Can't locate save point
-
-                # Mark file-touching tool turns inside (save_idx, i]
-                for j in range(save_idx + 1, i):
-                    if j in marked:
-                        continue
-                    mj = self._history[j]
-                    if mj.get("role") != "tool":
-                        continue
-                    pj = self._find_parent_assistant(j)
-                    if pj is None:
-                        continue
-                    # Check the specific tool_call (not whole turn)
-                    tcj_id = mj.get("tool_call_id")
-                    parent_j = self._history[pj]
-                    for tcj in parent_j.get("tool_calls") or []:
-                        if tcj.get("id") != tcj_id:
-                            continue
-                        try:
-                            tcj_args = json.loads(tcj["function"].get("arguments", "{}"))
-                        except (json.JSONDecodeError, KeyError, TypeError):
-                            continue
-                        if self._tool_touches_project(tcj_args, project_file):
-                            marked.add(j)
-                            tool_call_removals.setdefault(pj, []).append(tcj_id)
+                if not isinstance(args, dict):
+                    break
+                if isinstance(result, dict) and (
+                    result.get("success") is False or "error" in result
+                ):
+                    break  # The restore failed; the interval is still valid.
+                found = save_points.get((args.get("project_file", ""), args.get("version_id", "")))
+                if found is not None and found + 1 < p_idx:
+                    # Everything between the save result and the restore call
+                    # describes state that the restore rolled back.
+                    stale = range(found + 1, p_idx)
+                    save_idx = found
                 break
-            i -= 1
+            if stale is not None:
+                break
 
-        if not marked:
+        if stale is None or save_idx is None:
             return
 
-        # ---- Rebuild history --------------------------------------------------
-        # 1. Strip removed tool_calls from assistant messages.
-        # 2. Remove assistant messages with no remaining content or tool_calls.
-        # 3. Remove marked tool_result messages.
-        new_history: list[dict[str, Any]] = []
-        for idx, msg in enumerate(self._history):
-            if idx in marked:
-                continue  # drop tool_result
-            if msg.get("role") == "assistant" and idx in tool_call_removals:
-                removed_ids = set(tool_call_removals[idx])
-                new_tcs = [
-                    tc for tc in (msg.get("tool_calls") or []) if tc.get("id") not in removed_ids
-                ]
-                if not new_tcs and not msg.get("content"):
-                    continue  # drop empty assistant message
-                msg = dict(msg)  # shallow copy before mutating
-                msg["tool_calls"] = new_tcs
-            new_history.append(msg)
+        save_turn_idx = self._find_parent_assistant(save_idx)
+        self._history = self._history[: stale.start] + self._history[stale.stop :]
+        if save_turn_idx is not None:
+            self._trim_save_turn_calls(save_turn_idx)
+        log.info("_prune_rollback_history: pruned %d stale messages", len(stale))
 
-        pruned = len(self._history) - len(new_history)
-        if pruned:
-            log.info("_prune_rollback_history: pruned %d stale messages", pruned)
-        self._history = new_history
+    def _trim_save_turn_calls(self, turn_idx: int) -> None:
+        """Drop calls of *turn_idx* whose tool results the interval cut removed.
+
+        The interval starts after the save result, so any sibling call issued
+        later in the same assistant turn loses its result with the interval.
+        Leaving the declaration behind would make pruning depend on a later
+        ``_validate_history`` pass to repair its own output.
+        """
+        msg = self._history[turn_idx]
+        tool_calls = msg.get("tool_calls")
+        if msg.get("role") != "assistant" or not tool_calls:
+            return
+        surviving_ids: set[Any] = set()
+        j = turn_idx + 1
+        while j < len(self._history) and self._history[j].get("role") == "tool":
+            surviving_ids.add(self._history[j].get("tool_call_id"))
+            j += 1
+        kept = [tc for tc in tool_calls if tc.get("id") in surviving_ids]
+        if len(kept) == len(tool_calls):
+            return
+        updated = dict(msg)
+        if kept:
+            updated["tool_calls"] = kept
+        else:
+            updated.pop("tool_calls", None)
+        if not kept and not updated.get("content"):
+            del self._history[turn_idx]
+            return
+        self._history[turn_idx] = updated
 
     def _find_parent_assistant(self, tool_result_index: int) -> int | None:
         """Return the index of the assistant message that issued the tool call
@@ -2542,16 +2649,6 @@ class LLMClient:
         if annotated:
             log.info("_annotate_stale_queries: tagged %d stale query result(s)", annotated)
 
-    @staticmethod
-    def _tool_touches_project(args: dict[str, Any], project_file: str) -> bool:
-        """Return True if *args* reference any file of *project_file*'s project."""
-        target = os.path.abspath(project_file)
-        for key in ("file_path", "schematic_path", "pcb_path", "project_path"):
-            value = args.get(key)
-            if value and os.path.abspath(_project_path_for(value)) == target:
-                return True
-        return False
-
     def _validate_history(self) -> None:
         """Repair orphaned tool_calls in self._history.
 
@@ -2565,6 +2662,10 @@ class LLMClient:
         * If ALL tool_calls are orphaned → drop the entire assistant message.
         * If SOME are orphaned → strip only the orphaned entries from
           ``tool_calls``, keeping the valid ones and any text content.
+        * An empty ``tool_calls`` list is stripped (it is invalid on the wire).
+          A textless assistant with such a list is dropped.  Either way, any
+          immediately-following ``tool`` messages are dropped too: no id was
+          declared, so they cannot be paired and would become orphans.
         """
         i = 0
         removed_count = 0
@@ -2572,6 +2673,24 @@ class LLMClient:
             msg = self._history[i]
             tool_calls = msg.get("tool_calls") if msg.get("role") == "assistant" else None
             if not tool_calls:
+                if tool_calls == []:
+                    # ``"tool_calls": []`` is rejected by OpenAI-compatible
+                    # APIs (min length 1); old sessions may still carry it.
+                    # Keep any text as a plain assistant turn.
+                    msg = dict(msg)
+                    msg.pop("tool_calls", None)
+                    removed_count += 1
+                    log.warning("_validate_history: removed empty tool_calls at history[%d]", i)
+                    if not msg.get("content"):
+                        del self._history[i]
+                    else:
+                        self._history[i] = msg
+                        i += 1
+                    # No id was declared, so following tool messages have no
+                    # parent and must go with the turn (or the stripped key).
+                    while i < len(self._history) and self._history[i].get("role") == "tool":
+                        del self._history[i]
+                    continue
                 i += 1
                 continue
 
@@ -2680,8 +2799,9 @@ class LLMClient:
         returns an error string and the caller must not send the request.
 
         The one exception is ``_prune_rollback_history``: restoring an earlier
-        file version invalidates prior tool turns, so those are removed every
-        turn for correctness regardless of budget (rare, restore-only).
+        file version invalidates the whole interval since its save point, so
+        those messages are removed every turn for correctness regardless of
+        budget (rare, restore-only).
         """
         self._prune_rollback_history()
 
@@ -3028,6 +3148,13 @@ class LLMClient:
         policy = get_tool_policy(tool_name)
         path = self._get_required_path(args, tool_name, policy.path_arg)
 
+        # Resolve the project once for both the pre-edit snapshot and the
+        # post-success coverage tracking of this tool call.
+        project_path: str | None = None
+        project_error: str | None = None
+        if path and (policy.auto_snapshot or policy.track_snapshot):
+            project_path, project_error = _resolve_project(path, self._state_file)
+
         if policy.auto_snapshot:
             if not path:
                 return {
@@ -3037,8 +3164,18 @@ class LLMClient:
                         f"{policy.path_arg!r} argument."
                     ),
                 }
-            project_path = _project_path_for(path)
-            if project_path not in state.snapshotted_paths:
+            if project_path is None:
+                return {
+                    "success": False,
+                    "error": project_error
+                    or f"No .kicad_pro project file found for {path!r}; reopen the panel and retry.",
+                }
+            file_key = (project_path, os.path.abspath(path))
+            file_relative = _project_relative_path(project_path, path)
+            covered = state.covered_files.get(project_path, set())
+            if file_key not in state.snapshotted_paths and (
+                file_relative is None or file_relative not in covered
+            ):
                 # Save the document in KiCad first to sync in-memory changes
                 # (e.g. from IPC operations) to disk before taking a snapshot.
                 save_args = {"file_path": path}
@@ -3061,7 +3198,19 @@ class LLMClient:
                         save_result.get("error", "unknown error"),
                     )
 
-                snapshot_args = {"project_file": project_path}
+                try:
+                    include_files = _snapshot_include_files(project_path, path, self._state_file)
+                except ProjectSnapshotUnavailable as exc:
+                    # A degraded archive silently drops project files the edit
+                    # may touch; fail before the edit tool runs instead.
+                    return self._failure_carrying_markers(
+                        {},
+                        f"Failed to save project version before {tool_name}: {exc}",
+                    )
+                snapshot_args = {
+                    "project_file": project_path,
+                    "include_files": include_files,
+                }
                 snapshot_result = self._call_mcp_tool_guarded(
                     "save_project_version", snapshot_args, cancel_event
                 )
@@ -3074,7 +3223,7 @@ class LLMClient:
                         snapshot_result,
                         f"Failed to save project version before {tool_name}: {error}",
                     )
-                state.snapshotted_paths.add(project_path)
+                state.snapshotted_paths.add(file_key)
 
         result = self._call_mcp_tool_guarded(tool_name, args, cancel_event)
 
@@ -3105,8 +3254,13 @@ class LLMClient:
         if not self._tool_result_succeeded(result):
             return result
 
-        if policy.track_snapshot and path:
-            state.snapshotted_paths.add(_project_path_for(path))
+        if policy.track_snapshot and path and project_path is not None:
+            covered = state.covered_files.setdefault(project_path, set())
+            reported = result.get("files") if isinstance(result, dict) else None
+            if isinstance(reported, list):
+                for rel in reported:
+                    if isinstance(rel, str):
+                        covered.add(rel.replace(os.sep, "/"))
         if policy.clear_dirty_paths_arg:
             reload_paths = args.get(policy.clear_dirty_paths_arg, [])
             if isinstance(reload_paths, list):

@@ -31,6 +31,8 @@ import argparse
 import json
 from pathlib import Path
 import re
+import subprocess
+import sys
 from typing import Any
 import zipfile
 
@@ -46,6 +48,8 @@ PCM_PLUGIN_ROOT = "plugins"
 PCM_IDENTIFIER = "com.github.paul356.kicad-ai-assistant"
 PCM_KICAD_VERSION = "10.0"
 PCM_ARCHIVE = "kicad_ai_assistant_pcm.zip"
+
+SYNC_RESOLUTION = REPO_ROOT / "scripts" / "sync_project_resolution.py"
 
 _ZIP_TIMESTAMP = (1980, 1, 1, 0, 0, 0)
 _EXCLUDED_DIRS = {".backup", ".venv", "__pycache__"}
@@ -249,6 +253,11 @@ def build_pcm(
     return _write_archive(output, entries)
 
 
+def verify_vendored_resolution() -> None:
+    """Fail when the plugin's vendored resolver drifted from the core module."""
+    subprocess.run([sys.executable, str(SYNC_RESOLUTION), "--check"], check=True)
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("layout", choices=("legacy", "pcm"))
@@ -261,6 +270,7 @@ def main(argv: list[str] | None = None) -> int:
     )
     args = parser.parse_args(argv)
 
+    verify_vendored_resolution()
     output = args.output or DIST_DIR / (LEGACY_ARCHIVE if args.layout == "legacy" else PCM_ARCHIVE)
     if args.layout == "legacy":
         created = build_legacy(output, source=args.source)

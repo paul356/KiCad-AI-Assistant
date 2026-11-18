@@ -15,8 +15,9 @@ tools: [sync_symbol_index, get_symbol_sync_status, search_library_symbols, get_l
 - **get_symbol_index_stats(project_path?)** — Summary statistics (library count, symbol count, last sync).
 
 # Project scope (do this first)
-When working inside a project, pass **`project_path` = the path shown as `Active project`**
-in the conversation context to every symbol lookup and to the index sync. Omitting
+When working inside a project, pass **`project_path` = the `Project root` shown in the
+conversation context** (referred to as `active_project` below) to every symbol lookup and
+to the index sync. Omitting
 `project_path` searches global libraries only and will not find libraries declared in the
 project's own `sym-lib-table`; other projects are never searched. Call tools again with
 `project_path` when a search returns nothing but the part should be project-local.

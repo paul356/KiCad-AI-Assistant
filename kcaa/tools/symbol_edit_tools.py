@@ -25,6 +25,7 @@ from kcaa.tools.symbol_tools import _not_found_scope, _scope_text
 from kcaa.utils.config import (
     config,
 )
+from kcaa.utils.project_resolution import find_project_file, project_name
 from kcaa.utils.schematic_sexp_utils import save_schematic
 from kcaa.utils.skip_compat import safe_schematic
 from kcaa.utils.sym_lib_table_utils import (
@@ -1051,7 +1052,9 @@ def _do_add_symbol(
                 break
         reference = _next_reference(sch, prefix, schematic_path=schematic_path)
 
-        project_name = _find_project_name(schematic_path)
+        project = (
+            project_name(schematic_path) or os.path.splitext(os.path.basename(schematic_path))[0]
+        )
 
         # Collect existing wires and adjust placement if any pin would land
         # on a wire interior or endpoint.
@@ -1083,7 +1086,7 @@ def _do_add_symbol(
                 reference,
                 effective_value,
                 sch_uuid,
-                project_name,
+                project,
                 lib_sym_raw,
                 fields_autoplaced=fields_autoplaced,
             )
@@ -1142,51 +1145,28 @@ def _placed_world_bbox(
     return merged.to_dict() if merged is not None else None
 
 
-def _find_project_name(schematic_path: str) -> str:
-    """
-    Find the KiCad project name by locating the .kicad_pro file near the
-    schematic.  Checks the schematic's directory first, then the parent.
-    Returns the file stem, or "project" if nothing is found.
-    """
-    sch_dir = Path(schematic_path).parent
-    for search_dir in (sch_dir, sch_dir.parent):
-        matches = list(search_dir.glob("*.kicad_pro"))
-        if matches:
-            return matches[0].stem
-    return "project"
-
-
 def _find_project_dir(schematic_path: str) -> Path | None:
-    """Find the KiCad project directory containing a .kicad_pro file.
+    """Find the KiCad project directory containing the owning .kicad_pro.
 
-    A .kicad_pro matches only if a .kicad_sch with the same stem exists
-    in the same directory (standard KiCad convention).
-    Returns the directory Path, or None if no .kicad_pro is found.
+    Uses the canonical upward search, so a schematic in a subdirectory
+    resolves to the project root.  Returns the directory Path, or None if
+    no .kicad_pro is found.
     """
-    sch_path = Path(schematic_path)
-    sch_dir = sch_path.parent
-    dirs_to_check = {sch_dir, sch_dir.parent}
-    for d in dirs_to_check:
-        for proj in d.glob("*.kicad_pro"):
-            if (d / f"{proj.stem}.kicad_sch").exists():
-                return d
-    return None
+    project_file = find_project_file(schematic_path)
+    return Path(project_file).parent if project_file is not None else None
 
 
 def _find_root_schematic(schematic_path: str) -> str | None:
     """Return the root .kicad_sch path for the project containing *schematic_path*.
 
-    Finds the .kicad_pro file via ``_find_project_dir``, then looks for a
-    .kicad_sch with the same stem in the project directory.  Returns None if
-    no project or matching root schematic is found.
+    Resolves the owning .kicad_pro, then looks for a .kicad_sch with the
+    same stem in the project directory.  Returns None if no project or
+    matching root schematic is found.
     """
-    project_dir = _find_project_dir(schematic_path)
-    if project_dir is None:
+    project_file = find_project_file(schematic_path)
+    if project_file is None:
         return None
-    pro_files = list(project_dir.glob("*.kicad_pro"))
-    if not pro_files:
-        return None
-    root_sch = project_dir / (pro_files[0].stem + ".kicad_sch")
+    root_sch = Path(project_file).with_suffix(".kicad_sch")
     return str(root_sch) if root_sch.is_file() else None
 
 
