@@ -489,9 +489,47 @@ class TestPageAllocation:
 class TestInstancePathResolution:
     """D1: resolve the parent path from real project data, never guess it."""
 
-    def test_root_uuid_wins_over_stale_sheet_path(self, tools, tmp_path):
+    def test_project_root_sheet_uuid_wins_over_file_uuid(self, tools, tmp_path):
+        # KiCad keys instance paths by the project's top_level_sheets UUID,
+        # which may differ from the schematic file's own (uuid ...).
         root = tmp_path / "root.kicad_sch"
         _write_schematic(root, root_uuid=ROOT_UUID, instance_path="/stale", pages=(2,))
+        (tmp_path / "root.kicad_pro").write_text(
+            json.dumps(
+                {
+                    "schematic": {
+                        "top_level_sheets": [
+                            {"filename": "root.kicad_sch", "name": "Top", "uuid": PROJECT_UUID}
+                        ]
+                    }
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        result = _add_sheet(tools, str(root))
+        assert result.get("success") is True, result
+
+        sheet = _sheet_node(_load(str(root)), result["sheet_uuid"])
+        assert _instance_path(sheet) == f"/{PROJECT_UUID}"
+
+    def test_file_uuid_used_when_schematic_is_standalone(self, tools, tmp_path):
+        # A schematic the project does not list (e.g. a renamed copy) is a
+        # standalone document to KiCad, so its own UUID is the root path.
+        root = tmp_path / "root.kicad_sch"
+        _write_schematic(root, root_uuid=ROOT_UUID, instance_path="/stale", pages=(2,))
+        (tmp_path / "root.kicad_pro").write_text(
+            json.dumps(
+                {
+                    "schematic": {
+                        "top_level_sheets": [
+                            {"filename": "other.kicad_sch", "name": "Top", "uuid": PROJECT_UUID}
+                        ]
+                    }
+                }
+            ),
+            encoding="utf-8",
+        )
 
         result = _add_sheet(tools, str(root))
         assert result.get("success") is True, result

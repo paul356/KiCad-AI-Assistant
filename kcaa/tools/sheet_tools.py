@@ -16,7 +16,8 @@ import uuid
 
 from fastmcp import Context, FastMCP
 
-from kcaa.utils.project_resolution import project_name
+from kcaa.utils.file_utils import load_project_json
+from kcaa.utils.project_resolution import find_project_file, project_name
 from kcaa.utils.skip_compat import safe_schematic
 
 log = logging.getLogger(__name__)
@@ -268,18 +269,57 @@ def _sheet_file_from_node(sheet_node: list) -> str | None:
     return None
 
 
+def _project_root_sheet_uuid(schematic_path: str) -> str | None:
+    """Return the root sheet UUID the owning project records for *schematic_path*.
+
+    KiCad stores the project root sheet UUID in the project file
+    (``schematic.top_level_sheets[].uuid``), not in the schematic.  The
+    ``(uuid ...)`` at the top of a ``.kicad_sch`` is the screen/file UUID and
+    may legitimately differ from the root sheet UUID (which is what every
+    instance path in the hierarchy starts with).
+
+    Only a project entry naming *schematic_path* counts: a schematic copied
+    under another name is a standalone document to KiCad, and its instances
+    are keyed by its own UUID.
+    """
+    project_file = find_project_file(schematic_path)
+    if not project_file:
+        return None
+
+    data = load_project_json(project_file)
+    if not isinstance(data, dict):
+        return None
+
+    schematic = data.get("schematic")
+    sheets = schematic.get("top_level_sheets") if isinstance(schematic, dict) else None
+    if not isinstance(sheets, list):
+        return None
+
+    target = os.path.basename(schematic_path)
+    for entry in sheets:
+        if not isinstance(entry, dict):
+            continue
+        filename = entry.get("filename")
+        entry_uuid = entry.get("uuid")
+        if isinstance(filename, str) and isinstance(entry_uuid, str):
+            if os.path.basename(filename) == target:
+                return entry_uuid
+    return None
+
+
 def _resolve_sheet_parent_path(schematic_path: str, tree: list) -> tuple[str | None, str | None]:
     """Resolve the instance path of the sheet that owns *schematic_path*.
 
-    For a root schematic this is ``"/" + <root sheet UUID>``, resolved from
-    the file's own ``(uuid ...)``, then from an existing sibling sheet's
-    ``instances`` path (preferring the clause for this schematic's stem).
-    There is no project-file fallback.
+    For a root schematic this is ``"/" + <root sheet UUID>``.  The UUID is
+    taken from the owning project's ``top_level_sheets`` entry for this file,
+    because that is the value KiCad writes into every instance path; only a
+    standalone schematic (no project entry) falls back to the file's own
+    ``(uuid ...)``, then to an existing sibling sheet's ``instances`` path
+    (preferring the clause for this schematic's stem).
 
     KiCad always writes ``(uuid ...)`` into a saved schematic and assigns one
     on load when it is missing, so a root with neither its own UUID nor an
-    existing sheet instance path is not a state KiCad produces.  The root
-    UUID must come from the schematic itself rather than a cross-file guess.
+    existing sheet instance path is not a state KiCad produces.
 
     Returns ``(path, error)``; exactly one of the two is set.  A child
     schematic has no record of its enclosing sheet path, so it is rejected
@@ -292,6 +332,10 @@ def _resolve_sheet_parent_path(schematic_path: str, tree: list) -> tuple[str | N
             "path), so the enclosing sheet path is unknown.  Add the sheet to the "
             "project's root schematic instead."
         )
+
+    project_uuid = _project_root_sheet_uuid(schematic_path)
+    if project_uuid:
+        return "/" + project_uuid, None
 
     root_uuid = _top_level_string(tree, "uuid")
     if root_uuid:
