@@ -3,8 +3,10 @@
 The tools under test serialise schematics through ``skip``, which opens
 its output file with a bare ``open(fpath, "w")``.  Without an explicit
 UTF-8 context that write follows the process locale: on Chinese Windows
-(GBK) it either raises ``UnicodeEncodeError`` for µ or silently writes
-GBK bytes that later fail to decode as UTF-8.
+(GBK) non-ASCII content either raises ``UnicodeEncodeError`` -- the
+original bug, since GBK cannot encode U+00B5 µ at all -- or is written
+as GBK bytes for characters GBK does represent (for example Chinese
+text), which then fails to decode as UTF-8.
 
 Each test runs the real tool in a subprocess whose preferred encoding is
 forced away from UTF-8, then inspects the bytes that landed on disk.
@@ -26,9 +28,11 @@ REPO_ROOT = Path(__file__).resolve().parents[3]
 # Root sheet UUID of the fixture, as recorded in its instance paths.
 ROOT_UUID = "b1f7a3c2-5d4e-4a91-8c6f-2e7d0b9a4c11"
 
-# UTF-8 and GBK encodings of U+00B5 MICRO SIGN.
+# UTF-8 encoding of U+00B5 MICRO SIGN.  GBK has no encoding for it, so a
+# locale-encoded write raises UnicodeEncodeError instead of emitting bytes.
 UTF8_MICRO = b"\xc2\xb5"
-GBK_MICRO = b"\xa1\xc0"
+# GBK bytes of 中文 (U+4E2D U+6587): the fingerprint of a GBK-encoded write.
+GBK_CHINESE = b"\xd6\xd0\xce\xc4"
 
 # Executed in a subprocess whose preferred encoding is forced away from
 # UTF-8.  Everything here stays ASCII so the script survives argv decoding
@@ -75,7 +79,12 @@ def main():
                         "reference": "R1",
                         "property_name": "Value",
                         "property_value": "10\\u00b5F",
-                    }
+                    },
+                    {
+                        "reference": "R2",
+                        "property_name": "Description",
+                        "property_value": "\\u4e2d\\u6587\\u63cf\\u8ff0",
+                    },
                 ],
             )
         )
@@ -94,7 +103,7 @@ def main():
             height=33.02,
             create_child=True,
             child_paper="A4",
-            child_title="Power Sub Sheet",
+            child_title="\\u7535\\u6e90\\u5b50\\u56fe",
         )
     )
     if not result.get("success"):
@@ -116,17 +125,24 @@ except BaseException:
 
 
 def _stage_schematic(tmp_path: Path) -> Path:
-    """Copy the R1/R2 fixture and give R2 a non-ASCII value.
+    """Copy the R1/R2 fixture and stage non-ASCII content on disk.
 
-    The micro sign must already be in the file so that every tool which
-    re-serialises the schematic has to write it back.
+    R1's value is ``3µF`` so the property test can prove a rewrite by
+    changing it to ``10µF``.  R2's datasheet is Chinese so every tool that
+    re-serialises the schematic must carry GBK-encodable text through the
+    same write path too.
     """
     path = tmp_path / "pin_edit.kicad_sch"
     shutil.copy(FIXTURE, path)
     text = path.read_text(encoding="utf-8")
-    target = '(property "Value" "Plain" (at 122.54 101.27 0)'
-    assert target in text
-    text = text.replace(target, '(property "Value" "10\u00b5F" (at 122.54 101.27 0)', 1)
+    value_target = '(property "Value" "Plain" (at 102.54 101.27 0)'
+    datasheet_target = '(property "Datasheet" "~" (at 120 100 0)'
+    assert value_target in text
+    assert datasheet_target in text
+    text = text.replace(value_target, '(property "Value" "3\u00b5F" (at 102.54 101.27 0)', 1)
+    text = text.replace(
+        datasheet_target, '(property "Datasheet" "\u4e2d\u6587\u6570\u636e" (at 120 100 0)', 1
+    )
     path.write_text(text, encoding="utf-8")
 
     # The sheet tools resolve the root sheet UUID through an owning project
@@ -164,9 +180,14 @@ def _run_tool(tmp_path: Path, schematic_path: Path, mode: str) -> str:
 
 
 def _assert_utf8(path: Path) -> str:
-    """Decode *path* as UTF-8, rejecting a GBK-encoded micro sign."""
+    """Decode *path* as UTF-8, rejecting GBK-encoded Chinese text.
+
+    A locale-encoded write leaves GBK bytes for Chinese text.  A lone
+    latin-1 ``0xB5`` for µ needs no separate check: it is not valid UTF-8,
+    so the strict decode below already rejects it (UTF-8 µ is ``0xC2 0xB5``).
+    """
     raw = path.read_bytes()
-    assert GBK_MICRO not in raw, f"{path} contains GBK-encoded µ"
+    assert GBK_CHINESE not in raw, f"{path} contains GBK-encoded Chinese text"
     return raw.decode("utf-8")
 
 
@@ -178,9 +199,14 @@ def test_set_symbol_property_writes_utf8_under_non_utf8_locale(tmp_path: Path) -
     path = _stage_schematic(tmp_path)
     _run_tool(tmp_path, path, "property")
 
+    raw = path.read_bytes()
     text = _assert_utf8(path)
+    # The staged value was 3µF; seeing 10µF and no 3µF proves a rewrite.
     assert "10\u00b5F" in text
-    assert UTF8_MICRO in path.read_bytes()
+    assert "3\u00b5F" not in text
+    assert "\u4e2d\u6587\u63cf\u8ff0" in text
+    assert "\u4e2d\u6587\u6570\u636e" in text
+    assert raw.count(UTF8_MICRO) == 1
     assert list(tmp_path.glob("*.tmp")) == []
     assert (tmp_path / "pin_edit.kicad_sch.bak").exists()
 
@@ -194,13 +220,16 @@ def test_add_sheet_symbol_writes_utf8_under_non_utf8_locale(tmp_path: Path) -> N
     path = _stage_schematic(tmp_path)
     _run_tool(tmp_path, path, "sheet")
 
+    raw = path.read_bytes()
     parent_text = _assert_utf8(path)
-    assert "10\u00b5F" in parent_text
+    assert "3\u00b5F" in parent_text
+    assert "\u4e2d\u6587\u6570\u636e" in parent_text
     assert "Power_Sub" in parent_text
+    assert raw.count(UTF8_MICRO) == 1
 
     child = tmp_path / "power_sub.kicad_sch"
     assert child.exists()
-    _assert_utf8(child)
+    assert "\u7535\u6e90\u5b50\u56fe" in _assert_utf8(child)
 
     assert list(tmp_path.glob("*.tmp")) == []
     assert (tmp_path / "pin_edit.kicad_sch.bak").exists()
