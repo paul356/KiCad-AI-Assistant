@@ -16,6 +16,7 @@ import uuid
 
 from fastmcp import Context, FastMCP
 
+from kcaa.utils.atomic_io import read_text_utf8
 from kcaa.utils.file_utils import load_project_json
 from kcaa.utils.project_resolution import find_project_file, project_name
 from kcaa.utils.schematic_sexp_utils import write_schematic_text
@@ -175,8 +176,7 @@ def _load_schematic_tree(path: str) -> list:
     """Parse *path* into its raw ``sexpdata`` tree."""
     import sexpdata
 
-    with open(path, encoding="utf-8") as fh:
-        return sexpdata.loads(fh.read())
+    return sexpdata.loads(read_text_utf8(path))
 
 
 def _try_load_schematic_tree(path: str) -> list | None:

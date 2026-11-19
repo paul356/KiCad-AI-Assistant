@@ -10,7 +10,7 @@ from typing import Any
 
 import sexpdata
 
-from kcaa.utils.atomic_io import atomic_write_with, read_text_utf8
+from kcaa.utils.atomic_io import atomic_write_text, read_text_utf8
 
 # Top-level PCB elements that should start on their own line for readability.
 _NEWLINE_ELEMENTS = [
@@ -49,7 +49,7 @@ def load_pcb(path: str) -> list[Any]:
         raise ValueError(f"Failed to parse PCB file '{path}': {exc}") from exc
 
 
-def save_pcb(path: str, data: list[Any]) -> str:
+def save_pcb(path: str, data: list[Any]) -> str | None:
     """Write *data* back to *path*, creating a .bak backup first.
 
     Uses an atomic write: serializes to a .tmp sibling file then
@@ -58,17 +58,13 @@ def save_pcb(path: str, data: list[Any]) -> str:
 
     :param path: Absolute path to the .kicad_pcb file to overwrite.
     :param data: The (possibly mutated) S-expression tree.
-    :returns: Path to the backup file that was created.
+    :returns: Path to the backup file, or ``None`` if the target
+        did not exist when it was saved.
     :raises OSError: If the backup, write, sync, or atomic rename fails.
         The original file is left untouched in every case.
     """
     text = _serialize(data)
-
-    def _write(tmp_path: str) -> None:
-        with open(tmp_path, "w", encoding="utf-8") as fh:
-            fh.write(text)
-
-    return atomic_write_with(path, _write, create_backup=True)
+    return atomic_write_text(path, text, create_backup=True)
 
 
 def _serialize(data: list[Any]) -> str:

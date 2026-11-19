@@ -17,7 +17,7 @@ from typing import Any
 
 import sexpdata
 
-from kcaa.utils.atomic_io import atomic_write_text
+from kcaa.utils.atomic_io import atomic_write_text, read_text_utf8
 
 log = logging.getLogger(__name__)
 
@@ -97,8 +97,7 @@ def register_library_in_table(
     backup_path: str | None = None
 
     if os.path.isfile(table_path):
-        with open(table_path, encoding="utf-8") as fh:
-            original = fh.read()
+        original = read_text_utf8(table_path)
         if f'name "{nickname}"' in original:
             log.info("Library %r already registered in %s", nickname, table_path)
             return {"registered": False, "table_path": table_path, "reason": "already_registered"}
@@ -158,8 +157,7 @@ def unregister_library_in_table(
     if not os.path.isfile(table_path):
         return {"unregistered": False, "reason": "table not found", "table_path": table_path}
 
-    with open(table_path, encoding="utf-8") as fh:
-        original = fh.read()
+    original = read_text_utf8(table_path)
     needle = f'name "{nickname}"'
     if needle not in original:
         return {"unregistered": False, "table_path": table_path, "reason": "not_registered"}

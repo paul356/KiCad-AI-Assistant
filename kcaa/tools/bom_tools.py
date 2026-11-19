@@ -4,6 +4,8 @@ Bill of Materials (BOM) processing tools for KiCad projects.
 
 import csv
 import json
+import locale
+import logging
 import os
 from typing import Any
 
@@ -14,6 +16,8 @@ from kcaa.utils.atomic_io import read_text_utf8
 from kcaa.utils.config import config
 from kcaa.utils.file_utils import get_project_files
 from kcaa.utils.project_resolution import project_name
+
+log = logging.getLogger(__name__)
 
 
 def register_bom_tools(mcp: FastMCP) -> None:
@@ -345,8 +349,21 @@ def parse_bom_file(file_path: str) -> tuple[list[dict[str, Any]], dict[str, Any]
                     components.append(component)
 
         elif ext == ".json":
-            # Parse JSON
-            data = json.loads(read_text_utf8(file_path))
+            # Parse JSON.  BOM files are user/AI-generated, so a legacy
+            # locale encoding degrades to a lenient read instead of
+            # aborting the analysis.
+            try:
+                data = json.loads(read_text_utf8(file_path))
+            except ValueError as exc:
+                fallback_encoding = locale.getpreferredencoding(False)
+                log.warning(
+                    "Could not decode %s as UTF-8 (%s); retrying with %s",
+                    file_path,
+                    exc,
+                    fallback_encoding,
+                )
+                with open(file_path, encoding=fallback_encoding, errors="replace") as fh:
+                    data = json.load(fh)
 
             format_info["detected_format"] = "json"
 
@@ -748,7 +765,7 @@ async def export_bom_with_cli(
             await ctx.report_progress(80, 100)
 
         # Read the first few lines of the BOM to verify it's valid
-        bom_content = read_text_utf8(output_file)[:1024]
+        bom_content = read_text_utf8(output_file, limit=1024)
 
         if len(bom_content.strip()) == 0:
             return {

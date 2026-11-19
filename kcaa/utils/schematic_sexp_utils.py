@@ -29,7 +29,7 @@ def write_schematic_text(path: str, text: str) -> None:
     atomic_write_text(path, text)
 
 
-def save_schematic(path: str, sch: Any) -> str:
+def save_schematic(path: str, sch: Any) -> str | None:
     """Write *sch* back to *path*, creating a .bak backup first.
 
     The serialisation runs inside :func:`utf8_open_context` because skip's
@@ -39,7 +39,8 @@ def save_schematic(path: str, sch: Any) -> str:
 
     :param path: Absolute path to the .kicad_sch file to overwrite.
     :param sch: The (possibly mutated) skip.Schematic object.
-    :returns: Path to the backup file that was created.
+    :returns: Path to the backup file, or ``None`` if the target
+        did not exist when it was saved.
     :raises OSError: If the backup, write, sync, or atomic rename fails.
         The original file is left untouched in every case.
     """

@@ -18,6 +18,11 @@ from kcaa.utils.skip_compat import safe_schematic
 NON_ASCII = "µΩ中文"
 REPO_ROOT = Path(__file__).resolve().parents[3]
 
+
+def _tmp_files(directory: Path) -> list[Path]:
+    return list(directory.glob("*.tmp"))
+
+
 # Minimal valid schematic.  The text element carries characters that cannot
 # be encoded with ASCII/gbk, so a locale-dependent write fails on it.
 _SCHEMATIC = f"""(kicad_sch (version 20260306) (generator "kcaa") (generator_version "0.2.0")
@@ -83,7 +88,7 @@ def test_save_under_non_utf8_locale(tmp_path: Path) -> None:
     raw = path.read_bytes()
     assert NON_ASCII in raw.decode("utf-8")
     assert _text_values(path) == [NON_ASCII]
-    assert not (tmp_path / "board.kicad_sch.tmp").exists()
+    assert _tmp_files(tmp_path) == []
 
 
 def test_serialization_failure_leaves_original_bytes(
@@ -104,7 +109,7 @@ def test_serialization_failure_leaves_original_bytes(
 
     assert "disk full" in str(excinfo.value)
     assert path.read_bytes() == original
-    assert not (tmp_path / "board.kicad_sch.tmp").exists()
+    assert _tmp_files(tmp_path) == []
     # The pre-write backup was already taken and still reflects the original.
     assert (tmp_path / "board.kicad_sch.bak").read_bytes() == original
 
@@ -128,7 +133,7 @@ def test_oserror_type_and_attributes_survive(
     assert excinfo.value.errno == errno.EACCES
     assert excinfo.value.filename == target
     assert path.read_bytes() == original
-    assert not (tmp_path / "board.kicad_sch.tmp").exists()
+    assert _tmp_files(tmp_path) == []
 
 
 def test_non_oserror_is_wrapped_with_context(
@@ -150,7 +155,7 @@ def test_non_oserror_is_wrapped_with_context(
     assert str(path) in str(excinfo.value)
     assert str(path) + ".bak" in str(excinfo.value)
     assert path.read_bytes() == original
-    assert not (tmp_path / "board.kicad_sch.tmp").exists()
+    assert _tmp_files(tmp_path) == []
 
 
 def test_refused_write_does_not_replace_target(
@@ -158,8 +163,6 @@ def test_refused_write_does_not_replace_target(
 ) -> None:
     """skip silently skipping the write must not be mistaken for success."""
     path, original = _stage_schematic(tmp_path)
-    stale_tmp = tmp_path / "board.kicad_sch.tmp"
-    stale_tmp.write_bytes(b"(kicad_sch (stale output from an earlier crash))")
 
     class _RefusingWriter:
         def write(self, fpath: str) -> None:  # pragma: no cover - must not write
@@ -171,7 +174,7 @@ def test_refused_write_does_not_replace_target(
     assert str(path) in str(excinfo.value)
     assert str(path) + ".bak" in str(excinfo.value)
     assert path.read_bytes() == original
-    assert not stale_tmp.exists()
+    assert _tmp_files(tmp_path) == []
 
 
 def test_backup_failure_does_not_touch_target(
@@ -189,7 +192,7 @@ def test_backup_failure_does_not_touch_target(
         save_schematic(str(path), safe_schematic(str(path)))
 
     assert path.read_bytes() == original
-    assert not (tmp_path / "board.kicad_sch.tmp").exists()
+    assert _tmp_files(tmp_path) == []
 
 
 def test_backup_matches_pre_write_bytes(tmp_path: Path) -> None:
@@ -227,7 +230,7 @@ def test_write_schematic_text_is_utf8(tmp_path: Path) -> None:
     schematic_sexp_utils.write_schematic_text(str(path), payload)
 
     assert path.read_bytes().decode("utf-8") == payload
-    assert not (tmp_path / "child.kicad_sch.tmp").exists()
+    assert _tmp_files(tmp_path) == []
 
 
 def test_write_schematic_text_failure_leaves_no_partial_target(
@@ -244,7 +247,7 @@ def test_write_schematic_text_failure_leaves_no_partial_target(
         schematic_sexp_utils.write_schematic_text(str(path), "(kicad_sch)\n")
 
     assert not path.exists()
-    assert not (tmp_path / "child.kicad_sch.tmp").exists()
+    assert _tmp_files(tmp_path) == []
 
 
 def test_generate_child_schematic_writes_utf8_atomically(tmp_path: Path) -> None:
@@ -257,7 +260,7 @@ def test_generate_child_schematic_writes_utf8_atomically(tmp_path: Path) -> None
 
     assert child_path == tmp_path / "child.kicad_sch"
     assert title in child_path.read_bytes().decode("utf-8")
-    assert not Path(str(child_path) + ".tmp").exists()
+    assert _tmp_files(tmp_path) == []
 
 
 def test_chmod_failure_does_not_fail_save(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -266,7 +269,7 @@ def test_chmod_failure_does_not_fail_save(tmp_path: Path, monkeypatch: pytest.Mo
     chmod_calls: list[str] = []
 
     def _deny_chmod(target: str, mode: int, *, follow_symlinks: bool = True) -> None:
-        if target.endswith(".kicad_sch.tmp"):
+        if ".kicad_sch." in target and target.endswith(".tmp"):
             chmod_calls.append(target)
             raise PermissionError(errno.EPERM, "chmod refused", target)
 
@@ -278,4 +281,4 @@ def test_chmod_failure_does_not_fail_save(tmp_path: Path, monkeypatch: pytest.Mo
     assert Path(backup).exists()
     assert NON_ASCII in path.read_bytes().decode("utf-8")
     assert _text_values(path) == [NON_ASCII]
-    assert not (tmp_path / "board.kicad_sch.tmp").exists()
+    assert _tmp_files(tmp_path) == []

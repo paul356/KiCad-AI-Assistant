@@ -20,6 +20,7 @@ Dependencies:
     - platform: Operating system detection
 """
 
+import locale
 import logging
 import os
 import platform
@@ -249,7 +250,22 @@ class ServerConfig:
             env_path: Full path to the .env file to load
         """
         try:
-            for line in read_text_utf8(env_path).splitlines():
+            try:
+                content = read_text_utf8(env_path)
+            except ValueError as exc:
+                # .env is a human-authored file, not a KiCad-native one:
+                # tolerate a legacy locale encoding instead of refusing it.
+                fallback_encoding = locale.getpreferredencoding(False)
+                log.warning(
+                    "Could not decode %s as UTF-8 (%s); retrying with %s",
+                    env_path,
+                    exc,
+                    fallback_encoding,
+                )
+                with open(env_path, encoding=fallback_encoding) as fh:
+                    content = fh.read()
+
+            for line in content.splitlines():
                 line = line.strip()
 
                 # Skip empty lines and comments
@@ -279,7 +295,7 @@ class ServerConfig:
                     os.environ[key] = value
                     log.debug(f"Set {key} from .env")
 
-        except Exception:
+        except (OSError, ValueError):
             log.exception(f"Error loading .env file '{env_path}'")
 
     def _find_env_file(self, filename: str) -> str | None:

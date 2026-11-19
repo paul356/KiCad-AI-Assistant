@@ -12,6 +12,10 @@ from kcaa.utils.pcb_sexp_utils import load_pcb, save_pcb
 PCB_TEXT = '(kicad_pcb (version 20240108) (generator "kcaa") (layers))\n'
 
 
+def _tmp_files(directory: Path) -> list[Path]:
+    return list(directory.glob("*.tmp"))
+
+
 def _stage_pcb(tmp_path: Path) -> tuple[Path, list]:
     path = tmp_path / "board.kicad_pcb"
     path.write_text(PCB_TEXT, encoding="utf-8")
@@ -27,7 +31,7 @@ def test_save_pcb_backs_up_previous_version(tmp_path: Path) -> None:
     assert bak == str(path) + ".bak"
     assert Path(bak).read_bytes() == original
     assert path.read_text(encoding="utf-8").startswith("(kicad_pcb")
-    assert not (tmp_path / "board.kicad_pcb.tmp").exists()
+    assert _tmp_files(tmp_path) == []
 
 
 def test_serialize_failure_leaves_target_untouched(
@@ -46,7 +50,7 @@ def test_serialize_failure_leaves_target_untouched(
 
     assert path.read_bytes() == original
     assert not (tmp_path / "board.kicad_pcb.bak").exists()
-    assert not (tmp_path / "board.kicad_pcb.tmp").exists()
+    assert _tmp_files(tmp_path) == []
 
 
 def test_write_failure_keeps_target_and_removes_tmp(
@@ -65,7 +69,7 @@ def test_write_failure_keeps_target_and_removes_tmp(
 
     assert path.read_bytes() == original
     assert Path(str(path) + ".bak").read_bytes() == original
-    assert not (tmp_path / "board.kicad_pcb.tmp").exists()
+    assert _tmp_files(tmp_path) == []
 
 
 def test_load_pcb_rejects_gbk_with_guidance(tmp_path: Path) -> None:
