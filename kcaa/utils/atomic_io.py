@@ -23,6 +23,35 @@ import uuid
 Writer = Callable[[str], None]
 
 
+def detect_newline(text: str) -> str:
+    """Return the dominant line terminator used by *text*.
+
+    ``\\r\\n`` is chosen only when it occurs more often than a bare ``\\n``
+    (one not preceded by ``\\r``).  Ties, text without any newline, and the
+    empty string all resolve to ``\\n``.
+
+    :param text: File contents as read with ``newline=""``.
+    :returns: ``"\\r\\n"`` or ``"\\n"``.
+    """
+    crlf = text.count("\r\n")
+    bare_lf = text.count("\n") - crlf
+    return "\r\n" if crlf > bare_lf else "\n"
+
+
+def normalize_newlines(text: str, newline: str) -> str:
+    """Rewrite every line terminator in *text* as *newline*.
+
+    A file written with a homogeneous terminator is left byte-identical;
+    mixed input is unified on the requested terminator.
+
+    :param text: Text whose terminators should be rewritten.
+    :param newline: Target terminator, normally from :func:`detect_newline`.
+    :returns: *text* with every line ending replaced.
+    """
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
+    return text if newline == "\n" else text.replace("\n", newline)
+
+
 def discard(path: str) -> None:
     """Remove *path* if present; cleanup must never mask the real error.
 
@@ -61,22 +90,27 @@ def preserve_mode(source: str, target: str) -> None:
         pass
 
 
-def read_text_utf8(path: str, limit: int | None = None) -> str:
+def read_text_utf8(path: str, limit: int | None = None, *, preserve_newlines: bool = False) -> str:
     """Read a KiCad text file as strict UTF-8, tolerating a leading BOM.
 
-    Newlines are normalised (``newline=None``).  Offset-sensitive callers
-    that need the original line endings (for example span-based edits such
-    as ``set_symbol_pin``) must open the file themselves with ``newline=""``.
+    Newlines are normalised by default (``newline=None``).  Offset-sensitive
+    callers that need the original line endings (for example span-based edits
+    such as ``set_symbol_pin``) must open the file themselves with
+    ``newline=""``, or pass ``preserve_newlines=True``.
 
     :param path: File to read.
     :param limit: Optional maximum number of characters to read.
+    :param preserve_newlines: Keep the file's original ``\\r\\n`` / ``\\n``
+        bytes instead of normalising them.  Read-modify-write callers that
+        rebuild the whole text use this and then restore the dominant
+        terminator with :func:`detect_newline`.
     :returns: Decoded file contents.
     :raises ValueError: If the bytes are not valid UTF-8.  The message names
         the path and explains how to recover the file.
     :raises OSError: If the file cannot be opened.
     """
     try:
-        with open(path, encoding="utf-8-sig") as fh:
+        with open(path, encoding="utf-8-sig", newline="" if preserve_newlines else None) as fh:
             return fh.read() if limit is None else fh.read(limit)
     except UnicodeDecodeError as exc:
         raise ValueError(
