@@ -24,6 +24,8 @@ import logging
 import os
 import platform
 
+from kcaa.utils.atomic_io import read_text_utf8
+
 log = logging.getLogger(__name__)
 
 
@@ -247,36 +249,35 @@ class ServerConfig:
             env_path: Full path to the .env file to load
         """
         try:
-            with open(env_path) as f:
-                for line in f:
-                    line = line.strip()
+            for line in read_text_utf8(env_path).splitlines():
+                line = line.strip()
 
-                    # Skip empty lines and comments
-                    if not line or line.startswith("#"):
-                        continue
+                # Skip empty lines and comments
+                if not line or line.startswith("#"):
+                    continue
 
-                    # Parse key-value pairs
-                    if "=" in line:
-                        key, value = line.split("=", 1)
-                        key = key.strip()
-                        value = value.strip()
+                # Parse key-value pairs
+                if "=" in line:
+                    key, value = line.split("=", 1)
+                    key = key.strip()
+                    value = value.strip()
 
-                        # Remove quotes if present
-                        if (
-                            value.startswith('"')
-                            and value.endswith('"')
-                            or value.startswith("'")
-                            and value.endswith("'")
-                        ):
-                            value = value[1:-1]
+                    # Remove quotes if present
+                    if (
+                        value.startswith('"')
+                        and value.endswith('"')
+                        or value.startswith("'")
+                        and value.endswith("'")
+                    ):
+                        value = value[1:-1]
 
-                        # Expand ~ to user's home directory
-                        if "~" in value:
-                            value = os.path.expanduser(value)
+                    # Expand ~ to user's home directory
+                    if "~" in value:
+                        value = os.path.expanduser(value)
 
-                        # Set environment variable
-                        os.environ[key] = value
-                        log.debug(f"Set {key} from .env")
+                    # Set environment variable
+                    os.environ[key] = value
+                    log.debug(f"Set {key} from .env")
 
         except Exception:
             log.exception(f"Error loading .env file '{env_path}'")

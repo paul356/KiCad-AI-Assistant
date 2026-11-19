@@ -10,11 +10,11 @@ or kicad-cli is required.
 import json as _json
 import logging
 import os
-import shutil
 from typing import Any
 
 import sexpdata
 
+from kcaa.utils.atomic_io import atomic_write_text
 from kcaa.utils.project_resolution import find_project_file
 
 log = logging.getLogger(__name__)
@@ -111,14 +111,13 @@ def _save_dru(dru_file: str, data: list[Any]) -> str | None:
     bak_path = None
     if os.path.exists(dru_file):
         bak_path = dru_file + ".bak"
-        shutil.copy2(dru_file, bak_path)
 
     lines = [sexpdata.dumps(item) for item in data]
     text = "\n".join(lines) + "\n"
-    tmp_path = dru_file + ".tmp"
-    with open(tmp_path, "w", encoding="utf-8") as f:
-        f.write(text)
-    os.replace(tmp_path, dru_file)
+    if bak_path is None:
+        atomic_write_text(dru_file, text)
+    else:
+        atomic_write_text(dru_file, text, create_backup=True)
     return bak_path
 
 

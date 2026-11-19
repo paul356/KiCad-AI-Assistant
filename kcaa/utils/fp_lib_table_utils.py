@@ -16,12 +16,12 @@ from __future__ import annotations
 import logging
 import os
 import re
-import shutil
 from typing import Any
 
 import sexpdata
 
 from kcaa.utils import pcb_library_utils
+from kcaa.utils.atomic_io import atomic_write_text
 
 log = logging.getLogger(__name__)
 
@@ -121,15 +121,14 @@ def register_library_in_table(
             data.append(sexpdata.loads(entry))
             new_text = sexpdata.dumps(data, pretty_print=True, indent_as="\t") + "\n"
         backup_path = table_path + ".bak"
-        shutil.copy2(table_path, backup_path)
     else:
         os.makedirs(os.path.dirname(table_path) or ".", exist_ok=True)
         new_text = "(fp_lib_table\n\t(version 7)\n\t" + entry + "\n)\n"
 
-    tmp_path = table_path + ".tmp"
-    with open(tmp_path, "w", encoding="utf-8") as fh:
-        fh.write(new_text)
-    os.replace(tmp_path, table_path)
+    if backup_path is None:
+        atomic_write_text(table_path, new_text)
+    else:
+        atomic_write_text(table_path, new_text, create_backup=True)
     return {
         "registered": True,
         "table_path": table_path,
@@ -196,11 +195,7 @@ def unregister_library_in_table(
         new_text = sexpdata.dumps(kept_data, pretty_print=True, indent_as="\t") + "\n"
 
     backup_path = table_path + ".bak"
-    shutil.copy2(table_path, backup_path)
-    tmp_path = table_path + ".tmp"
-    with open(tmp_path, "w", encoding="utf-8") as fh:
-        fh.write(new_text)
-    os.replace(tmp_path, table_path)
+    atomic_write_text(table_path, new_text, create_backup=True)
     return {
         "unregistered": True,
         "table_path": table_path,

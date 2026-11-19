@@ -18,6 +18,7 @@ from typing import Any
 
 import sexpdata
 
+from kcaa.utils.atomic_io import atomic_write_text
 from kcaa.utils.sexp_utils import sym_str as _sym
 
 log = logging.getLogger(__name__)
@@ -723,9 +724,6 @@ def write_footprint_mod(library_dir: str, name: str, node: list[Any]) -> str:
     if os.path.exists(path):
         raise FileExistsError(f"Footprint already exists: {path}")
     text = serialize_footprint_mod(node)
-    tmp_path = path + ".tmp"
-    with open(tmp_path, "w", encoding="utf-8") as fh:
-        fh.write(text)
-    os.replace(tmp_path, path)
+    atomic_write_text(path, text)
     log.info("Exported footprint %s -> %s", name, path)
     return path

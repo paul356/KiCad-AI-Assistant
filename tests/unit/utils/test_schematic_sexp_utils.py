@@ -11,7 +11,7 @@ import sys
 import pytest
 
 from kcaa.tools.sheet_tools import _generate_child_schematic
-from kcaa.utils import schematic_sexp_utils
+from kcaa.utils import atomic_io, schematic_sexp_utils
 from kcaa.utils.schematic_sexp_utils import save_schematic
 from kcaa.utils.skip_compat import safe_schematic
 
@@ -120,7 +120,7 @@ def test_oserror_type_and_attributes_survive(
     def _fail_replace(src: str, dst: str) -> None:
         raise PermissionError(errno.EACCES, "permission denied", dst)
 
-    monkeypatch.setattr(schematic_sexp_utils.os, "replace", _fail_replace)
+    monkeypatch.setattr(atomic_io.os, "replace", _fail_replace)
 
     with pytest.raises(PermissionError) as excinfo:
         save_schematic(target, sch)
@@ -183,7 +183,7 @@ def test_backup_failure_does_not_touch_target(
     def _fail_copy(src: str, dst: str) -> None:
         raise OSError("backup refused")
 
-    monkeypatch.setattr(schematic_sexp_utils.shutil, "copy", _fail_copy)
+    monkeypatch.setattr(atomic_io.shutil, "copy2", _fail_copy)
 
     with pytest.raises(OSError, match="backup refused"):
         save_schematic(str(path), safe_schematic(str(path)))
@@ -238,7 +238,7 @@ def test_write_schematic_text_failure_leaves_no_partial_target(
     def _fail_replace(src: str, dst: str) -> None:
         raise OSError("rename refused")
 
-    monkeypatch.setattr(schematic_sexp_utils.os, "replace", _fail_replace)
+    monkeypatch.setattr(atomic_io.os, "replace", _fail_replace)
 
     with pytest.raises(OSError, match="rename refused"):
         schematic_sexp_utils.write_schematic_text(str(path), "(kicad_sch)\n")
@@ -265,12 +265,12 @@ def test_chmod_failure_does_not_fail_save(tmp_path: Path, monkeypatch: pytest.Mo
     path, _ = _stage_schematic(tmp_path)
     chmod_calls: list[str] = []
 
-    def _deny_chmod(target: str, mode: int) -> None:
+    def _deny_chmod(target: str, mode: int, *, follow_symlinks: bool = True) -> None:
         if target.endswith(".kicad_sch.tmp"):
             chmod_calls.append(target)
             raise PermissionError(errno.EPERM, "chmod refused", target)
 
-    monkeypatch.setattr(schematic_sexp_utils.os, "chmod", _deny_chmod)
+    monkeypatch.setattr(atomic_io.os, "chmod", _deny_chmod)
 
     backup = save_schematic(str(path), safe_schematic(str(path)))
 

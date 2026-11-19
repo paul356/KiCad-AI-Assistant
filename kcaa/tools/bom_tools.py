@@ -10,6 +10,7 @@ from typing import Any
 from fastmcp import Context, FastMCP
 import pandas as pd
 
+from kcaa.utils.atomic_io import read_text_utf8
 from kcaa.utils.config import config
 from kcaa.utils.file_utils import get_project_files
 from kcaa.utils.project_resolution import project_name
@@ -345,8 +346,7 @@ def parse_bom_file(file_path: str) -> tuple[list[dict[str, Any]], dict[str, Any]
 
         elif ext == ".json":
             # Parse JSON
-            with open(file_path) as f:
-                data = json.load(f)
+            data = json.loads(read_text_utf8(file_path))
 
             format_info["detected_format"] = "json"
 
@@ -748,8 +748,7 @@ async def export_bom_with_cli(
             await ctx.report_progress(80, 100)
 
         # Read the first few lines of the BOM to verify it's valid
-        with open(output_file) as f:
-            bom_content = f.read(1024)  # Read first 1KB
+        bom_content = read_text_utf8(output_file)[:1024]
 
         if len(bom_content.strip()) == 0:
             return {

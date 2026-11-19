@@ -5,12 +5,12 @@ Only concerns: load, save, and backup.  No domain knowledge about
 footprints, nets, or layers lives here.
 """
 
-import os
 import re
-import shutil
 from typing import Any
 
 import sexpdata
+
+from kcaa.utils.atomic_io import atomic_write_with, read_text_utf8
 
 # Top-level PCB elements that should start on their own line for readability.
 _NEWLINE_ELEMENTS = [
@@ -40,10 +40,9 @@ def load_pcb(path: str) -> list[Any]:
     :param path: Absolute path to the .kicad_pcb file.
     :returns: A list representing the parsed S-expression tree.
     :raises FileNotFoundError: If path does not exist.
-    :raises ValueError: If the file cannot be parsed.
+    :raises ValueError: If the file is not valid UTF-8 or cannot be parsed.
     """
-    with open(path, encoding="utf-8") as fh:
-        raw = fh.read()
+    raw = read_text_utf8(path)
     try:
         return sexpdata.loads(raw)
     except Exception as exc:
@@ -60,18 +59,16 @@ def save_pcb(path: str, data: list[Any]) -> str:
     :param path: Absolute path to the .kicad_pcb file to overwrite.
     :param data: The (possibly mutated) S-expression tree.
     :returns: Path to the backup file that was created.
-    :raises OSError: If the backup copy or the atomic rename fails.
+    :raises OSError: If the backup, write, sync, or atomic rename fails.
+        The original file is left untouched in every case.
     """
-    bak_path = path + ".bak"
-    tmp_path = path + ".tmp"
-    shutil.copy2(path, bak_path)
-
     text = _serialize(data)
-    with open(tmp_path, "w", encoding="utf-8") as fh:
-        fh.write(text)
-    os.replace(tmp_path, path)
 
-    return bak_path
+    def _write(tmp_path: str) -> None:
+        with open(tmp_path, "w", encoding="utf-8") as fh:
+            fh.write(text)
+
+    return atomic_write_with(path, _write, create_backup=True)
 
 
 def _serialize(data: list[Any]) -> str:

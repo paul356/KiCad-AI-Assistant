@@ -17,12 +17,11 @@ import copy
 import logging
 import os
 import re
-import shutil
-import stat
 from typing import Any
 
 import sexpdata
 
+from kcaa.utils.atomic_io import atomic_write_text
 from kcaa.utils.config import ServerConfig
 from kcaa.utils.sexp_utils import sym_str as _sym
 
@@ -271,8 +270,7 @@ def create_empty_library_file(file_path: str) -> str:
     if os.path.exists(file_path):
         raise FileExistsError(f"Library file already exists, refusing to overwrite: {file_path}")
     os.makedirs(os.path.dirname(file_path) or ".", exist_ok=True)
-    with open(file_path, "w", encoding="utf-8") as fh:
-        fh.write(_LIB_HEADER + "\n)\n")
+    atomic_write_text(file_path, _LIB_HEADER + "\n)\n")
     return file_path
 
 
@@ -359,17 +357,13 @@ def append_symbol_to_library(file_path: str, lib_sym_raw: list, symbol_name: str
     raw_copy[1] = symbol_name
     node_text = sexpdata.dumps(raw_copy)
 
-    shutil.copy2(file_path, file_path + ".bak")
     # Insert the new (symbol ...) node before the final closing paren of the
     # kicad_symbol_lib root, keeping the pretty layout.
     idx = stripped.rfind("\n)")
     if idx == -1:
         idx = len(stripped) - 1
     new_text = stripped[:idx] + "\n  " + node_text + stripped[idx:] + "\n"
-    tmp_path = file_path + ".tmp"
-    with open(tmp_path, "w", encoding="utf-8") as fh:
-        fh.write(new_text)
-    os.replace(tmp_path, file_path)
+    atomic_write_text(file_path, new_text, create_backup=True)
     return os.path.abspath(file_path)
 
 
@@ -541,11 +535,7 @@ def remove_symbol_from_library_file(file_path: str, symbol_name: str) -> str:
         remove_end = j + 1
 
     new_text = text[:line_start] + text[remove_end:]
-    shutil.copy2(file_path, file_path + ".bak")
-    tmp_path = file_path + ".tmp"
-    with open(tmp_path, "w", encoding="utf-8") as fh:
-        fh.write(new_text)
-    os.replace(tmp_path, file_path)
+    atomic_write_text(file_path, new_text, create_backup=True)
     return os.path.abspath(file_path)
 
 
@@ -1088,7 +1078,6 @@ def set_symbol_pin(
                 f"Library file is not writable: {file_path} "
                 "(fix the file permissions and retry; nothing was changed)"
             )
-        mode = stat.S_IMODE(os.stat(file_path).st_mode)
         new_text = text
         for (replace_start, replace_end), replacement in sorted(
             replacements, key=lambda item: item[0][0], reverse=True
@@ -1096,14 +1085,7 @@ def set_symbol_pin(
             new_text = new_text[:replace_start] + replacement + new_text[replace_end:]
         file_path = os.path.abspath(file_path)
         backup_path = file_path + ".bak"
-        shutil.copy2(file_path, backup_path)
-        tmp_path = file_path + ".tmp"
-        with open(tmp_path, "w", encoding="utf-8", newline="") as fh:
-            fh.write(new_text)
-        # Keep the library's own mode (e.g. 0640); the temp file is created
-        # with the process default otherwise.
-        os.chmod(tmp_path, mode)
-        os.replace(tmp_path, file_path)
+        atomic_write_text(file_path, new_text, create_backup=True)
 
     return {
         "symbol_name": symbol_name,
