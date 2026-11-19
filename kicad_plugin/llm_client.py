@@ -634,7 +634,7 @@ _COMPACTION_SUMMARY_FLOOR_CHARS = 800
 # "python-requests/2.32.3" from PluginSettings ("Don't use kicad plugin as a
 # type of agent" — review on #150). Version literal must stay in sync with
 # pyproject.toml (the plugin package has no __version__).
-_LLM_USER_AGENT = "KiCad-AI-Assistant/0.2.12 (+https://github.com/paul356/KiCad-AI-Assistant)"
+_LLM_USER_AGENT = "KiCad-AI-Assistant/0.2.13 (+https://github.com/paul356/KiCad-AI-Assistant)"
 
 # ------------------------------------------------------------------
 # On-demand tool loading (issue #129)

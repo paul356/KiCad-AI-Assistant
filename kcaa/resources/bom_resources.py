@@ -11,6 +11,7 @@ import pandas as pd
 
 # Import the helper functions from bom_tools.py to avoid code duplication
 from kcaa.tools.bom_tools import analyze_bom_data, parse_bom_file
+from kcaa.utils.atomic_io import read_text_utf8
 from kcaa.utils.file_utils import get_project_files
 from kcaa.utils.project_resolution import project_name
 
@@ -269,16 +270,15 @@ def register_bom_resources(mcp: FastMCP) -> None:
             for file_type, file_path in bom_files.items():
                 # If it's already JSON, parse it directly
                 if file_path.lower().endswith(".json"):
-                    with open(file_path) as f:
-                        try:
-                            result["bom_files"][file_type] = json.load(f)
-                            continue
-                        except Exception:
-                            # If JSON parsing fails, fall back to regular parsing
-                            log.debug(
-                                "JSON parsing failed for %s, falling back to regular parsing",
-                                file_path,
-                            )
+                    try:
+                        result["bom_files"][file_type] = json.loads(read_text_utf8(file_path))
+                        continue
+                    except Exception:
+                        # If JSON parsing fails, fall back to regular parsing
+                        log.debug(
+                            "JSON parsing failed for %s, falling back to regular parsing",
+                            file_path,
+                        )
 
                 # Otherwise parse with our utility
                 bom_data, format_info = parse_bom_file(file_path)

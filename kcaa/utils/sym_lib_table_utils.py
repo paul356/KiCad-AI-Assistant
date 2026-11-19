@@ -13,10 +13,11 @@ from __future__ import annotations
 import logging
 import os
 import re
-import shutil
 from typing import Any
 
 import sexpdata
+
+from kcaa.utils.atomic_io import atomic_write_text, read_text_utf8
 
 log = logging.getLogger(__name__)
 
@@ -96,8 +97,7 @@ def register_library_in_table(
     backup_path: str | None = None
 
     if os.path.isfile(table_path):
-        with open(table_path, encoding="utf-8") as fh:
-            original = fh.read()
+        original = read_text_utf8(table_path)
         if f'name "{nickname}"' in original:
             log.info("Library %r already registered in %s", nickname, table_path)
             return {"registered": False, "table_path": table_path, "reason": "already_registered"}
@@ -118,15 +118,14 @@ def register_library_in_table(
             data.append(sexpdata.loads(entry))
             new_text = sexpdata.dumps(data, pretty_print=True, indent_as="\t") + "\n"
         backup_path = table_path + ".bak"
-        shutil.copy2(table_path, backup_path)
     else:
         os.makedirs(os.path.dirname(table_path) or ".", exist_ok=True)
         new_text = "(sym_lib_table\n\t" + entry + "\n)\n"
 
-    tmp_path = table_path + ".tmp"
-    with open(tmp_path, "w", encoding="utf-8") as fh:
-        fh.write(new_text)
-    os.replace(tmp_path, table_path)
+    if backup_path is None:
+        atomic_write_text(table_path, new_text)
+    else:
+        atomic_write_text(table_path, new_text, create_backup=True)
     return {
         "registered": True,
         "table_path": table_path,
@@ -158,8 +157,7 @@ def unregister_library_in_table(
     if not os.path.isfile(table_path):
         return {"unregistered": False, "reason": "table not found", "table_path": table_path}
 
-    with open(table_path, encoding="utf-8") as fh:
-        original = fh.read()
+    original = read_text_utf8(table_path)
     needle = f'name "{nickname}"'
     if needle not in original:
         return {"unregistered": False, "table_path": table_path, "reason": "not_registered"}
@@ -193,11 +191,7 @@ def unregister_library_in_table(
         new_text = sexpdata.dumps(kept_data, pretty_print=True, indent_as="\t") + "\n"
 
     backup_path = table_path + ".bak"
-    shutil.copy2(table_path, backup_path)
-    tmp_path = table_path + ".tmp"
-    with open(tmp_path, "w", encoding="utf-8") as fh:
-        fh.write(new_text)
-    os.replace(tmp_path, table_path)
+    atomic_write_text(table_path, new_text, create_backup=True)
     return {
         "unregistered": True,
         "table_path": table_path,

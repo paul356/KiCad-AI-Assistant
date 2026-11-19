@@ -6,6 +6,8 @@ import os
 
 from fastmcp import FastMCP
 
+from kcaa.utils.atomic_io import read_text_utf8
+
 
 def register_file_resources(mcp: FastMCP) -> None:
     """Register file-related resources with the MCP server.
@@ -23,8 +25,7 @@ def register_file_resources(mcp: FastMCP) -> None:
         # KiCad schematic files are in S-expression format (not JSON)
         # This is a basic extraction of text-based information
         try:
-            with open(schematic_path) as f:
-                content = f.read()
+            content = read_text_utf8(schematic_path)
 
             # Basic extraction of components
             components = []

@@ -20,9 +20,12 @@ Dependencies:
     - platform: Operating system detection
 """
 
+import locale
 import logging
 import os
 import platform
+
+from kcaa.utils.atomic_io import read_text_utf8
 
 log = logging.getLogger(__name__)
 
@@ -247,38 +250,52 @@ class ServerConfig:
             env_path: Full path to the .env file to load
         """
         try:
-            with open(env_path) as f:
-                for line in f:
-                    line = line.strip()
+            try:
+                content = read_text_utf8(env_path)
+            except ValueError as exc:
+                # .env is a human-authored file, not a KiCad-native one:
+                # tolerate a legacy locale encoding instead of refusing it.
+                fallback_encoding = locale.getpreferredencoding(False)
+                log.warning(
+                    "Could not decode %s as UTF-8 (%s); retrying with %s",
+                    env_path,
+                    exc,
+                    fallback_encoding,
+                )
+                with open(env_path, encoding=fallback_encoding) as fh:
+                    content = fh.read()
 
-                    # Skip empty lines and comments
-                    if not line or line.startswith("#"):
-                        continue
+            for line in content.splitlines():
+                line = line.strip()
 
-                    # Parse key-value pairs
-                    if "=" in line:
-                        key, value = line.split("=", 1)
-                        key = key.strip()
-                        value = value.strip()
+                # Skip empty lines and comments
+                if not line or line.startswith("#"):
+                    continue
 
-                        # Remove quotes if present
-                        if (
-                            value.startswith('"')
-                            and value.endswith('"')
-                            or value.startswith("'")
-                            and value.endswith("'")
-                        ):
-                            value = value[1:-1]
+                # Parse key-value pairs
+                if "=" in line:
+                    key, value = line.split("=", 1)
+                    key = key.strip()
+                    value = value.strip()
 
-                        # Expand ~ to user's home directory
-                        if "~" in value:
-                            value = os.path.expanduser(value)
+                    # Remove quotes if present
+                    if (
+                        value.startswith('"')
+                        and value.endswith('"')
+                        or value.startswith("'")
+                        and value.endswith("'")
+                    ):
+                        value = value[1:-1]
 
-                        # Set environment variable
-                        os.environ[key] = value
-                        log.debug(f"Set {key} from .env")
+                    # Expand ~ to user's home directory
+                    if "~" in value:
+                        value = os.path.expanduser(value)
 
-        except Exception:
+                    # Set environment variable
+                    os.environ[key] = value
+                    log.debug(f"Set {key} from .env")
+
+        except (OSError, ValueError):
             log.exception(f"Error loading .env file '{env_path}'")
 
     def _find_env_file(self, filename: str) -> str | None:

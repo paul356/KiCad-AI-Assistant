@@ -7,6 +7,7 @@ from typing import Any
 
 from fastmcp import FastMCP
 
+from kcaa.utils.atomic_io import read_text_utf8
 from kcaa.utils.file_utils import get_project_files
 
 
@@ -35,10 +36,9 @@ def register_analysis_tools(mcp: FastMCP) -> None:
 
         # Validate project file
         try:
-            with open(project_path) as f:
-                import json
+            import json
 
-                json.load(f)
+            json.loads(read_text_utf8(project_path))
         except json.JSONDecodeError:
             issues.append("Invalid project file format (JSON parsing error)")
         except Exception as e:

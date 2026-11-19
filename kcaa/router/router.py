@@ -2511,7 +2511,7 @@ def _dump_viz(
             }
             for d in shoved
         ]
-    with open(fname, "w") as f:
+    with open(fname, "w", encoding="utf-8") as f:
         json.dump(data, f)
     print(f"  [viz] dumped {fname}")
 
@@ -2554,7 +2554,7 @@ def _dump_viz_segments(
         ],
         "route_bbox": list(route_bbox),
     }
-    with open(fname, "w") as f:
+    with open(fname, "w", encoding="utf-8") as f:
         json.dump(data, f)
     print(f"  [viz] dumped {fname}")
 
