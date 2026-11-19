@@ -18,6 +18,7 @@ from fastmcp import Context, FastMCP
 
 from kcaa.utils.file_utils import load_project_json
 from kcaa.utils.project_resolution import find_project_file, project_name
+from kcaa.utils.schematic_sexp_utils import write_schematic_text
 from kcaa.utils.skip_compat import safe_schematic
 
 log = logging.getLogger(__name__)
@@ -595,9 +596,7 @@ def _generate_child_schematic(
     lines.append("  (lib_symbols)")
     lines.append(")")
 
-    with open(child_path, "w", encoding="utf-8") as fh:
-        fh.write("\n".join(lines))
-        fh.write("\n")
+    write_schematic_text(child_path, "\n".join(lines) + "\n")
 
     return child_path
 

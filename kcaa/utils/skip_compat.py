@@ -39,8 +39,12 @@ from typing import Any
 
 
 @contextmanager
-def _utf8_open_context():
+def utf8_open_context():
     """Context manager that defaults text-mode opens to ``encoding="utf-8"``.
+
+    Use around skip calls that touch the filesystem -- both construction
+    (read) and ``SourceFile.write`` (write), which serialises through bare
+    ``open(fpath, "w")`` in ``skip.sexp.util.writeTree``.
 
     Only affects calls that do **not** already pass an explicit ``encoding=``
     keyword; those are left unchanged.  Binary-mode opens (``"rb"``, ``"wb"``,
@@ -83,7 +87,7 @@ def safe_source_file(path: str):
     """
     import skip.sexp.sourcefile
 
-    with _utf8_open_context():
+    with utf8_open_context():
         return skip.sexp.sourcefile.SourceFile(path)
 
 
@@ -95,5 +99,5 @@ def safe_schematic(path: str):
     """
     import skip
 
-    with _utf8_open_context():
+    with utf8_open_context():
         return skip.Schematic(path)
