@@ -165,9 +165,11 @@ def test_refused_write_does_not_replace_target(
         def write(self, fpath: str) -> None:  # pragma: no cover - must not write
             return None
 
-    with pytest.raises(OSError, match="produced no output"):
+    with pytest.raises(OSError, match="produced no output") as excinfo:
         save_schematic(str(path), _RefusingWriter())  # type: ignore[arg-type]
 
+    assert str(path) in str(excinfo.value)
+    assert str(path) + ".bak" in str(excinfo.value)
     assert path.read_bytes() == original
     assert not stale_tmp.exists()
 
@@ -256,3 +258,24 @@ def test_generate_child_schematic_writes_utf8_atomically(tmp_path: Path) -> None
     assert child_path == tmp_path / "child.kicad_sch"
     assert title in child_path.read_bytes().decode("utf-8")
     assert not Path(str(child_path) + ".tmp").exists()
+
+
+def test_chmod_failure_does_not_fail_save(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Permission parity is best effort: chmod rejection must not lose the save."""
+    path, _ = _stage_schematic(tmp_path)
+    chmod_calls: list[str] = []
+
+    def _deny_chmod(target: str, mode: int) -> None:
+        if target.endswith(".kicad_sch.tmp"):
+            chmod_calls.append(target)
+            raise PermissionError(errno.EPERM, "chmod refused", target)
+
+    monkeypatch.setattr(schematic_sexp_utils.os, "chmod", _deny_chmod)
+
+    backup = save_schematic(str(path), safe_schematic(str(path)))
+
+    assert chmod_calls
+    assert Path(backup).exists()
+    assert NON_ASCII in path.read_bytes().decode("utf-8")
+    assert _text_values(path) == [NON_ASCII]
+    assert not (tmp_path / "board.kicad_sch.tmp").exists()

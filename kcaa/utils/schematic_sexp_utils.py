@@ -23,22 +23,38 @@ def _discard(path: str) -> None:
     """Remove *path* if present; cleanup must never mask the real error.
 
     On Windows a just-closed file can briefly reject ``unlink`` with
-    ``PermissionError``; an equally failed cleanup must not replace the
-    original exception that is already propagating.
+    ``PermissionError``, and a ``.tmp`` that inherited read-only permission
+    bits is likewise undeletable.  Clear the write protection and retry;
+    an equally failed cleanup must not replace the original exception that
+    is already propagating.
     """
     try:
+        os.unlink(path)
+        return
+    except OSError:
+        pass
+    try:
+        os.chmod(path, 0o600)
         os.unlink(path)
     except OSError:
         pass
 
 
 def _preserve_mode(source: str, target: str) -> None:
-    """Give *target* the permission bits of *source*, if source exists."""
+    """Give *target* the permission bits of *source*, if source exists.
+
+    Best effort: SMB/FUSE mounts and restricted ACLs can reject ``chmod``
+    even on a file we just created, and that must not fail an otherwise
+    complete save.
+    """
     try:
         mode = stat.S_IMODE(os.stat(source).st_mode)
     except FileNotFoundError:
         return
-    os.chmod(target, mode)
+    try:
+        os.chmod(target, mode)
+    except OSError:
+        pass
 
 
 def write_schematic_text(path: str, text: str) -> None:
@@ -108,10 +124,16 @@ def save_schematic(path: str, sch: Any) -> str:
 
         if not os.path.isfile(tmp_path):
             raise OSError(
-                "serializer produced no output (skip's will_write() may have refused the path)"
+                f"Failed to write schematic {path!r}: serializer produced no "
+                f"output (skip's will_write() may have refused the path); "
+                f"the original file was left unchanged (backup: {bak_path!r})"
             )
         if os.path.getsize(tmp_path) == 0:
-            raise OSError("serializer produced an empty file")
+            raise OSError(
+                f"Failed to write schematic {path!r}: serializer produced an "
+                f"empty file; the original file was left unchanged "
+                f"(backup: {bak_path!r})"
+            )
 
         # A read-write handle keeps os.fsync() portable (Windows rejects it
         # on a read-only descriptor); no bytes are modified here.
