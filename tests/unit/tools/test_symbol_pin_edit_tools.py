@@ -519,7 +519,7 @@ def test_collision_error_leaves_file_untouched(tmp_path):
 
     assert library.read_bytes() == before
     assert not Path(str(library) + ".bak").exists()
-    assert not Path(str(library) + ".tmp").exists()
+    assert not list(library.parent.glob("*.tmp"))
 
 
 def test_cross_unit_number_is_a_warning_not_an_error(tmp_path):
@@ -638,7 +638,7 @@ def test_batch_atomicity_unknown_pin(tmp_path):
 
     assert library.read_bytes() == before
     assert not Path(str(library) + ".bak").exists()
-    assert not Path(str(library) + ".tmp").exists()
+    assert not list(library.parent.glob("*.tmp"))
 
 
 def test_batch_atomicity_collision(tmp_path):
@@ -654,7 +654,7 @@ def test_batch_atomicity_collision(tmp_path):
 
     assert library.read_bytes() == before
     assert not Path(str(library) + ".bak").exists()
-    assert not Path(str(library) + ".tmp").exists()
+    assert not list(library.parent.glob("*.tmp"))
 
 
 def test_batch_rejects_more_than_256_entries(tmp_path):
@@ -801,7 +801,7 @@ def test_common_pin_number_collision_is_an_error(tmp_path, pins, unit):
 
     assert library.read_bytes() == before
     assert not Path(str(library) + ".bak").exists()
-    assert not Path(str(library) + ".tmp").exists()
+    assert not list(library.parent.glob("*.tmp"))
 
 
 def test_both_styles_do_not_collide_and_noop_is_allowed(tmp_path):
@@ -857,7 +857,7 @@ def test_stacked_rename_rejects_a_number_already_in_use(tmp_path):
         set_symbol_pin(library, "Stacked", [_edit("5", new_number="7")])
 
     assert library.read_bytes() == before
-    assert not Path(str(library) + ".tmp").exists()
+    assert not list(library.parent.glob("*.tmp"))
     assert _symbol_pin_numbers(library, "Stacked") == {"5", "7"}
 
 
@@ -925,7 +925,7 @@ def test_read_only_library_is_refused(tmp_path):
 
     assert library.read_bytes() == before
     assert not Path(str(library) + ".bak").exists()
-    assert not Path(str(library) + ".tmp").exists()
+    assert not list(library.parent.glob("*.tmp"))
     assert stat.S_IMODE(library.stat().st_mode) == 0o444
 
 
@@ -1082,7 +1082,7 @@ def test_tool_refuses_read_only_library(monkeypatch, tmp_path):
     }
     assert library.read_bytes() == before
     assert not Path(str(library) + ".bak").exists()
-    assert not Path(str(library) + ".tmp").exists()
+    assert not list(library.parent.glob("*.tmp"))
 
 
 def test_tool_reports_invalid_pin_as_error(monkeypatch, tmp_path):
@@ -1146,7 +1146,7 @@ def test_tool_rejects_lib_id_without_colon(monkeypatch, tmp_path):
     assert result == {"error": "lib_id must be 'Library:Symbol' (got 'MYOP')"}
     assert library.read_bytes() == before
     assert not Path(str(library) + ".bak").exists()
-    assert not Path(str(library) + ".tmp").exists()
+    assert not list(library.parent.glob("*.tmp"))
 
 
 @pytest.mark.parametrize("lib_id", [":Plain", f"{_TOOL_LIB}:"])
@@ -1166,7 +1166,7 @@ def test_tool_rejects_lib_id_with_empty_half(monkeypatch, tmp_path, lib_id):
     assert result == {"error": f"lib_id must be 'Library:Symbol' (got {lib_id!r})"}
     assert library.read_bytes() == before
     assert not Path(str(library) + ".bak").exists()
-    assert not Path(str(library) + ".tmp").exists()
+    assert not list(library.parent.glob("*.tmp"))
 
 
 def test_tool_project_local_library_edits_with_project_dir(monkeypatch, tmp_path):
@@ -1266,7 +1266,7 @@ def test_schematic_tool_bare_name_does_not_match_qualified_cache(tmp_path):
     assert "'Device:R_Small'" in result["error"]
     assert schematic.read_bytes() == before
     assert not Path(str(schematic) + ".bak").exists()
-    assert not Path(str(schematic) + ".tmp").exists()
+    assert not list(schematic.parent.glob("*.tmp"))
 
 
 def test_schematic_tool_not_found_lists_at_most_five_ids(tmp_path):
@@ -1564,7 +1564,7 @@ def test_schematic_tool_common_pin_collision_is_an_error(tmp_path):
     assert result["error"] == "pin number 'C0' is already used by another pin in the symbol"
     assert schematic.read_bytes() == before
     assert not Path(str(schematic) + ".bak").exists()
-    assert not Path(str(schematic) + ".tmp").exists()
+    assert not list(schematic.parent.glob("*.tmp"))
 
 
 def test_schematic_tool_rewrite_keeps_instance_pin_uuids(tmp_path):
