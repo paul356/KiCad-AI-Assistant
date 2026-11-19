@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import errno
 import os
 from pathlib import Path
 import subprocess
@@ -9,6 +10,7 @@ import sys
 
 import pytest
 
+from kcaa.tools.sheet_tools import _generate_child_schematic
 from kcaa.utils import schematic_sexp_utils
 from kcaa.utils.schematic_sexp_utils import save_schematic
 from kcaa.utils.skip_compat import safe_schematic
@@ -101,11 +103,54 @@ def test_serialization_failure_leaves_original_bytes(
         save_schematic(str(path), sch)
 
     assert "disk full" in str(excinfo.value)
-    assert isinstance(excinfo.value.__cause__, OSError)
     assert path.read_bytes() == original
     assert not (tmp_path / "board.kicad_sch.tmp").exists()
     # The pre-write backup was already taken and still reflects the original.
     assert (tmp_path / "board.kicad_sch.bak").read_bytes() == original
+
+
+def test_oserror_type_and_attributes_survive(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """OSError subclasses are re-raised unchanged after temp cleanup."""
+    path, original = _stage_schematic(tmp_path)
+    sch = safe_schematic(str(path))
+    target = str(path)
+
+    def _fail_replace(src: str, dst: str) -> None:
+        raise PermissionError(errno.EACCES, "permission denied", dst)
+
+    monkeypatch.setattr(schematic_sexp_utils.os, "replace", _fail_replace)
+
+    with pytest.raises(PermissionError) as excinfo:
+        save_schematic(target, sch)
+
+    assert excinfo.value.errno == errno.EACCES
+    assert excinfo.value.filename == target
+    assert path.read_bytes() == original
+    assert not (tmp_path / "board.kicad_sch.tmp").exists()
+
+
+def test_non_oserror_is_wrapped_with_context(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Programming errors from the serializer keep their chain and context."""
+    path, original = _stage_schematic(tmp_path)
+    sch = safe_schematic(str(path))
+
+    def _explode(fpath: str, tree: object) -> None:
+        raise ValueError("bad tree")
+
+    monkeypatch.setattr("skip.sexp.sourcefile.writeTree", _explode)
+
+    with pytest.raises(OSError) as excinfo:
+        save_schematic(str(path), sch)
+
+    assert isinstance(excinfo.value.__cause__, ValueError)
+    assert str(path) in str(excinfo.value)
+    assert str(path) + ".bak" in str(excinfo.value)
+    assert path.read_bytes() == original
+    assert not (tmp_path / "board.kicad_sch.tmp").exists()
 
 
 def test_refused_write_does_not_replace_target(
@@ -198,3 +243,16 @@ def test_write_schematic_text_failure_leaves_no_partial_target(
 
     assert not path.exists()
     assert not (tmp_path / "child.kicad_sch.tmp").exists()
+
+
+def test_generate_child_schematic_writes_utf8_atomically(tmp_path: Path) -> None:
+    """A generated child sheet keeps a non-ASCII title and leaves no .tmp."""
+    parent = tmp_path / "root.kicad_sch"
+    parent.write_text("(kicad_sch)\n", encoding="utf-8")
+    title = "分压器 µΩ 模块"
+
+    child_path = Path(_generate_child_schematic(str(parent), "child", title=title))
+
+    assert child_path == tmp_path / "child.kicad_sch"
+    assert title in child_path.read_bytes().decode("utf-8")
+    assert not Path(str(child_path) + ".tmp").exists()

@@ -31,7 +31,17 @@ from __future__ import annotations
 
 import builtins
 from contextlib import contextmanager
+import threading
 from typing import Any
+
+# ``builtins.open`` is process-global, so overlapping enter/exit pairs from
+# different threads corrupt each other: the first exit restores the locale
+# default while the second thread is still writing, and the second exit
+# leaves the wrapper permanently installed.  Every skip I/O operation that
+# needs the UTF-8 default therefore runs under this lock.  It is reentrant
+# so nested same-thread use (safe_schematic() around a save) still works.
+_io_lock = threading.RLock()
+
 
 # ---------------------------------------------------------------------------
 # Internal: temporary open() monkey-patch
@@ -46,31 +56,36 @@ def utf8_open_context():
     (read) and ``SourceFile.write`` (write), which serialises through bare
     ``open(fpath, "w")`` in ``skip.sexp.util.writeTree``.
 
+    This context serialises skip file I/O across threads: the
+    ``builtins.open`` patch is process-global, so concurrent enter/exit
+    pairs would leak the wrapper or expose the locale codec mid-write.
+
     Only affects calls that do **not** already pass an explicit ``encoding=``
     keyword; those are left unchanged.  Binary-mode opens (``"rb"``, ``"wb"``,
     etc.) are never touched.
     """
-    original_open = builtins.open
+    with _io_lock:
+        original_open = builtins.open
 
-    def _open(
-        file: Any,
-        mode: str = "r",
-        buffering: int = -1,
-        encoding: str | None = None,
-        errors: str | None = None,
-        newline: str | None = None,
-        closefd: bool = True,
-        opener: Any = None,
-    ):
-        if encoding is None and "b" not in mode:
-            encoding = "utf-8"
-        return original_open(file, mode, buffering, encoding, errors, newline, closefd, opener)
+        def _open(
+            file: Any,
+            mode: str = "r",
+            buffering: int = -1,
+            encoding: str | None = None,
+            errors: str | None = None,
+            newline: str | None = None,
+            closefd: bool = True,
+            opener: Any = None,
+        ):
+            if encoding is None and "b" not in mode:
+                encoding = "utf-8"
+            return original_open(file, mode, buffering, encoding, errors, newline, closefd, opener)
 
-    builtins.open = _open  # type: ignore[assignment]
-    try:
-        yield
-    finally:
-        builtins.open = original_open
+        builtins.open = _open  # type: ignore[assignment]
+        try:
+            yield
+        finally:
+            builtins.open = original_open
 
 
 # ---------------------------------------------------------------------------

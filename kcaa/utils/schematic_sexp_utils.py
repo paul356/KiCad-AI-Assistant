@@ -13,17 +13,32 @@ from __future__ import annotations
 
 import os
 import shutil
+import stat
 from typing import Any
 
 from kcaa.utils.skip_compat import utf8_open_context
 
 
 def _discard(path: str) -> None:
-    """Remove *path* if present; cleanup must never mask the real error."""
+    """Remove *path* if present; cleanup must never mask the real error.
+
+    On Windows a just-closed file can briefly reject ``unlink`` with
+    ``PermissionError``; an equally failed cleanup must not replace the
+    original exception that is already propagating.
+    """
     try:
         os.unlink(path)
-    except FileNotFoundError:
+    except OSError:
         pass
+
+
+def _preserve_mode(source: str, target: str) -> None:
+    """Give *target* the permission bits of *source*, if source exists."""
+    try:
+        mode = stat.S_IMODE(os.stat(source).st_mode)
+    except FileNotFoundError:
+        return
+    os.chmod(target, mode)
 
 
 def write_schematic_text(path: str, text: str) -> None:
@@ -44,7 +59,11 @@ def write_schematic_text(path: str, text: str) -> None:
             fh.write(text)
             fh.flush()
             os.fsync(fh.fileno())
+        _preserve_mode(path, tmp_path)
         os.replace(tmp_path, path)
+    except OSError:
+        _discard(tmp_path)
+        raise
     except Exception as exc:
         _discard(tmp_path)
         raise OSError(f"Failed to write schematic file {path!r}: {exc}") from exc
@@ -99,7 +118,13 @@ def save_schematic(path: str, sch: Any) -> str:
         with open(tmp_path, "rb+") as fh:
             os.fsync(fh.fileno())
 
+        # os.replace() keeps the temp file's mode, which is the process
+        # default; carry the target's permissions over instead.
+        _preserve_mode(path, tmp_path)
         os.replace(tmp_path, path)
+    except OSError:
+        _discard(tmp_path)
+        raise
     except Exception as exc:
         _discard(tmp_path)
         raise OSError(
