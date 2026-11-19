@@ -10,11 +10,11 @@ or kicad-cli is required.
 import json as _json
 import logging
 import os
-import shutil
 from typing import Any
 
 import sexpdata
 
+from kcaa.utils.atomic_io import atomic_write_text
 from kcaa.utils.project_resolution import find_project_file
 
 log = logging.getLogger(__name__)
@@ -101,25 +101,17 @@ def _load_dru(dru_file: str) -> list[Any]:
 
 
 def _save_dru(dru_file: str, data: list[Any]) -> str | None:
-    """Write *data* to *dru_file*, creating a .bak backup first if file exists.
+    """Write *data* to *dru_file*, creating a .bak backup first.
 
     Each top-level form in *data* is serialised on its own line so that
     the file can be round-tripped with ``sexpdata.parse``.
 
-    Returns the backup path or None if the file didn't exist yet.
+    :returns: Path to the backup file, or ``None`` if the file did not exist.
+    :raises OSError: If the backup, write, sync, or rename fails.
     """
-    bak_path = None
-    if os.path.exists(dru_file):
-        bak_path = dru_file + ".bak"
-        shutil.copy2(dru_file, bak_path)
-
     lines = [sexpdata.dumps(item) for item in data]
     text = "\n".join(lines) + "\n"
-    tmp_path = dru_file + ".tmp"
-    with open(tmp_path, "w", encoding="utf-8") as f:
-        f.write(text)
-    os.replace(tmp_path, dru_file)
-    return bak_path
+    return atomic_write_text(dru_file, text, create_backup=True)
 
 
 def _parse_dru_value(val: Any) -> float:
@@ -304,17 +296,8 @@ def update_design_rules_in_file(pro_file: str, updates: dict[str, float]) -> dic
     if not changed:
         return {"success": True, "updated": [], "message": "No matching fields found to update."}
 
-    import shutil
-
-    bak_path = pro_file + ".bak"
     try:
-        shutil.copy2(pro_file, bak_path)
-    except OSError as exc:
-        return {"success": False, "error": f"Failed to create backup: {exc}"}
-
-    try:
-        with open(pro_file, "w", encoding="utf-8") as f:
-            _json.dump(data, f, indent=2)
+        bak_path = atomic_write_text(pro_file, _json.dumps(data, indent=2), create_backup=True)
     except OSError as exc:
         return {"success": False, "error": f"Failed to write project file: {exc}"}
 

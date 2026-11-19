@@ -9,6 +9,8 @@ import json as _json
 import logging
 from typing import Any
 
+from kcaa.utils.atomic_io import atomic_write_text
+
 log = logging.getLogger(__name__)
 
 # Valid netclass fields in a .kicad_pro file
@@ -152,17 +154,8 @@ def set_net_class_in_pro(
             changed.append(f"{key}: {old_val}mm → {value}mm")
 
     # Create backup
-    import shutil
-
-    bak_path = pro_file + ".bak"
     try:
-        shutil.copy2(pro_file, bak_path)
-    except OSError as exc:
-        return {"success": False, "error": f"Failed to create backup: {exc}"}
-
-    try:
-        with open(pro_file, "w", encoding="utf-8") as f:
-            _json.dump(data, f, indent=2)
+        bak_path = atomic_write_text(pro_file, _json.dumps(data, indent=2), create_backup=True)
     except OSError as exc:
         return {"success": False, "error": f"Failed to write project file: {exc}"}
 
@@ -279,17 +272,8 @@ def assign_nets_to_class_in_pro(pro_file: str, class_name: str, nets: list[str])
 
     ns["netclass_patterns"] = new_patterns
 
-    import shutil
-
-    bak_path = pro_file + ".bak"
     try:
-        shutil.copy2(pro_file, bak_path)
-    except OSError as exc:
-        return {"success": False, "error": f"Failed to create backup: {exc}"}
-
-    try:
-        with open(pro_file, "w", encoding="utf-8") as f:
-            _json.dump(data, f, indent=2)
+        bak_path = atomic_write_text(pro_file, _json.dumps(data, indent=2), create_backup=True)
     except OSError as exc:
         return {"success": False, "error": f"Failed to write project file: {exc}"}
 
@@ -378,17 +362,8 @@ def remove_nets_from_class_in_pro(
 
     ns["netclass_patterns"] = new_patterns
 
-    import shutil
-
-    bak_path = pro_file + ".bak"
     try:
-        shutil.copy2(pro_file, bak_path)
-    except OSError as exc:
-        return {"success": False, "error": f"Failed to create backup: {exc}"}
-
-    try:
-        with open(pro_file, "w", encoding="utf-8") as f:
-            _json.dump(data, f, indent=2)
+        bak_path = atomic_write_text(pro_file, _json.dumps(data, indent=2), create_backup=True)
     except OSError as exc:
         return {"success": False, "error": f"Failed to write project file: {exc}"}
 
@@ -470,17 +445,8 @@ def delete_net_class_from_pro(pro_file: str, class_name: str) -> dict[str, Any]:
                 new_patterns.append(p)
         ns["netclass_patterns"] = new_patterns
 
-    import shutil
-
-    bak_path = pro_file + ".bak"
     try:
-        shutil.copy2(pro_file, bak_path)
-    except OSError as exc:
-        return {"success": False, "error": f"Failed to create backup: {exc}"}
-
-    try:
-        with open(pro_file, "w", encoding="utf-8") as f:
-            _json.dump(data, f, indent=2)
+        bak_path = atomic_write_text(pro_file, _json.dumps(data, indent=2), create_backup=True)
     except OSError as exc:
         return {"success": False, "error": f"Failed to write project file: {exc}"}
 

@@ -1157,7 +1157,7 @@ def test_no_differences_writes_nothing(refresh_env):
     assert result["backup_path"] is None
     assert result["placements_updated"] == 0
     assert not Path(str(refresh_env.schematic) + ".bak").exists()
-    assert not Path(str(refresh_env.schematic) + ".tmp").exists()
+    assert not list(refresh_env.schematic.parent.glob("*.tmp"))
     assert refresh_env.schematic.read_bytes() == original
 
 
@@ -1172,7 +1172,7 @@ def test_dry_run_reports_diff_without_writing(refresh_env):
     assert result["backup_path"] is None
     assert result["pins_renamed"][0]["new_name"] == "ANODE"
     assert not Path(str(refresh_env.schematic) + ".bak").exists()
-    assert not Path(str(refresh_env.schematic) + ".tmp").exists()
+    assert not list(refresh_env.schematic.parent.glob("*.tmp"))
     assert refresh_env.schematic.read_bytes() == original
 
 

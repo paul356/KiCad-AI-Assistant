@@ -1020,7 +1020,7 @@ def _dump_viz_schematic(
     }
     if notes:
         data["notes"] = notes
-    with open(fname, "w") as f:
+    with open(fname, "w", encoding="utf-8") as f:
         json.dump(data, f)
     log.info("[viz] dumped %s", fname)
 

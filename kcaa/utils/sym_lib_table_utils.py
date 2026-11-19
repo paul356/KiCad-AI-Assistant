@@ -13,10 +13,16 @@ from __future__ import annotations
 import logging
 import os
 import re
-import shutil
 from typing import Any
 
 import sexpdata
+
+from kcaa.utils.atomic_io import (
+    atomic_write_text,
+    detect_newline,
+    normalize_newlines,
+    read_text_utf8,
+)
 
 log = logging.getLogger(__name__)
 
@@ -96,37 +102,38 @@ def register_library_in_table(
     backup_path: str | None = None
 
     if os.path.isfile(table_path):
-        with open(table_path, encoding="utf-8") as fh:
-            original = fh.read()
+        original = read_text_utf8(table_path, preserve_newlines=True)
         if f'name "{nickname}"' in original:
             log.info("Library %r already registered in %s", nickname, table_path)
             return {"registered": False, "table_path": table_path, "reason": "already_registered"}
-        text = original.rstrip()
-        if not text.endswith(")"):
+        newline = detect_newline(original)
+        text = normalize_newlines(original, "\n")
+        stripped = text.rstrip()
+        if not stripped.endswith(")"):
             raise ValueError(f"Malformed sym-lib-table (no closing paren): {table_path}")
-        if _last_line_is_closing_paren(original):
+        if _last_line_is_closing_paren(text):
             # Pretty layout: insert a new entry line before the final ")".
-            idx = original.rfind("\n)")
-            new_text = original[: idx + 1] + "\t" + entry + "\n" + original[idx + 1 :]
+            idx = text.rfind("\n)")
+            new_text = text[: idx + 1] + "\t" + entry + "\n" + text[idx + 1 :]
         else:
             # Compact single-line layout: re-serialize with sexpdata.
             log.warning(
                 "sym-lib-table %s is single-line; re-serializing to append entry",
                 table_path,
             )
-            data = sexpdata.loads(original)
+            data = sexpdata.loads(text)
             data.append(sexpdata.loads(entry))
             new_text = sexpdata.dumps(data, pretty_print=True, indent_as="\t") + "\n"
+        new_text = normalize_newlines(new_text, newline)
         backup_path = table_path + ".bak"
-        shutil.copy2(table_path, backup_path)
     else:
         os.makedirs(os.path.dirname(table_path) or ".", exist_ok=True)
         new_text = "(sym_lib_table\n\t" + entry + "\n)\n"
 
-    tmp_path = table_path + ".tmp"
-    with open(tmp_path, "w", encoding="utf-8") as fh:
-        fh.write(new_text)
-    os.replace(tmp_path, table_path)
+    if backup_path is None:
+        atomic_write_text(table_path, new_text)
+    else:
+        atomic_write_text(table_path, new_text, create_backup=True)
     return {
         "registered": True,
         "table_path": table_path,
@@ -158,14 +165,15 @@ def unregister_library_in_table(
     if not os.path.isfile(table_path):
         return {"unregistered": False, "reason": "table not found", "table_path": table_path}
 
-    with open(table_path, encoding="utf-8") as fh:
-        original = fh.read()
+    original = read_text_utf8(table_path, preserve_newlines=True)
     needle = f'name "{nickname}"'
     if needle not in original:
         return {"unregistered": False, "table_path": table_path, "reason": "not_registered"}
 
-    if _last_line_is_closing_paren(original):
-        lines = original.splitlines(keepends=True)
+    newline = detect_newline(original)
+    text = normalize_newlines(original, "\n")
+    if _last_line_is_closing_paren(text):
+        lines = text.splitlines(keepends=True)
         kept = [ln for ln in lines if not (ln.strip().startswith("(lib ") and needle in ln)]
         new_text = "".join(kept)
     else:
@@ -173,7 +181,7 @@ def unregister_library_in_table(
             "sym-lib-table %s is single-line; re-serializing to drop entry",
             table_path,
         )
-        data = sexpdata.loads(original)
+        data = sexpdata.loads(text)
         kept_data = [
             child
             for child in data
@@ -193,11 +201,7 @@ def unregister_library_in_table(
         new_text = sexpdata.dumps(kept_data, pretty_print=True, indent_as="\t") + "\n"
 
     backup_path = table_path + ".bak"
-    shutil.copy2(table_path, backup_path)
-    tmp_path = table_path + ".tmp"
-    with open(tmp_path, "w", encoding="utf-8") as fh:
-        fh.write(new_text)
-    os.replace(tmp_path, table_path)
+    atomic_write_text(table_path, normalize_newlines(new_text, newline), create_backup=True)
     return {
         "unregistered": True,
         "table_path": table_path,

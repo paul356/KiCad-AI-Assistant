@@ -2,27 +2,54 @@
 
 Only concerns: save and backup.  No domain knowledge about symbols,
 wires, or nets lives here.
+
+The actual write mechanics live in :mod:`kcaa.utils.atomic_io`; schematic
+serialisation goes through ``skip``, which opens its output file itself,
+so it uses :func:`atomic_write_with` plus the UTF-8 open context.
 """
 
-import os
-import shutil
+from __future__ import annotations
+
+from typing import Any
+
+from kcaa.utils.atomic_io import atomic_write_text, atomic_write_with
+from kcaa.utils.skip_compat import utf8_open_context
 
 
-def save_schematic(path: str, sch) -> str:
+def write_schematic_text(path: str, text: str) -> None:
+    """Atomically write *text* to *path* as UTF-8.
+
+    Intended for schematic-adjacent text files created from scratch (for
+    example a generated child sheet).
+
+    :param path: Destination file path.
+    :param text: Complete file contents.
+    :raises OSError: If writing, syncing, validating, or renaming fails.
+    """
+    atomic_write_text(path, text)
+
+
+def save_schematic(path: str, sch: Any) -> str | None:
     """Write *sch* back to *path*, creating a .bak backup first.
 
-    Uses an atomic write: writes to a .tmp sibling file then renames it
-    over the target so a crash or disk-full error never leaves the
-    schematic file partially written or empty.
+    The serialisation runs inside :func:`utf8_open_context` because skip's
+    ``SourceFile.write()`` uses a bare ``open(fpath, "w")``.  The staged
+    output is atomically renamed over the target; on any failure the
+    temporary file is removed and the original file keeps its exact bytes.
 
     :param path: Absolute path to the .kicad_sch file to overwrite.
     :param sch: The (possibly mutated) skip.Schematic object.
-    :returns: Path to the backup file that was created.
-    :raises OSError: If the backup copy or the atomic rename fails.
+    :returns: Path to the backup file, or ``None`` if the target
+        did not exist when it was saved.
+    :raises OSError: If the backup, write, sync, or atomic rename fails.
+        The original file is left untouched in every case.
     """
-    bak_path = path + ".bak"
-    tmp_path = path + ".tmp"
-    shutil.copy(path, bak_path)
-    sch.write(tmp_path)
-    os.replace(tmp_path, path)
-    return bak_path
+
+    def _serialize(tmp_path: str) -> None:
+        # skip's SourceFile.write() serialises through a bare
+        # open(fpath, "w"), which would otherwise use the locale encoding
+        # (gbk on Chinese Windows).
+        with utf8_open_context():
+            sch.write(tmp_path)
+
+    return atomic_write_with(path, _serialize, create_backup=True)
