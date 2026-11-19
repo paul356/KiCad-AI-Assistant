@@ -21,7 +21,7 @@ from typing import Any
 
 import sexpdata
 
-from kcaa.utils.atomic_io import atomic_write_text
+from kcaa.utils.atomic_io import atomic_write_text, detect_newline, normalize_newlines
 from kcaa.utils.config import ServerConfig
 from kcaa.utils.sexp_utils import sym_str as _sym
 
@@ -347,9 +347,10 @@ def append_symbol_to_library(file_path: str, lib_sym_raw: list, symbol_name: str
             "(refusing to overwrite)"
         )
 
-    with open(file_path, encoding="utf-8") as fh:
+    with open(file_path, encoding="utf-8", newline="") as fh:
         original = fh.read()
-    stripped = original.rstrip()
+    newline = detect_newline(original)
+    stripped = normalize_newlines(original.rstrip(), "\n")
     if not stripped.endswith(")"):
         raise ValueError(f"Malformed symbol library file (no closing paren): {file_path}")
 
@@ -363,7 +364,7 @@ def append_symbol_to_library(file_path: str, lib_sym_raw: list, symbol_name: str
     if idx == -1:
         idx = len(stripped) - 1
     new_text = stripped[:idx] + "\n  " + node_text + stripped[idx:] + "\n"
-    atomic_write_text(file_path, new_text, create_backup=True)
+    atomic_write_text(file_path, normalize_newlines(new_text, newline), create_backup=True)
     return os.path.abspath(file_path)
 
 
@@ -487,8 +488,10 @@ def remove_symbol_from_library_file(file_path: str, symbol_name: str) -> str:
     if not is_safe_symbol_name(symbol_name):
         raise ValueError(f"Unsafe symbol name {symbol_name!r} (refusing to edit)")
 
-    with open(file_path, encoding="utf-8") as fh:
-        text = fh.read()
+    with open(file_path, encoding="utf-8", newline="") as fh:
+        original = fh.read()
+    newline = detect_newline(original)
+    text = normalize_newlines(original, "\n")
 
     try:
         data = sexpdata.loads(text)
@@ -535,7 +538,7 @@ def remove_symbol_from_library_file(file_path: str, symbol_name: str) -> str:
         remove_end = j + 1
 
     new_text = text[:line_start] + text[remove_end:]
-    atomic_write_text(file_path, new_text, create_backup=True)
+    atomic_write_text(file_path, normalize_newlines(new_text, newline), create_backup=True)
     return os.path.abspath(file_path)
 
 
