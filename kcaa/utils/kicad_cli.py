@@ -5,21 +5,110 @@ Provides a single source of truth for locating KiCad CLI across platforms
 with caching and configuration support.
 """
 
+from collections.abc import Iterable, Iterator
+from dataclasses import dataclass
+import importlib
 import logging
+import ntpath
 import os
 import platform
 import shutil
 import subprocess  # nosec B404 -- controlled command execution, no user input
+import sys
+from typing import Any, cast
 
 from .config import config
 
 logger = logging.getLogger(__name__)
+
+_MAX_REPORTED_CANDIDATES = 10
+
+# Registry locations that may contain a KiCad uninstall entry with
+# ``DisplayName`` / ``InstallLocation`` values (Windows only).
+_WINDOWS_UNINSTALL_KEYS: tuple[tuple[str, str], ...] = (
+    ("HKLM", r"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall"),
+    ("HKLM", r"SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall"),
+    ("HKCU", r"Software\Microsoft\Windows\CurrentVersion\Uninstall"),
+)
 
 
 class KiCadCLIError(Exception):
     """Raised when KiCad CLI operations fail."""
 
     pass
+
+
+@dataclass(frozen=True)
+class CLICandidate:
+    """
+    A single location probed while looking for the KiCad CLI.
+
+    Attributes:
+        path: Candidate executable path
+        source: Where the candidate came from ("environment", "path",
+            "common", or "registry")
+        exists: Whether the candidate file exists
+        validated: Whether ``--version`` succeeded; None if not validated
+            (missing file or validation not attempted)
+    """
+
+    path: str
+    source: str
+    exists: bool
+    validated: bool | None = None
+
+
+@dataclass(frozen=True)
+class CLIDiagnosis:
+    """
+    Structured snapshot of a KiCad CLI detection pass.
+
+    Attributes:
+        platform: Platform name reported by :func:`platform.system`
+        candidates: Candidates probed during the pass, in priority order
+        selected: Path of the accepted candidate, or None if none worked
+        path_lookup: Result of the ``PATH`` lookup for kicad-cli, if any
+    """
+
+    platform: str
+    candidates: tuple[CLICandidate, ...]
+    selected: str | None
+    path_lookup: str | None = None
+
+
+def _parse_version_directory(name: str) -> tuple[int, ...] | None:
+    """
+    Parse a dotted numeric directory name (``9.0.4``) into a tuple.
+
+    ``str.isdecimal`` is used rather than ``str.isdigit``: characters such
+    as ``²`` are digits but not valid ``int()`` input (and are not directory
+    names KiCad produces).
+    """
+    parts = name.split(".")
+    if not parts or not all(part.isdecimal() for part in parts):
+        return None
+    return tuple(int(part) for part in parts)
+
+
+def _sort_version_directories(names: Iterable[str]) -> list[str]:
+    """
+    Sort installation directory names by version, newest first.
+
+    Dotted numeric names (``10.0``, ``9.0.4``) sort numerically descending.
+    Names that cannot be parsed (``nightly``) follow, sorted alphabetically.
+    """
+    numeric: list[tuple[tuple[int, ...], str]] = []
+    other: list[str] = []
+    for name in names:
+        version = _parse_version_directory(name)
+        if version is None:
+            other.append(name)
+        else:
+            numeric.append((version, name))
+    numeric.sort(key=lambda item: item[1])
+    numeric.sort(key=lambda item: item[0], reverse=True)
+    other.sort()
+    return [name for _, name in numeric] + other
 
 
 class KiCadCLIManager:
@@ -34,10 +123,18 @@ class KiCadCLIManager:
         self._cached_cli_path: str | None = None
         self._cache_validated = False
         self._system = platform.system()
+        self._last_candidates: list[CLICandidate] = []
+        self._last_path_lookup: str | None = None
 
     def find_kicad_cli(self, force_refresh: bool = False) -> str | None:
         """
         Find the KiCad CLI executable path.
+
+        Candidates are probed in priority order (KICAD_CLI_PATH, PATH, common
+        installation directories). The first candidate that exists and passes
+        ``--version`` validation wins; a candidate that exists but fails
+        validation does not abort the search. On Windows, registry uninstall
+        entries are probed as a last resort when nothing earlier validated.
 
         Args:
             force_refresh: Force re-detection even if cached
@@ -49,18 +146,44 @@ class KiCadCLIManager:
         if self._cached_cli_path and not force_refresh and self._cache_validated:
             return self._cached_cli_path
 
-        # Try to find CLI
-        cli_path = self._detect_cli_path()
+        self._last_candidates = []
+        self._last_path_lookup = None
+        probes: list[CLICandidate] = []
+        selected: str | None = None
 
-        if cli_path:
-            # Validate the found CLI
-            if self._validate_cli_path(cli_path):
-                self._cached_cli_path = cli_path
-                self._cache_validated = True
-                logger.info(f"Found KiCad CLI at: {cli_path}")
-                return cli_path
-            else:
-                logger.warning(f"Found KiCad CLI at {cli_path} but validation failed")
+        for candidate in self._detect_cli_path():
+            if not candidate.exists:
+                probes.append(candidate)
+                logger.debug("Skipping missing KiCad CLI candidate: %s", candidate.path)
+                continue
+
+            valid = self._validate_cli_path(candidate.path)
+            probes.append(
+                CLICandidate(
+                    path=candidate.path,
+                    source=candidate.source,
+                    exists=True,
+                    validated=valid,
+                )
+            )
+            if valid:
+                selected = candidate.path
+                break
+
+            logger.warning("KiCad CLI candidate %s failed validation; trying next", candidate.path)
+            if candidate.source == "environment":
+                logger.warning(
+                    "KICAD_CLI_PATH=%s is not usable; falling back to other locations",
+                    candidate.path,
+                )
+
+        self._last_candidates = probes
+
+        if selected is not None:
+            self._cached_cli_path = selected
+            self._cache_validated = True
+            logger.info("Found KiCad CLI at: %s", selected)
+            return selected
 
         # Clear cache if detection failed
         self._cached_cli_path = None
@@ -84,11 +207,11 @@ class KiCadCLIManager:
         cli_path = self.find_kicad_cli()
 
         if cli_path is None and required:
-            raise KiCadCLIError(
-                "KiCad CLI not found. Please install KiCad or set KICAD_CLI_PATH environment variable."
-            )
+            raise KiCadCLIError(self._build_not_found_message())
 
-        return cli_path
+        # ``required=False`` historically returns None despite the ``str``
+        # annotation; keep that API while satisfying type checkers.
+        return cast(str, cli_path)
 
     def is_available(self) -> bool:
         """Check if KiCad CLI is available."""
@@ -119,34 +242,102 @@ class KiCadCLIManager:
 
         return None
 
-    def _detect_cli_path(self) -> str | None:
+    def diagnose(self, force_refresh: bool = False) -> CLIDiagnosis:
         """
-        Detect KiCad CLI path using platform-specific strategies.
+        Return a read-only snapshot of the most recent detection pass.
+
+        Intended for UI/diagnostics consumers that need to explain why ERC or
+        DRC commands are unavailable. This does not alter detection semantics;
+        the returned ``selected`` value matches :meth:`find_kicad_cli`.
+
+        Args:
+            force_refresh: Re-probe instead of using the cached result
 
         Returns:
-            Path to CLI executable or None if not found
+            Structured diagnosis with every probed candidate.
         """
-        # Check environment variable first
+        selected = self.find_kicad_cli(force_refresh=force_refresh)
+        return CLIDiagnosis(
+            platform=self._system,
+            candidates=tuple(self._last_candidates),
+            selected=selected,
+            path_lookup=self._last_path_lookup,
+        )
+
+    def _candidate_key(self, path: str) -> str:
+        """
+        Return a platform-appropriate identity key for a candidate path.
+
+        Windows paths are case-insensitive, so case variants (including
+        environment variables that differ only in casing) must deduplicate.
+        ``ntpath.normcase`` provides that behaviour even when tests simulate
+        Windows on POSIX.
+        """
+        if self._system == "Windows":
+            return ntpath.normcase(path)
+        return os.path.normcase(path)
+
+    def _iter_candidates(self) -> Iterator[tuple[str, str]]:
+        """
+        Yield ``(source, path)`` candidates in priority order.
+
+        Lazily evaluated so an early acceptance avoids enumerating directories
+        or reading the registry. Duplicate paths are yielded only once.
+        """
+        seen: set[str] = set()
+
+        def fresh(source: str, path: str) -> tuple[str, str] | None:
+            key = self._candidate_key(path)
+            if key in seen:
+                return None
+            seen.add(key)
+            return (source, path)
+
         env_path = os.environ.get("KICAD_CLI_PATH")
-        if env_path and os.path.isfile(env_path) and os.access(env_path, os.X_OK):
-            logger.info(f"Using KiCad CLI from environment: {env_path}")
-            return env_path
+        if env_path:
+            if not os.path.isfile(env_path):
+                logger.warning(
+                    "KICAD_CLI_PATH points to %s, which does not exist; ignoring it", env_path
+                )
+            item = fresh("environment", env_path)
+            if item is not None:
+                yield item
 
-        # Try system PATH
         cli_name = self._get_cli_executable_name()
-        system_path = shutil.which(cli_name)
-        if system_path:
-            logger.info(f"Found KiCad CLI in system PATH: {system_path}")
-            return system_path
+        path_hit = shutil.which(cli_name)
+        self._last_path_lookup = path_hit
+        if path_hit:
+            item = fresh("path", path_hit)
+            if item is not None:
+                yield item
 
-        # Try platform-specific common locations
-        common_paths = self._get_common_installation_paths()
-        for path in common_paths:
-            if os.path.isfile(path) and os.access(path, os.X_OK):
-                logger.info(f"Found KiCad CLI at common location: {path}")
-                return path
+        for path in self._get_common_installation_paths():
+            item = fresh("common", path)
+            if item is not None:
+                yield item
 
-        return None
+        # Registry is the last resort. Being lazy, this is only reached when
+        # the caller consumed every earlier candidate without accepting one,
+        # i.e. when no candidate passed validation.
+        if self._system == "Windows":
+            for path in self._get_registry_installation_paths():
+                item = fresh("registry", path)
+                if item is not None:
+                    yield item
+
+    def _detect_cli_path(self) -> Iterator[CLICandidate]:
+        """
+        Yield KiCad CLI candidates in priority order, with existence flags.
+
+        This is lazy: callers that stop early never enumerate installation
+        directories or read the registry. Candidates are not validated here;
+        :meth:`find_kicad_cli` validates each existing candidate in turn.
+
+        Yields:
+            Candidates in priority order (may include non-existent paths)
+        """
+        for source, path in self._iter_candidates():
+            yield CLICandidate(path=path, source=source, exists=os.path.isfile(path))
 
     def _get_cli_executable_name(self) -> str:
         """Get the CLI executable name for current platform."""
@@ -156,7 +347,7 @@ class KiCadCLIManager:
 
     def _get_common_installation_paths(self) -> list[str]:
         """Get list of common installation paths for current platform."""
-        paths = []
+        paths: list[str] = []
 
         if self._system == "Darwin":  # macOS
             paths.extend(
@@ -168,6 +359,9 @@ class KiCadCLIManager:
                 ]
             )
         elif self._system == "Windows":
+            # Versioned install dirs first (newest version first); the
+            # unversioned locations below remain as a fallback.
+            paths.extend(self._get_versioned_installation_paths())
             paths.extend(
                 [
                     r"C:\Program Files\KiCad\bin\kicad-cli.exe",
@@ -185,7 +379,204 @@ class KiCadCLIManager:
                 ]
             )
 
+        deduped: dict[str, str] = {}
+        for path in paths:
+            deduped.setdefault(self._candidate_key(path), path)
+        return list(deduped.values())
+
+    def _get_versioned_installation_paths(self) -> list[str]:
+        """
+        Enumerate ``<root>\\<version>\\bin\\kicad-cli.exe`` on Windows.
+
+        Roots come from environment variables so tests can simulate Windows
+        layouts on other platforms. Missing/unreadable roots are ignored.
+        """
+        exe_name = self._get_cli_executable_name()
+        paths: list[str] = []
+        for root in self._iter_windows_install_roots():
+            for directory in self._list_version_directories(root):
+                paths.append(os.path.join(root, directory, "bin", exe_name))
         return paths
+
+    def _iter_windows_install_roots(self) -> Iterator[str]:
+        """Yield candidate ``...\\KiCad`` installation roots from the environment."""
+        # Windows environment names are case-insensitive; keep canonical casing.
+        program_files = os.environ.get("ProgramFiles")  # noqa: SIM112
+        if program_files:
+            yield os.path.join(program_files, "KiCad")
+
+        program_files_x86 = os.environ.get("ProgramFiles(x86)")  # noqa: SIM112
+        if program_files_x86:
+            yield os.path.join(program_files_x86, "KiCad")
+
+        # A 32-bit process sees ProgramFiles/WOW64 redirects; ProgramW6432 is
+        # the real 64-bit Program Files directory, when present.
+        program_w6432 = os.environ.get("ProgramW6432")  # noqa: SIM112
+        if program_w6432:
+            yield os.path.join(program_w6432, "KiCad")
+
+        # KiCad also supports per-user installations.
+        local_appdata = os.environ.get("LOCALAPPDATA")
+        if local_appdata:
+            yield os.path.join(local_appdata, "Programs", "KiCad")
+
+    def _list_version_directories(self, root: str) -> list[str]:
+        """List version-like child directories of ``root``, newest first."""
+        names: list[str] = []
+        try:
+            with os.scandir(root) as entries:
+                for entry in entries:
+                    try:
+                        if entry.is_dir():
+                            names.append(entry.name)
+                    except OSError:
+                        # Broken symlink or permission issue on this entry.
+                        continue
+        except OSError:
+            # Root missing or unreadable: no versioned installs here.
+            return []
+
+        # Version-like names are always kept; other names (``share``,
+        # ``docs``, ``nightly``) only when they contain a real CLI binary.
+        exe_name = self._get_cli_executable_name()
+        kept = [
+            name
+            for name in names
+            if _parse_version_directory(name) is not None
+            or os.path.isfile(os.path.join(root, name, "bin", exe_name))
+        ]
+        return _sort_version_directories(kept)
+
+    def _get_registry_installation_paths(self) -> list[str]:
+        """
+        Read KiCad install locations from the Windows uninstall registry.
+
+        The ``winreg`` import is lazy and the whole function is a no-op
+        outside Windows. Any registry error is swallowed: this is a fallback
+        and must never mask the primary detection results.
+        """
+        # ``getattr`` keeps type checkers from constant-folding ``sys.platform``
+        # and treating the rest of this Windows-only function as unreachable.
+        if getattr(sys, "platform", "") != "win32":
+            return []
+
+        try:
+            winreg: Any = importlib.import_module("winreg")
+        except ImportError:
+            return []
+
+        hives: dict[str, Any] = {
+            "HKLM": winreg.HKEY_LOCAL_MACHINE,
+            "HKCU": winreg.HKEY_CURRENT_USER,
+        }
+        exe_name = self._get_cli_executable_name()
+        found: list[str] = []
+
+        for hive_name, key_path in _WINDOWS_UNINSTALL_KEYS:
+            hive = hives[hive_name]
+            try:
+                key = winreg.OpenKey(hive, key_path)
+            except OSError:
+                continue
+            try:
+                index = 0
+                while True:
+                    try:
+                        subkey_name = winreg.EnumKey(key, index)
+                    except OSError:
+                        break
+                    index += 1
+                    install_location = self._read_registry_install_location(
+                        winreg, hive, key_path, subkey_name
+                    )
+                    if install_location:
+                        found.append(self._join_windows_cli_path(install_location, exe_name))
+            finally:
+                try:
+                    winreg.CloseKey(key)
+                except OSError:
+                    pass
+
+        return list(dict.fromkeys(found))
+
+    @staticmethod
+    def _read_registry_install_location(
+        winreg_module: Any, hive: Any, key_path: str, subkey_name: str
+    ) -> str | None:
+        """Return ``InstallLocation`` for a KiCad uninstall entry, if present."""
+        try:
+            subkey = winreg_module.OpenKey(hive, ntpath.join(key_path, subkey_name))
+        except OSError:
+            return None
+        try:
+            try:
+                display_name, _ = winreg_module.QueryValueEx(subkey, "DisplayName")
+            except OSError:
+                return None
+            if not isinstance(display_name, str) or "kicad" not in display_name.lower():
+                return None
+            try:
+                install_location, _ = winreg_module.QueryValueEx(subkey, "InstallLocation")
+            except OSError:
+                return None
+            if not isinstance(install_location, str):
+                return None
+            stripped = install_location.strip().strip('"')
+            return stripped or None
+        finally:
+            try:
+                winreg_module.CloseKey(subkey)
+            except OSError:
+                pass
+
+    @staticmethod
+    def _join_windows_cli_path(install_location: str, exe_name: str) -> str:
+        """Join a registry install location to its kicad-cli executable."""
+        if ntpath.basename(install_location.rstrip("\\/")).lower() == "bin":
+            return ntpath.join(install_location, exe_name)
+        return ntpath.join(install_location, "bin", exe_name)
+
+    def _build_not_found_message(self) -> str:
+        """Build an actionable, bounded diagnostic message for detection failure."""
+        cli_name = self._get_cli_executable_name()
+        lines = ["KiCad CLI not found."]
+
+        env_path = os.environ.get("KICAD_CLI_PATH")
+        if env_path:
+            if os.path.isfile(env_path):
+                lines.append(
+                    f"  KICAD_CLI_PATH={env_path!r} exists but is not a working {cli_name}."
+                )
+            else:
+                lines.append(f"  KICAD_CLI_PATH={env_path!r} does not point to an existing file.")
+        else:
+            lines.append("  KICAD_CLI_PATH is not set.")
+
+        if self._last_path_lookup:
+            lines.append(
+                f"  PATH lookup for {cli_name} found {self._last_path_lookup} (not usable)."
+            )
+        else:
+            lines.append(f"  PATH lookup for {cli_name}: no executable found.")
+
+        candidates = self._last_candidates
+        if candidates:
+            lines.append(f"  Tried {len(candidates)} candidate location(s):")
+            for candidate in candidates[:_MAX_REPORTED_CANDIDATES]:
+                # The message is only built when no candidate validated.
+                status = "exists but failed --version" if candidate.exists else "missing"
+                lines.append(f"    - [{candidate.source}] {candidate.path} ({status})")
+            remaining = len(candidates) - _MAX_REPORTED_CANDIDATES
+            if remaining > 0:
+                lines.append(f"    ... and {remaining} more")
+        else:
+            lines.append("  No candidate locations were available to probe.")
+
+        lines.append(
+            "  Set KICAD_CLI_PATH to the full path of kicad-cli, "
+            "or add KiCad's bin directory to PATH."
+        )
+        return "\n".join(lines)
 
     def _validate_cli_path(self, cli_path: str) -> bool:
         """
@@ -205,7 +596,8 @@ class KiCadCLIManager:
                 timeout=config.timeout_constants["kicad_cli_version_check"],
             )
             return result.returncode == 0
-        except (subprocess.SubprocessError, OSError, FileNotFoundError):
+        except (subprocess.SubprocessError, OSError, ValueError):
+            # ValueError covers UnicodeDecodeError from text=True output.
             return False
 
 
