@@ -17,7 +17,10 @@ from kcaa.utils.kicad_cli import (
 )
 
 UNINSTALL_KEY = r"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall"
+WOW6432_UNINSTALL_KEY = r"SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall"
 HKCU_UNINSTALL_KEY = r"Software\Microsoft\Windows\CurrentVersion\Uninstall"
+
+RegistryEntry = tuple[str, str, str, str, str | None]
 
 UNVERSIONED_WINDOWS_PATHS = [
     r"C:\Program Files\KiCad\bin\kicad-cli.exe",
@@ -67,42 +70,102 @@ def _patch_validation(manager: KiCadCLIManager, monkeypatch, valid_paths: list[s
     return calls
 
 
+def _install_entry(
+    install_location: str | None,
+    *,
+    hive: str = "HKLM",
+    uninstall_key: str = UNINSTALL_KEY,
+    subkey: str = "KiCad 10.0",
+    display_name: str = "KiCad 10.0",
+) -> RegistryEntry:
+    """Build an in-memory uninstall entry for :class:`_FakeWinreg`."""
+    return (hive, uninstall_key, subkey, display_name, install_location)
+
+
 class _FakeWinreg:
-    """Minimal winreg stand-in exposing one KiCad uninstall entry."""
+    """Winreg stand-in backing uninstall entries in HKLM, WOW6432 and HKCU."""
 
     HKEY_LOCAL_MACHINE = "HKLM"
     HKEY_CURRENT_USER = "HKCU"
 
-    def __init__(self, install_location: str | None, display_name: str = "KiCad 10.0"):
-        self.install_location = install_location
-        self.display_name = display_name
-        self.closed: list[tuple[str, str]] = []
+    def __init__(self, entries: list[RegistryEntry] | None = None):
+        self._entries = list(entries or [])
+        self._handles: dict[int, dict[str, str | None]] = {}
+        self._next_handle = 0
+        self.opened: list[int] = []
+        self.closed: list[int] = []
+
+    def _new_handle(self, info: dict[str, str | None]) -> int:
+        handle = self._next_handle
+        self._next_handle += 1
+        self._handles[handle] = info
+        self.opened.append(handle)
+        return handle
 
     def OpenKey(self, hive, path):
-        if path == UNINSTALL_KEY:
-            return ("uninstall", path)
-        if path == UNINSTALL_KEY + "\\KiCad 10.0":
-            return ("product", path)
+        for entry_hive, uninstall_key, subkey, display_name, install_location in self._entries:
+            if hive != entry_hive:
+                continue
+            if path == uninstall_key:
+                return self._new_handle({"hive": hive, "uninstall": uninstall_key, "subkey": None})
+            if path == uninstall_key + "\\" + subkey:
+                return self._new_handle(
+                    {
+                        "hive": hive,
+                        "uninstall": uninstall_key,
+                        "subkey": subkey,
+                        "display": display_name,
+                        "location": install_location,
+                    }
+                )
         raise FileNotFoundError(path)
 
     def EnumKey(self, key, index):
-        if key[0] == "uninstall" and index == 0:
-            return "KiCad 10.0"
+        info = self._handles[key]
+        if info["subkey"] is not None:
+            raise OSError("key has no subkeys")
+        names = [
+            entry[2]
+            for entry in self._entries
+            if entry[0] == info["hive"] and entry[1] == info["uninstall"]
+        ]
+        if index < len(names):
+            return names[index]
         raise OSError("no more data")
 
     def QueryValueEx(self, key, name):
-        if key[0] != "product":
+        info = self._handles[key]
+        if info["subkey"] is None:
             raise OSError("unexpected key")
         if name == "DisplayName":
-            return (self.display_name, 1)
+            return (info["display"], 1)
         if name == "InstallLocation":
-            if self.install_location is None:
+            if info["location"] is None:
                 raise FileNotFoundError(name)
-            return (self.install_location, 1)
+            return (info["location"], 1)
         raise FileNotFoundError(name)
 
     def CloseKey(self, key):
         self.closed.append(key)
+
+    def key_info(self, handle: int) -> tuple[str, str, str | None]:
+        """Return ``(hive, uninstall key, subkey)`` for an opened handle."""
+        info = self._handles[handle]
+        return (str(info["hive"]), str(info["uninstall"]), info["subkey"])
+
+    @property
+    def opened_keys(self) -> list[tuple[str, str, str | None]]:
+        return [self.key_info(handle) for handle in self.opened]
+
+    @property
+    def closed_keys(self) -> list[tuple[str, str, str | None]]:
+        return [self.key_info(handle) for handle in self.closed]
+
+
+def _assert_all_keys_closed(fake_winreg: _FakeWinreg) -> None:
+    """Every handle opened by the registry reader must be closed exactly once."""
+    assert fake_winreg.opened
+    assert sorted(fake_winreg.closed) == sorted(fake_winreg.opened)
 
 
 class _RaisingWinreg:
@@ -326,39 +389,109 @@ def test_invalid_environment_file_falls_back_to_enumeration(windows_env, monkeyp
 def test_registry_fallback_finds_install_location(windows_env, monkeypatch):
     """Registry uninstall entries provide a last-resort candidate."""
     monkeypatch.setattr(sys, "platform", "win32")
-    fake_winreg = _FakeWinreg(r"C:\Program Files\KiCad\10.0")
+    fake_winreg = _FakeWinreg([_install_entry(r"C:\Program Files\KiCad\10.0")])
     monkeypatch.setitem(sys.modules, "winreg", fake_winreg)
     manager = KiCadCLIManager()
     expected = r"C:\Program Files\KiCad\10.0\bin\kicad-cli.exe"
 
     assert manager._get_registry_installation_paths() == [expected]
     assert expected in [candidate.path for candidate in manager._detect_cli_path()]
-    closed_kinds = {handle[0] for handle in fake_winreg.closed}
-    assert closed_kinds == {"uninstall", "product"}
+    assert fake_winreg.opened_keys[0] == ("HKLM", UNINSTALL_KEY, None)
+    assert ("HKLM", UNINSTALL_KEY, "KiCad 10.0") in fake_winreg.opened_keys
+    _assert_all_keys_closed(fake_winreg)
+
+
+def test_registry_finds_hkcu_per_user_install(windows_env, monkeypatch):
+    """A KiCad entry under HKCU is detected when HKLM has nothing."""
+    monkeypatch.setattr(sys, "platform", "win32")
+    install_location = r"C:\Users\user\AppData\Local\Programs\KiCad\9.0"
+    fake_winreg = _FakeWinreg(
+        [
+            _install_entry(
+                install_location,
+                hive="HKCU",
+                uninstall_key=HKCU_UNINSTALL_KEY,
+                subkey="KiCad 9.0",
+                display_name="KiCad 9.0",
+            )
+        ]
+    )
+    monkeypatch.setitem(sys.modules, "winreg", fake_winreg)
+    manager = KiCadCLIManager()
+
+    assert manager._get_registry_installation_paths() == [install_location + r"\bin\kicad-cli.exe"]
+    assert ("HKCU", HKCU_UNINSTALL_KEY, None) in fake_winreg.opened_keys
+    assert ("HKCU", HKCU_UNINSTALL_KEY, "KiCad 9.0") in fake_winreg.opened_keys
+    _assert_all_keys_closed(fake_winreg)
+
+
+def test_registry_finds_wow6432node_install(windows_env, monkeypatch):
+    """A KiCad entry under the WOW6432Node uninstall key is detected."""
+    monkeypatch.setattr(sys, "platform", "win32")
+    install_location = r"C:\Program Files (x86)\KiCad\8.0"
+    fake_winreg = _FakeWinreg(
+        [
+            _install_entry(
+                install_location,
+                uninstall_key=WOW6432_UNINSTALL_KEY,
+                subkey="KiCad 8.0",
+                display_name="KiCad 8.0",
+            )
+        ]
+    )
+    monkeypatch.setitem(sys.modules, "winreg", fake_winreg)
+    manager = KiCadCLIManager()
+
+    assert manager._get_registry_installation_paths() == [install_location + r"\bin\kicad-cli.exe"]
+    assert ("HKLM", WOW6432_UNINSTALL_KEY, None) in fake_winreg.opened_keys
+    _assert_all_keys_closed(fake_winreg)
 
 
 def test_registry_runs_after_existing_candidate_fails_validation(windows_env, monkeypatch):
     """A stale install must not stop the registry fallback from being consulted."""
     stale = _make_install(windows_env / "KiCad", ["8.0"])
     monkeypatch.setattr(sys, "platform", "win32")
-    monkeypatch.setitem(sys.modules, "winreg", _FakeWinreg(r"D:\CustomKiCad\9.0"))
+    monkeypatch.setitem(sys.modules, "winreg", _FakeWinreg([_install_entry(r"D:\CustomKiCad\9.0")]))
     manager = KiCadCLIManager()
     registry_exe = r"D:\CustomKiCad\9.0\bin\kicad-cli.exe"
     # Simulate the executable existing on the (real) Windows volume.
     real_isfile = os.path.isfile
     monkeypatch.setattr(os.path, "isfile", lambda path: path == registry_exe or real_isfile(path))
     calls = _patch_validation(manager, monkeypatch, [registry_exe])
+    registry_reads: list[int] = []
+    original_registry = manager._get_registry_installation_paths
+
+    def counting_registry():
+        registry_reads.append(1)
+        return original_registry()
+
+    monkeypatch.setattr(manager, "_get_registry_installation_paths", counting_registry)
 
     selected = manager.find_kicad_cli()
 
     assert selected == registry_exe
     assert calls == [str(stale["8.0"]), registry_exe]
+    assert registry_reads == [1]
+
+
+def test_registry_is_not_read_when_first_candidate_validates(windows_env, monkeypatch):
+    """A successful early candidate must leave the registry untouched."""
+    installed = _make_install(windows_env / "KiCad", ["10.0"])
+    manager = KiCadCLIManager()
+    _patch_validation(manager, monkeypatch, None)
+    monkeypatch.setattr(
+        manager,
+        "_get_registry_installation_paths",
+        lambda: pytest.fail("registry must not be read when a candidate validates"),
+    )
+
+    assert manager.find_kicad_cli() == str(installed["10.0"])
 
 
 def test_registry_install_location_pointing_at_bin_is_not_doubled(windows_env, monkeypatch):
     """InstallLocation already ending in bin is joined directly."""
     monkeypatch.setattr(sys, "platform", "win32")
-    monkeypatch.setitem(sys.modules, "winreg", _FakeWinreg(r"C:\KiCad\bin"))
+    monkeypatch.setitem(sys.modules, "winreg", _FakeWinreg([_install_entry(r"C:\KiCad\bin")]))
     manager = KiCadCLIManager()
 
     assert manager._get_registry_installation_paths() == [r"C:\KiCad\bin\kicad-cli.exe"]
@@ -376,24 +509,29 @@ def test_registry_permission_errors_are_swallowed(windows_env, monkeypatch):
 def test_registry_skips_non_kicad_entries(windows_env, monkeypatch):
     """Entries whose DisplayName is not KiCad are ignored."""
     monkeypatch.setattr(sys, "platform", "win32")
-    fake_winreg = _FakeWinreg(r"C:\Program Files\KiCad\10.0", display_name="Other EDA Suite")
+    fake_winreg = _FakeWinreg(
+        [_install_entry(r"C:\Program Files\KiCad\10.0", display_name="Other EDA Suite")]
+    )
     monkeypatch.setitem(sys.modules, "winreg", fake_winreg)
     manager = KiCadCLIManager()
 
     assert manager._get_registry_installation_paths() == []
-    assert fake_winreg.closed
+    _assert_all_keys_closed(fake_winreg)
 
 
 def test_registry_skips_kicad_entries_without_install_location(windows_env, monkeypatch):
     """KiCad-named docs entries without InstallLocation are ignored, keys closed."""
     monkeypatch.setattr(sys, "platform", "win32")
-    fake_winreg = _FakeWinreg(None, display_name="KiCad Documentation")
+    fake_winreg = _FakeWinreg([_install_entry(None, display_name="KiCad Documentation")])
     monkeypatch.setitem(sys.modules, "winreg", fake_winreg)
     manager = KiCadCLIManager()
 
     assert manager._get_registry_installation_paths() == []
-    closed_kinds = {handle[0] for handle in fake_winreg.closed}
-    assert closed_kinds == {"uninstall", "product"}
+    assert fake_winreg.closed_keys == [
+        ("HKLM", UNINSTALL_KEY, "KiCad 10.0"),
+        ("HKLM", UNINSTALL_KEY, None),
+    ]
+    _assert_all_keys_closed(fake_winreg)
 
 
 def test_unreadable_installation_root_is_ignored(windows_env, monkeypatch):
@@ -577,6 +715,11 @@ class TestValidateCliPath:
     def test_missing_executable_returns_false(self, tmp_path):
         assert KiCadCLIManager()._validate_cli_path(str(tmp_path / "absent")) is False
 
-    def test_undecodable_output_returns_false(self, tmp_path):
-        script = self._script(tmp_path, "printf '\\377'")
-        assert KiCadCLIManager()._validate_cli_path(str(script)) is False
+    def test_undecodable_output_returns_false(self, monkeypatch):
+        """Decoding errors are treated as validation failure on any locale."""
+
+        def raise_unicode_error(*args, **kwargs):
+            raise UnicodeDecodeError("utf-8", b"\xff", 0, 1, "invalid start byte")
+
+        monkeypatch.setattr("kcaa.utils.kicad_cli.subprocess.run", raise_unicode_error)
+        assert KiCadCLIManager()._validate_cli_path("/virtual/kicad-cli") is False
