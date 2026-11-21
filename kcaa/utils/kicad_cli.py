@@ -77,9 +77,15 @@ class CLIDiagnosis:
 
 
 def _parse_version_directory(name: str) -> tuple[int, ...] | None:
-    """Parse a dotted numeric directory name (``9.0.4``) into a tuple."""
+    """
+    Parse a dotted numeric directory name (``9.0.4``) into a tuple.
+
+    ``str.isdecimal`` is used rather than ``str.isdigit``: characters such
+    as ``²`` are digits but not valid ``int()`` input (and are not directory
+    names KiCad produces).
+    """
     parts = name.split(".")
-    if not parts or not all(part.isdigit() for part in parts):
+    if not parts or not all(part.isdecimal() for part in parts):
         return None
     return tuple(int(part) for part in parts)
 
@@ -125,9 +131,10 @@ class KiCadCLIManager:
         Find the KiCad CLI executable path.
 
         Candidates are probed in priority order (KICAD_CLI_PATH, PATH, common
-        installation directories, Windows registry). The first candidate that
-        exists and passes ``--version`` validation wins; a candidate that
-        exists but fails validation does not abort the search.
+        installation directories). The first candidate that exists and passes
+        ``--version`` validation wins; a candidate that exists but fails
+        validation does not abort the search. On Windows, registry uninstall
+        entries are probed as a last resort when nothing earlier validated.
 
         Args:
             force_refresh: Force re-detection even if cached
@@ -257,6 +264,19 @@ class KiCadCLIManager:
             path_lookup=self._last_path_lookup,
         )
 
+    def _candidate_key(self, path: str) -> str:
+        """
+        Return a platform-appropriate identity key for a candidate path.
+
+        Windows paths are case-insensitive, so case variants (including
+        environment variables that differ only in casing) must deduplicate.
+        ``ntpath.normcase`` provides that behaviour even when tests simulate
+        Windows on POSIX.
+        """
+        if self._system == "Windows":
+            return ntpath.normcase(path)
+        return os.path.normcase(path)
+
     def _iter_candidates(self) -> Iterator[tuple[str, str]]:
         """
         Yield ``(source, path)`` candidates in priority order.
@@ -267,7 +287,7 @@ class KiCadCLIManager:
         seen: set[str] = set()
 
         def fresh(source: str, path: str) -> tuple[str, str] | None:
-            key = os.path.normcase(path)
+            key = self._candidate_key(path)
             if key in seen:
                 return None
             seen.add(key)
@@ -291,18 +311,15 @@ class KiCadCLIManager:
             if item is not None:
                 yield item
 
-        common_paths = self._get_common_installation_paths()
-        any_common_exists = False
-        for path in common_paths:
-            if os.path.isfile(path):
-                any_common_exists = True
+        for path in self._get_common_installation_paths():
             item = fresh("common", path)
             if item is not None:
                 yield item
 
-        # Registry is the last resort, only when directory enumeration found
-        # no existing file at all.
-        if self._system == "Windows" and not any_common_exists:
+        # Registry is the last resort. Being lazy, this is only reached when
+        # the caller consumed every earlier candidate without accepting one,
+        # i.e. when no candidate passed validation.
+        if self._system == "Windows":
             for path in self._get_registry_installation_paths():
                 item = fresh("registry", path)
                 if item is not None:
@@ -362,7 +379,10 @@ class KiCadCLIManager:
                 ]
             )
 
-        return list(dict.fromkeys(paths))
+        deduped: dict[str, str] = {}
+        for path in paths:
+            deduped.setdefault(self._candidate_key(path), path)
+        return list(deduped.values())
 
     def _get_versioned_installation_paths(self) -> list[str]:
         """
@@ -389,6 +409,12 @@ class KiCadCLIManager:
         if program_files_x86:
             yield os.path.join(program_files_x86, "KiCad")
 
+        # A 32-bit process sees ProgramFiles/WOW64 redirects; ProgramW6432 is
+        # the real 64-bit Program Files directory, when present.
+        program_w6432 = os.environ.get("ProgramW6432")  # noqa: SIM112
+        if program_w6432:
+            yield os.path.join(program_w6432, "KiCad")
+
         # KiCad also supports per-user installations.
         local_appdata = os.environ.get("LOCALAPPDATA")
         if local_appdata:
@@ -409,7 +435,17 @@ class KiCadCLIManager:
         except OSError:
             # Root missing or unreadable: no versioned installs here.
             return []
-        return _sort_version_directories(names)
+
+        # Version-like names are always kept; other names (``share``,
+        # ``docs``, ``nightly``) only when they contain a real CLI binary.
+        exe_name = self._get_cli_executable_name()
+        kept = [
+            name
+            for name in names
+            if _parse_version_directory(name) is not None
+            or os.path.isfile(os.path.join(root, name, "bin", exe_name))
+        ]
+        return _sort_version_directories(kept)
 
     def _get_registry_installation_paths(self) -> list[str]:
         """
@@ -507,9 +543,12 @@ class KiCadCLIManager:
 
         env_path = os.environ.get("KICAD_CLI_PATH")
         if env_path:
-            lines.append(
-                f"  KICAD_CLI_PATH={env_path!r} was tried but is not a working {cli_name}."
-            )
+            if os.path.isfile(env_path):
+                lines.append(
+                    f"  KICAD_CLI_PATH={env_path!r} exists but is not a working {cli_name}."
+                )
+            else:
+                lines.append(f"  KICAD_CLI_PATH={env_path!r} does not point to an existing file.")
         else:
             lines.append("  KICAD_CLI_PATH is not set.")
 
@@ -524,12 +563,8 @@ class KiCadCLIManager:
         if candidates:
             lines.append(f"  Tried {len(candidates)} candidate location(s):")
             for candidate in candidates[:_MAX_REPORTED_CANDIDATES]:
-                if candidate.validated:
-                    status = "valid"
-                elif candidate.exists:
-                    status = "exists but failed --version"
-                else:
-                    status = "missing"
+                # The message is only built when no candidate validated.
+                status = "exists but failed --version" if candidate.exists else "missing"
                 lines.append(f"    - [{candidate.source}] {candidate.path} ({status})")
             remaining = len(candidates) - _MAX_REPORTED_CANDIDATES
             if remaining > 0:
@@ -561,7 +596,8 @@ class KiCadCLIManager:
                 timeout=config.timeout_constants["kicad_cli_version_check"],
             )
             return result.returncode == 0
-        except (subprocess.SubprocessError, OSError, FileNotFoundError):
+        except (subprocess.SubprocessError, OSError, ValueError):
+            # ValueError covers UnicodeDecodeError from text=True output.
             return False
 
 
