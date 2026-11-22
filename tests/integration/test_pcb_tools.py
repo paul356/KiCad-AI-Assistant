@@ -344,12 +344,16 @@ class TestGetRatsnest:
         assert "unconnected_count" in result
         assert "fully_routed" in result
 
-    def test_net_a_has_unconnected_pair(self, mcp_server):
+    def test_net_a_reports_every_unconnected_pad(self, mcp_server):
         """NET_A: C1:pad2 and J1:pad2 share the net but have no connecting track."""
         port, sid = mcp_server
         result = _call_tool(port, sid, "get_ratsnest", {"pcb_path": BOARD_FIXTURE})
-        net_a_pairs = [r for r in result["unconnected"] if r["net"] == "NET_A"]
-        assert len(net_a_pairs) > 0, "Expected at least one unconnected pair on NET_A"
+        net_a_items = [r for r in result["unconnected"] if r["net"] == "NET_A"]
+        assert len(net_a_items) == 2
+        assert {(r["from"]["ref"], r["from"]["pad"]) for r in net_a_items} == {
+            ("C1", "2"),
+            ("J1", "2"),
+        }
 
     def test_not_fully_routed(self, mcp_server):
         port, sid = mcp_server
