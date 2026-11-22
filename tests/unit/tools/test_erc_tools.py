@@ -320,9 +320,44 @@ def _kicad_cli_available() -> bool:
     return is_kicad_cli_available()
 
 
+@pytest.fixture
+def live_project_state(tmp_path, monkeypatch):
+    """Publish the ERC fixture directory as the open project.
+
+    The live test runs the real CLI, so ``run_erc``'s path validation needs a
+    trusted project root; provision one instead of relying on a host KiCad
+    session having a project open.
+    """
+    from kcaa.utils.config import config
+    import kcaa.utils.path_validator as path_validator_mod
+    import kcaa.utils.secure_subprocess as secure_subprocess_mod
+
+    project = Path(__file__).parent / "fixtures"
+    state_file = tmp_path / "project_state.json"
+    state_file.write_text(
+        json.dumps(
+            {
+                "version": 2,
+                "written_at": "2026-11-22T00:00:00Z",
+                "project_root": str(project),
+                "profile_file": "tools_test.kicad_sch",
+                "pcb_files": [],
+                "schematic_files": ["tools_test.kicad_sch"],
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("KCAA_PROJECT_STATE_FILE", str(state_file))
+    # Server temp files go to a scratch data dir, not the user's config dir.
+    monkeypatch.setattr(config, "get_kcaa_data_dir", lambda: str(tmp_path / "kcaa_data"))
+    monkeypatch.setattr(path_validator_mod, "_default_validator", None)
+    monkeypatch.setattr(secure_subprocess_mod, "_subprocess_runner", None)
+    return project
+
+
 @pytest.mark.skipif(not _kicad_cli_available(), reason="kicad-cli not installed")
 class TestRunErcLive:
-    def test_real_erc_on_fixture(self, tools):
+    def test_real_erc_on_fixture(self, tools, live_project_state):
         result = asyncio.run(tools["run_erc"](schematic_path=SCHEMATIC_PATH, severity="all"))
         assert result["success"] is True, result
         assert isinstance(result["violation_count"], int)
