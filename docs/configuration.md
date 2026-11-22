@@ -27,7 +27,7 @@ These settings control how the server locates KiCad:
 
 | Environment Variable | Description | Default Value | Example |
 |---------------------|-------------|---------------|---------|
-| `KICAD_APP_PATH` | Path to the KiCad application | `/Applications/KiCad/KiCad.app` (macOS)<br>`C:\Program Files\KiCad` (Windows)<br>`/usr/share/kicad` (Linux) | `/Applications/KiCad7/KiCad.app` |
+| `KICAD_APP_PATH` | Path to the KiCad install root (the directory containing `bin/kicad-cli`) | `/Applications/KiCad/KiCad.app` (macOS)<br>`%ProgramFiles%\KiCad\<version>` (Windows)<br>`/usr` (Linux) | `/Applications/KiCad7/KiCad.app` |
 
 ## Using a .env File (Recommended)
 
@@ -53,13 +53,13 @@ The recommended way to configure the server is by creating a `.env` file in the 
    # Additional directories to search for KiCad projects (comma-separated)
    KICAD_SEARCH_PATHS=~/pcb,~/Electronics,~/Projects/KiCad
    
-   # KiCad application path (needed for opening projects and command-line tools)
+   # KiCad install root (the directory containing bin/kicad-cli)
    # macOS:
    KICAD_APP_PATH=/Applications/KiCad/KiCad.app
    # Windows:
-   # KICAD_APP_PATH=C:\Program Files\KiCad
+   # KICAD_APP_PATH=C:\Program Files\KiCad\10.0
    # Linux:
-   # KICAD_APP_PATH=/usr/share/kicad
+   # KICAD_APP_PATH=/usr
    ```
 
 ## Directory Structure and Project Discovery
@@ -202,10 +202,10 @@ KICAD_APP_PATH=/path/to/your/KiCad.app
 
 ### Windows
 
-On Windows, KiCad is typically installed in `C:\Program Files\KiCad`. If you have a different installation location, set:
+On Windows, KiCad is typically installed in `C:\Program Files\KiCad\<version>`. Set the directory that contains `bin/kicad-cli.exe`:
 
 ```
-KICAD_APP_PATH=D:\Software\KiCad
+KICAD_APP_PATH=C:\Program Files\KiCad\10.0
 ```
 
 For paths in the `.env` file on Windows, you can use either:
@@ -214,16 +214,13 @@ For paths in the `.env` file on Windows, you can use either:
 
 ### Linux
 
-On Linux, KiCad's location varies by distribution. Common paths include:
-- `/usr/share/kicad`
-- `/usr/local/share/kicad`
-- `/opt/kicad`
-
-Set the appropriate path in your configuration:
+On Linux, KiCad's location varies by distribution. Set the install root that contains `bin/kicad-cli`:
 
 ```
-KICAD_APP_PATH=/opt/kicad
+KICAD_APP_PATH=/usr
 ```
+
+AppImage builds live under their mount point (for example `/tmp/.mount_xxxx/usr`). The server derives the root automatically from `KICAD{N}_SYMBOL_DIR` and friends when `KICAD_APP_PATH` is unset.
 
 ## Debugging Configuration Issues
 

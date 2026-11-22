@@ -3,23 +3,69 @@ Centralized KiCad CLI detection and management.
 
 Provides a single source of truth for locating KiCad CLI across platforms
 with caching and configuration support.
+
+``config.kicad_app_path`` points at the directory containing ``bin/kicad-cli``.
+The KiCad version is known up front, so platform default candidates are built
+directly from it; no directory scanning or version-less fallbacks are used.
 """
 
+from collections.abc import Iterator
+from dataclasses import dataclass
 import logging
 import os
 import platform
 import shutil
 import subprocess  # nosec B404 -- controlled command execution, no user input
+from typing import cast
 
-from .config import config
+from .config import _root_version_variants, config
 
 logger = logging.getLogger(__name__)
+
+_MAX_REPORTED_CANDIDATES = 10
 
 
 class KiCadCLIError(Exception):
     """Raised when KiCad CLI operations fail."""
 
     pass
+
+
+@dataclass(frozen=True)
+class CLICandidate:
+    """
+    A single location probed while looking for the KiCad CLI.
+
+    Attributes:
+        path: Candidate executable path
+        source: Where the candidate came from ("config", "path" or "common")
+        exists: Whether the candidate file exists
+        validated: Whether ``--version`` succeeded; None if not validated
+            (missing file or validation not attempted)
+    """
+
+    path: str
+    source: str
+    exists: bool
+    validated: bool | None = None
+
+
+@dataclass(frozen=True)
+class CLIDiagnosis:
+    """
+    Structured snapshot of a KiCad CLI detection pass.
+
+    Attributes:
+        platform: Platform name reported by :func:`platform.system`
+        candidates: Candidates probed during the pass, in priority order
+        selected: Path of the accepted candidate, or None if none worked
+        path_lookup: Result of the ``PATH`` lookup for kicad-cli, if any
+    """
+
+    platform: str
+    candidates: tuple[CLICandidate, ...]
+    selected: str | None
+    path_lookup: str | None = None
 
 
 class KiCadCLIManager:
@@ -34,10 +80,17 @@ class KiCadCLIManager:
         self._cached_cli_path: str | None = None
         self._cache_validated = False
         self._system = platform.system()
+        self._last_candidates: list[CLICandidate] = []
+        self._last_path_lookup: str | None = None
 
     def find_kicad_cli(self, force_refresh: bool = False) -> str | None:
         """
         Find the KiCad CLI executable path.
+
+        Candidates are probed in priority order: the configured install root,
+        ``PATH``, then the platform default roots for the known version. The
+        first candidate that exists and passes ``--version`` validation wins;
+        a candidate that exists but fails validation does not abort the search.
 
         Args:
             force_refresh: Force re-detection even if cached
@@ -49,18 +102,39 @@ class KiCadCLIManager:
         if self._cached_cli_path and not force_refresh and self._cache_validated:
             return self._cached_cli_path
 
-        # Try to find CLI
-        cli_path = self._detect_cli_path()
+        self._last_candidates = []
+        self._last_path_lookup = None
+        probes: list[CLICandidate] = []
+        selected: str | None = None
 
-        if cli_path:
-            # Validate the found CLI
-            if self._validate_cli_path(cli_path):
-                self._cached_cli_path = cli_path
-                self._cache_validated = True
-                logger.info(f"Found KiCad CLI at: {cli_path}")
-                return cli_path
-            else:
-                logger.warning(f"Found KiCad CLI at {cli_path} but validation failed")
+        for candidate in self._detect_cli_path():
+            if not candidate.exists:
+                probes.append(candidate)
+                logger.debug("Skipping missing KiCad CLI candidate: %s", candidate.path)
+                continue
+
+            valid = self._validate_cli_path(candidate.path)
+            probes.append(
+                CLICandidate(
+                    path=candidate.path,
+                    source=candidate.source,
+                    exists=True,
+                    validated=valid,
+                )
+            )
+            if valid:
+                selected = candidate.path
+                break
+
+            logger.warning("KiCad CLI candidate %s failed validation; trying next", candidate.path)
+
+        self._last_candidates = probes
+
+        if selected is not None:
+            self._cached_cli_path = selected
+            self._cache_validated = True
+            logger.info("Found KiCad CLI at: %s", selected)
+            return selected
 
         # Clear cache if detection failed
         self._cached_cli_path = None
@@ -84,11 +158,11 @@ class KiCadCLIManager:
         cli_path = self.find_kicad_cli()
 
         if cli_path is None and required:
-            raise KiCadCLIError(
-                "KiCad CLI not found. Please install KiCad or set KICAD_CLI_PATH environment variable."
-            )
+            raise KiCadCLIError(self._build_not_found_message())
 
-        return cli_path
+        # ``required=False`` historically returns None despite the ``str``
+        # annotation; keep that API while satisfying type checkers.
+        return cast(str, cli_path)
 
     def is_available(self) -> bool:
         """Check if KiCad CLI is available."""
@@ -119,34 +193,81 @@ class KiCadCLIManager:
 
         return None
 
-    def _detect_cli_path(self) -> str | None:
+    def diagnose(self, force_refresh: bool = False) -> CLIDiagnosis:
         """
-        Detect KiCad CLI path using platform-specific strategies.
+        Return a read-only snapshot of the most recent detection pass.
+
+        Intended for UI/diagnostics consumers that need to explain why ERC or
+        DRC commands are unavailable. This does not alter detection semantics;
+        the returned ``selected`` value matches :meth:`find_kicad_cli`.
+
+        Args:
+            force_refresh: Re-probe instead of using the cached result
 
         Returns:
-            Path to CLI executable or None if not found
+            Structured diagnosis with every probed candidate.
         """
-        # Check environment variable first
-        env_path = os.environ.get("KICAD_CLI_PATH")
-        if env_path and os.path.isfile(env_path) and os.access(env_path, os.X_OK):
-            logger.info(f"Using KiCad CLI from environment: {env_path}")
-            return env_path
+        selected = self.find_kicad_cli(force_refresh=force_refresh)
+        return CLIDiagnosis(
+            platform=self._system,
+            candidates=tuple(self._last_candidates),
+            selected=selected,
+            path_lookup=self._last_path_lookup,
+        )
 
-        # Try system PATH
-        cli_name = self._get_cli_executable_name()
-        system_path = shutil.which(cli_name)
-        if system_path:
-            logger.info(f"Found KiCad CLI in system PATH: {system_path}")
-            return system_path
+    def _candidate_key(self, path: str) -> str:
+        """Return a platform-appropriate identity key for a candidate path."""
+        if self._system == "Windows":
+            return os.path.normcase(path).lower()
+        return os.path.normcase(path)
 
-        # Try platform-specific common locations
-        common_paths = self._get_common_installation_paths()
-        for path in common_paths:
-            if os.path.isfile(path) and os.access(path, os.X_OK):
-                logger.info(f"Found KiCad CLI at common location: {path}")
-                return path
+    def _iter_candidates(self) -> Iterator[tuple[str, str]]:
+        """
+        Yield ``(source, path)`` candidates in priority order.
 
-        return None
+        Lazily evaluated so an early acceptance avoids the ``PATH`` lookup and
+        platform defaults. Duplicate paths are yielded only once.
+        """
+        seen: set[str] = set()
+
+        def fresh(source: str, path: str) -> tuple[str, str] | None:
+            key = self._candidate_key(path)
+            if key in seen:
+                return None
+            seen.add(key)
+            return (source, path)
+
+        for path in self._get_config_installation_paths():
+            item = fresh("config", path)
+            if item is not None:
+                yield item
+
+        for name in self._which_names():
+            path_hit = shutil.which(name)
+            if path_hit:
+                if self._last_path_lookup is None:
+                    self._last_path_lookup = path_hit
+                item = fresh("path", path_hit)
+                if item is not None:
+                    yield item
+
+        for path in self._get_common_installation_paths():
+            item = fresh("common", path)
+            if item is not None:
+                yield item
+
+    def _detect_cli_path(self) -> Iterator[CLICandidate]:
+        """
+        Yield KiCad CLI candidates in priority order, with existence flags.
+
+        Candidates are not validated here; :meth:`find_kicad_cli` validates
+        each existing candidate in turn.
+
+        Yields:
+            Candidates in priority order (may include non-existent paths)
+        """
+        for source, path in self._iter_candidates():
+            yield CLICandidate(path=path, source=source, exists=os.path.isfile(path))
 
     def _get_cli_executable_name(self) -> str:
         """Get the CLI executable name for current platform."""
@@ -154,38 +275,102 @@ class KiCadCLIManager:
             return "kicad-cli.exe"
         return "kicad-cli"
 
+    def _which_names(self) -> tuple[str, ...]:
+        """Return PATH lookup names in platform-appropriate order."""
+        if self._system == "Windows":
+            return ("kicad-cli.exe", "kicad-cli")
+        return ("kicad-cli", "kicad-cli.exe")
+
+    def _known_version(self) -> str | None:
+        """Return the configured KiCad version, or None if unavailable."""
+        try:
+            version = config.kicad_version
+        except Exception:  # noqa: BLE001 -- config access must never break detection
+            return None
+        return version if isinstance(version, str) and version else None
+
+    def _get_config_installation_paths(self) -> list[str]:
+        """Return the canonical CLI path under the configured install root."""
+        try:
+            app_path = config.kicad_app_path
+        except Exception:  # noqa: BLE001 -- config access must never break detection
+            return []
+        if not app_path:
+            return []
+
+        if self._system == "Darwin":
+            return [os.path.join(app_path, "Contents", "MacOS", "kicad-cli")]
+        return [os.path.join(app_path, "bin", self._get_cli_executable_name())]
+
     def _get_common_installation_paths(self) -> list[str]:
-        """Get list of common installation paths for current platform."""
-        paths = []
+        """Return deterministic CLI paths for platform default install roots."""
+        paths: list[str] = []
 
-        if self._system == "Darwin":  # macOS
-            paths.extend(
-                [
-                    "/Applications/KiCad/KiCad.app/Contents/MacOS/kicad-cli",
-                    "/Applications/KiCad/kicad-cli",
-                    "/usr/local/bin/kicad-cli",
-                    "/opt/homebrew/bin/kicad-cli",
-                ]
-            )
+        if self._system == "Darwin":
+            paths.append("/Applications/KiCad/KiCad.app/Contents/MacOS/kicad-cli")
         elif self._system == "Windows":
-            paths.extend(
-                [
-                    r"C:\Program Files\KiCad\bin\kicad-cli.exe",
-                    r"C:\Program Files (x86)\KiCad\bin\kicad-cli.exe",
-                    r"C:\KiCad\bin\kicad-cli.exe",
-                ]
-            )
-        else:  # Linux and other Unix-like systems
-            paths.extend(
-                [
-                    "/usr/bin/kicad-cli",
-                    "/usr/local/bin/kicad-cli",
-                    "/opt/kicad/bin/kicad-cli",
-                    "/snap/kicad/current/usr/bin/kicad-cli",
-                ]
-            )
+            version = self._known_version()
+            if version:
+                exe_name = self._get_cli_executable_name()
+                for root in self._iter_windows_install_roots():
+                    for variant in _root_version_variants(version):
+                        paths.append(os.path.join(root, variant, "bin", exe_name))
+        # Linux: no hardcoded paths -- config derivation and ``which`` cover it.
 
-        return paths
+        deduped: dict[str, str] = {}
+        for path in paths:
+            deduped.setdefault(self._candidate_key(path), path)
+        return list(deduped.values())
+
+    def _iter_windows_install_roots(self) -> Iterator[str]:
+        """Yield KiCad roots from the Windows environment, when present."""
+        # Windows environment names are case-insensitive; keep canonical casing.
+        program_files = os.environ.get("ProgramFiles")  # noqa: SIM112
+        if program_files:
+            yield os.path.join(program_files, "KiCad")
+
+        program_files_x86 = os.environ.get("ProgramFiles(x86)")  # noqa: SIM112
+        if program_files_x86:
+            yield os.path.join(program_files_x86, "KiCad")
+
+        program_w6432 = os.environ.get("ProgramW6432")  # noqa: SIM112
+        if program_w6432:
+            yield os.path.join(program_w6432, "KiCad")
+
+        local_appdata = os.environ.get("LOCALAPPDATA")
+        if local_appdata:
+            yield os.path.join(local_appdata, "Programs", "KiCad")
+
+    def _build_not_found_message(self) -> str:
+        """Build an actionable, bounded diagnostic message for detection failure."""
+        cli_name = self._get_cli_executable_name()
+        lines = ["KiCad CLI not found."]
+
+        if self._last_path_lookup:
+            lines.append(
+                f"  PATH lookup for {cli_name} found {self._last_path_lookup} (not usable)."
+            )
+        else:
+            lines.append(f"  PATH lookup for {cli_name}: no executable found.")
+
+        candidates = self._last_candidates
+        if candidates:
+            lines.append(f"  Tried {len(candidates)} candidate location(s):")
+            for candidate in candidates[:_MAX_REPORTED_CANDIDATES]:
+                # The message is only built when no candidate validated.
+                status = "exists but failed --version" if candidate.exists else "missing"
+                lines.append(f"    - [{candidate.source}] {candidate.path} ({status})")
+            remaining = len(candidates) - _MAX_REPORTED_CANDIDATES
+            if remaining > 0:
+                lines.append(f"    ... and {remaining} more")
+        else:
+            lines.append("  No candidate locations were available to probe.")
+
+        lines.append(
+            "  Set KICAD_APP_PATH to the directory containing bin/kicad-cli "
+            "(e.g. C:\\Program Files\\KiCad\\10.0), or add KiCad's bin directory to PATH."
+        )
+        return "\n".join(lines)
 
     def _validate_cli_path(self, cli_path: str) -> bool:
         """
@@ -205,7 +390,8 @@ class KiCadCLIManager:
                 timeout=config.timeout_constants["kicad_cli_version_check"],
             )
             return result.returncode == 0
-        except (subprocess.SubprocessError, OSError, FileNotFoundError):
+        except (subprocess.SubprocessError, OSError, ValueError):
+            # ValueError covers UnicodeDecodeError from text=True output.
             return False
 
 
@@ -232,7 +418,7 @@ def get_kicad_cli_path(required: bool = True) -> str:
 
 
 def is_kicad_cli_available() -> bool:
-    """Convenience function to check if KiCad CLI is available."""
+    """Check if KiCad CLI is available."""
     return get_cli_manager().is_available()
 
 
