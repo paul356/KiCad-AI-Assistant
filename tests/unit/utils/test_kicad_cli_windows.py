@@ -12,6 +12,8 @@ from kcaa.utils.config import config
 from kcaa.utils.kicad_cli import (
     KiCadCLIError,
     KiCadCLIManager,
+    _iter_ancestor_dirs,
+    _iter_appimage_mount_dirs,
     _parse_version_directory,
     _sort_version_directories,
 )
@@ -39,6 +41,24 @@ def _make_install(root: Path, versions: list[str]) -> dict[str, Path]:
         exe.touch()
         installed[version] = exe
     return installed
+
+
+@pytest.fixture(autouse=True)
+def _isolate_external_discovery(monkeypatch):
+    """Keep tests independent of host config, AppImage mounts and drives."""
+    monkeypatch.setattr(
+        "kcaa.utils.kicad_cli._iter_appimage_mount_dirs",
+        lambda max_mounts=8: iter(()),
+    )
+    monkeypatch.delenv("APPDIR", raising=False)
+    monkeypatch.setattr("kcaa.utils.kicad_cli._list_windows_drives", lambda: [])
+    for attr in (
+        "_kicad_app_path",
+        "_kicad_symbol_dir",
+        "_kicad_footprint_dir",
+        "_kicad_template_dir",
+    ):
+        monkeypatch.setattr(config, attr, "")
 
 
 @pytest.fixture
@@ -723,3 +743,302 @@ class TestValidateCliPath:
 
         monkeypatch.setattr("kcaa.utils.kicad_cli.subprocess.run", raise_unicode_error)
         assert KiCadCLIManager()._validate_cli_path("/virtual/kicad-cli") is False
+
+
+def _linux_manager(monkeypatch) -> KiCadCLIManager:
+    """Create a Linux manager isolated from host installation paths."""
+    monkeypatch.setattr(platform, "system", lambda: "Linux")
+    monkeypatch.setattr(sys, "platform", "linux")
+    monkeypatch.setattr(shutil, "which", lambda name: None)
+    monkeypatch.delenv("KICAD_CLI_PATH", raising=False)
+    manager = KiCadCLIManager()
+    monkeypatch.setattr(manager, "_get_common_installation_paths", lambda: [])
+    return manager
+
+
+def test_config_windows_symbol_dir_finds_cli(windows_env, monkeypatch):
+    """Config-derived Windows symbol dir maps to the sibling bin directory."""
+    exe = r"D:\KiCad\10.0\bin\kicad-cli.exe"
+    monkeypatch.setattr(config, "_kicad_symbol_dir", r"D:\KiCad\10.0\share\kicad\symbols")
+    real_isfile = os.path.isfile
+    monkeypatch.setattr(os.path, "isfile", lambda path: path == exe or real_isfile(path))
+    manager = KiCadCLIManager()
+    _patch_validation(manager, monkeypatch, None)
+
+    diagnosis = manager.diagnose()
+
+    assert diagnosis.selected == exe
+    assert [(candidate.source, candidate.path) for candidate in diagnosis.candidates] == [
+        ("config", exe)
+    ]
+
+
+def test_config_linux_symbol_dir_ancestor_finds_cli(tmp_path, monkeypatch):
+    """Walking up from a Linux symbol dir finds <prefix>/bin/kicad-cli."""
+    app_root = tmp_path / "app"
+    symbols = app_root / "usr" / "share" / "kicad" / "symbols"
+    symbols.mkdir(parents=True)
+    exe = app_root / "usr" / "bin" / "kicad-cli"
+    exe.parent.mkdir(parents=True)
+    exe.touch()
+    manager = _linux_manager(monkeypatch)
+    monkeypatch.setattr(config, "_kicad_symbol_dir", str(symbols))
+    _patch_validation(manager, monkeypatch, None)
+
+    diagnosis = manager.diagnose()
+
+    assert diagnosis.selected == str(exe)
+    assert [(candidate.source, candidate.path) for candidate in diagnosis.candidates] == [
+        ("config", str(exe))
+    ]
+
+
+def test_config_macos_app_bundle_finds_cli(tmp_path, monkeypatch):
+    """macOS app bundles resolve through Contents/MacOS/kicad-cli."""
+    contents = tmp_path / "KiCad.app" / "Contents"
+    symbols = contents / "SharedSupport" / "symbols"
+    symbols.mkdir(parents=True)
+    exe = contents / "MacOS" / "kicad-cli"
+    exe.parent.mkdir(parents=True)
+    exe.touch()
+    monkeypatch.setattr(platform, "system", lambda: "Darwin")
+    monkeypatch.setattr(sys, "platform", "darwin")
+    monkeypatch.setattr(shutil, "which", lambda name: None)
+    monkeypatch.delenv("KICAD_CLI_PATH", raising=False)
+    monkeypatch.setattr(config, "_kicad_symbol_dir", str(symbols))
+    manager = KiCadCLIManager()
+    monkeypatch.setattr(manager, "_get_common_installation_paths", lambda: [])
+    _patch_validation(manager, monkeypatch, None)
+
+    diagnosis = manager.diagnose()
+
+    assert diagnosis.selected == str(exe)
+    assert [candidate.source for candidate in diagnosis.candidates] == ["config"]
+
+
+def test_config_custom_library_without_bin_yields_no_candidates(tmp_path, monkeypatch):
+    """A user library directory must not create fake config candidates."""
+    symbols = tmp_path / "MyLibs" / "symbols"
+    symbols.mkdir(parents=True)
+    manager = _linux_manager(monkeypatch)
+    monkeypatch.setattr(config, "_kicad_symbol_dir", str(symbols))
+    _patch_validation(manager, monkeypatch, [])
+
+    assert manager._get_config_installation_paths() == []
+    assert manager.find_kicad_cli() is None
+
+
+def test_config_candidate_priority_over_common_installations(windows_env, monkeypatch):
+    """Config-derived candidates are probed before platform default roots."""
+    config_root = windows_env / "config-install"
+    config_bin = config_root / "10.0" / "bin"
+    config_bin.mkdir(parents=True)
+    config_exe = config_bin / "kicad-cli.exe"
+    config_exe.touch()
+    _make_install(windows_env / "KiCad", ["10.0"])
+    monkeypatch.setattr(config, "_kicad_app_path", str(config_root))
+    manager = KiCadCLIManager()
+    _patch_validation(manager, monkeypatch, None)
+
+    diagnosis = manager.diagnose()
+
+    assert diagnosis.selected == str(config_exe)
+    assert diagnosis.candidates[0].source == "config"
+
+
+def test_environment_variable_takes_priority_over_config(windows_env, monkeypatch):
+    """KICAD_CLI_PATH still wins before config-derived candidates are probed."""
+    env_exe = windows_env / "custom" / "kicad-cli.exe"
+    env_exe.parent.mkdir()
+    env_exe.touch()
+    config_bin = windows_env / "config-install" / "10.0" / "bin"
+    config_bin.mkdir(parents=True)
+    (config_bin / "kicad-cli.exe").touch()
+    monkeypatch.setenv("KICAD_CLI_PATH", str(env_exe))
+    monkeypatch.setattr(config, "_kicad_app_path", str(windows_env / "config-install"))
+    manager = KiCadCLIManager()
+    _patch_validation(manager, monkeypatch, None)
+    monkeypatch.setattr(
+        manager,
+        "_get_config_installation_paths",
+        lambda: pytest.fail("config must not be enumerated when KICAD_CLI_PATH works"),
+    )
+
+    assert manager.find_kicad_cli() == str(env_exe)
+
+
+def test_appimage_appdir_cli_is_detected(tmp_path, monkeypatch):
+    """APPDIR identifies the running AppImage's CLI."""
+    mount = tmp_path / "mnt"
+    exe = mount / "usr" / "bin" / "kicad-cli"
+    exe.parent.mkdir(parents=True)
+    exe.touch()
+    monkeypatch.setenv("APPDIR", str(mount))
+    manager = _linux_manager(monkeypatch)
+    _patch_validation(manager, monkeypatch, None)
+
+    diagnosis = manager.diagnose()
+
+    assert diagnosis.selected == str(exe)
+    assert [(candidate.source, candidate.path) for candidate in diagnosis.candidates] == [
+        ("appimage", str(exe))
+    ]
+
+
+def test_appimage_mount_candidates_skip_empty_mounts(tmp_path, monkeypatch):
+    """Mounts without kicad-cli are probed but skipped for the next mount."""
+    first = tmp_path / "m1"
+    (first / "usr" / "bin").mkdir(parents=True)
+    second = tmp_path / "m2"
+    exe = second / "usr" / "bin" / "kicad-cli"
+    exe.parent.mkdir(parents=True)
+    exe.touch()
+    monkeypatch.setattr(
+        "kcaa.utils.kicad_cli._iter_appimage_mount_dirs",
+        lambda max_mounts=8: iter([str(first), str(second)]),
+    )
+    manager = _linux_manager(monkeypatch)
+    _patch_validation(manager, monkeypatch, None)
+
+    diagnosis = manager.diagnose()
+    appimage = [c for c in diagnosis.candidates if c.source == "appimage"]
+
+    assert diagnosis.selected == str(exe)
+    assert [candidate.path for candidate in appimage] == [
+        os.path.join(str(first), "usr", "bin", "kicad-cli"),
+        str(exe),
+    ]
+    assert [candidate.exists for candidate in appimage] == [False, True]
+
+
+def test_appimage_empty_mount_list_is_skipped(monkeypatch):
+    """No APPDIR and no mounts yields no appimage candidates and no error."""
+    manager = _linux_manager(monkeypatch)
+    _patch_validation(manager, monkeypatch, [])
+
+    assert manager.find_kicad_cli() is None
+    assert all(candidate.source != "appimage" for candidate in manager._last_candidates)
+
+
+def test_appimage_mount_dirs_sorted_by_mtime_and_limited(tmp_path, monkeypatch):
+    """Mount dirs are newest-first and capped at eight entries."""
+    mounts = []
+    for index in range(10):
+        mount = tmp_path / f"mount{index}"
+        mount.mkdir()
+        os.utime(mount, (1000 + index, 1000 + index))
+        mounts.append(str(mount))
+    monkeypatch.setattr("kcaa.utils.kicad_cli.glob.glob", lambda pattern: list(mounts))
+
+    assert list(_iter_appimage_mount_dirs()) == list(reversed(mounts))[:8]
+
+
+def test_windows_other_drive_install_detected(windows_env, monkeypatch):
+    """Versioned KiCad roots on non-system drives are enumerated."""
+    target = r"D:\KiCad\10.0\bin\kicad-cli.exe"
+    monkeypatch.setattr("kcaa.utils.kicad_cli._list_windows_drives", lambda: ["C:\\", "D:\\"])
+    monkeypatch.setattr(
+        KiCadCLIManager,
+        "_list_version_directories",
+        lambda self, root: ["10.0"] if root == r"D:\KiCad" else [],
+    )
+    real_isfile = os.path.isfile
+    monkeypatch.setattr(os.path, "isfile", lambda path: path == target or real_isfile(path))
+    manager = KiCadCLIManager()
+    _patch_validation(manager, monkeypatch, None)
+
+    diagnosis = manager.diagnose()
+    drive = [candidate for candidate in diagnosis.candidates if candidate.source == "drive"]
+
+    assert diagnosis.selected == target
+    assert [candidate.path for candidate in drive] == [target]
+
+
+def test_nonexistent_drive_roots_do_not_raise(windows_env, monkeypatch):
+    """A drive that cannot be scanned contributes no candidates and no error."""
+    monkeypatch.setattr("kcaa.utils.kicad_cli._list_windows_drives", lambda: ["Z:\\"])
+    real_scandir = os.scandir
+
+    def fake_scandir(path):
+        if str(path).startswith("Z:"):
+            raise FileNotFoundError(path)
+        return real_scandir(path)
+
+    monkeypatch.setattr(os, "scandir", fake_scandir)
+    manager = KiCadCLIManager()
+
+    assert manager._get_drive_installation_paths() == []
+
+
+def test_config_and_drive_duplicate_path_appears_once(windows_env, monkeypatch):
+    """The same path produced by config and drive sources is deduplicated."""
+    target = r"D:\KiCad\10.0\bin\kicad-cli.exe"
+    monkeypatch.setattr(config, "_kicad_symbol_dir", r"D:\KiCad\10.0\share\kicad\symbols")
+    monkeypatch.setattr("kcaa.utils.kicad_cli._list_windows_drives", lambda: ["D:\\"])
+    monkeypatch.setattr(
+        KiCadCLIManager,
+        "_list_version_directories",
+        lambda self, root: ["10.0"] if root == r"D:\KiCad" else [],
+    )
+    real_isfile = os.path.isfile
+    monkeypatch.setattr(os.path, "isfile", lambda path: path == target or real_isfile(path))
+    manager = KiCadCLIManager()
+
+    candidates = list(manager._detect_cli_path())
+
+    assert [candidate.path for candidate in candidates if candidate.source == "config"] == [target]
+    assert [candidate.path for candidate in candidates if candidate.source == "drive"] == []
+    assert [candidate.path for candidate in candidates].count(target) == 1
+
+
+def test_registry_is_used_after_config_and_common_fail(windows_env, monkeypatch):
+    """Registry lookup remains the final fallback after all earlier sources."""
+    config_bin = windows_env / "config-install" / "10.0" / "bin"
+    config_bin.mkdir(parents=True)
+    config_exe = config_bin / "kicad-cli.exe"
+    config_exe.touch()
+    stale_exe = _make_install(windows_env / "KiCad", ["8.0"])["8.0"]
+    monkeypatch.setattr(config, "_kicad_app_path", str(windows_env / "config-install"))
+    monkeypatch.setattr(sys, "platform", "win32")
+    registry_install = r"D:\CustomKiCad\9.0"
+    registry_exe = registry_install + r"\bin\kicad-cli.exe"
+    monkeypatch.setitem(sys.modules, "winreg", _FakeWinreg([_install_entry(registry_install)]))
+    real_isfile = os.path.isfile
+    monkeypatch.setattr(os.path, "isfile", lambda path: path == registry_exe or real_isfile(path))
+    manager = KiCadCLIManager()
+    calls = _patch_validation(manager, monkeypatch, [registry_exe])
+    registry_reads: list[int] = []
+    original_registry = manager._get_registry_installation_paths
+
+    def counting_registry():
+        registry_reads.append(1)
+        return original_registry()
+
+    monkeypatch.setattr(manager, "_get_registry_installation_paths", counting_registry)
+
+    assert manager.find_kicad_cli() == registry_exe
+    assert calls == [str(config_exe), str(stale_exe), registry_exe]
+    assert registry_reads == [1]
+
+
+def test_ancestor_traversal_is_bounded(tmp_path, monkeypatch):
+    """Ancestor walking stops after five levels even for deep directories."""
+    deep = tmp_path
+    for level in range(8):
+        deep = deep / f"level{level}"
+    deep.mkdir(parents=True)
+    lengths: list[int] = []
+    real_iter = _iter_ancestor_dirs
+
+    def counting_ancestors(path, max_levels=5):
+        ancestors = list(real_iter(path, max_levels))
+        lengths.append(len(ancestors))
+        yield from ancestors
+
+    monkeypatch.setattr("kcaa.utils.kicad_cli._iter_ancestor_dirs", counting_ancestors)
+    manager = _linux_manager(monkeypatch)
+    monkeypatch.setattr(config, "_kicad_symbol_dir", str(deep))
+
+    assert manager._get_config_installation_paths() == []
+    assert lengths == [5]
+    assert len(list(real_iter(str(deep)))) == 5

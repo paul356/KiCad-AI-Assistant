@@ -7,6 +7,7 @@ with caching and configuration support.
 
 from collections.abc import Iterable, Iterator
 from dataclasses import dataclass
+import glob
 import importlib
 import logging
 import ntpath
@@ -109,6 +110,108 @@ def _sort_version_directories(names: Iterable[str]) -> list[str]:
     numeric.sort(key=lambda item: item[0], reverse=True)
     other.sort()
     return [name for _, name in numeric] + other
+
+
+def _path_module_for(path: str) -> Any:
+    """
+    Return ``ntpath`` for Windows-style paths, ``os.path`` otherwise.
+
+    Detection tests simulate Windows on POSIX, so path helpers must not rely
+    on ``os.path`` always matching the simulated platform.
+    """
+    if ntpath.splitdrive(path)[0] or "\\" in path:
+        return ntpath
+    return os.path
+
+
+def _join_path(path: str, *parts: str) -> str:
+    """Join path components using the flavour implied by ``path``."""
+    return cast(str, _path_module_for(path).join(path, *parts))
+
+
+def _iter_ancestor_dirs(path: str, max_levels: int = 5) -> Iterator[str]:
+    """
+    Yield ``path`` and its parents, up to ``max_levels`` directories.
+
+    Stops before the filesystem root; empty paths yield nothing.
+    """
+    if not path:
+        return
+    module = _path_module_for(path)
+    current = module.normpath(path)
+    for _ in range(max_levels):
+        parent = module.dirname(current)
+        if not parent or parent == current:
+            break
+        yield current
+        current = parent
+
+
+def _iter_appimage_mount_dirs(max_mounts: int = 8) -> Iterator[str]:
+    """Yield recent AppImage mount directories (``/tmp/.mount_*``)."""
+    try:
+        mounts = [path for path in glob.glob("/tmp/.mount_*") if os.path.isdir(path)]
+    except OSError:
+        return
+
+    def mount_mtime(path: str) -> float:
+        try:
+            return os.path.getmtime(path)
+        except OSError:
+            return 0.0
+
+    mounts.sort(key=lambda path: (-mount_mtime(path), path))
+    yield from mounts[:max_mounts]
+
+
+def _iter_appimage_cli_paths() -> Iterator[str]:
+    """Yield ``kicad-cli`` paths from the current AppImage mount and APPDIR."""
+    app_dir = os.environ.get("APPDIR")
+    if app_dir:
+        yield os.path.join(app_dir, "usr", "bin", "kicad-cli")
+    for mount in _iter_appimage_mount_dirs():
+        yield os.path.join(mount, "usr", "bin", "kicad-cli")
+
+
+def _list_windows_drives() -> list[str]:
+    """Return Windows logical drive roots (``C:\\\\`` style)."""
+    listdrives = getattr(os, "listdrives", None)
+    if callable(listdrives):
+        try:
+            return list(listdrives())
+        except OSError:
+            return []
+
+    try:
+        import ctypes  # Windows-only lazy import
+    except ImportError:
+        return []
+
+    windll = getattr(ctypes, "windll", None)
+    if windll is None:
+        return []
+    try:
+        mask = windll.kernel32.GetLogicalDrives()
+    except (AttributeError, OSError):
+        return []
+    return [f"{chr(ord('A') + index)}:\\" for index in range(26) if mask & (1 << index)]
+
+
+_WINDOWS_DRIVE_KICAD_SUBDIRS: tuple[tuple[str, ...], ...] = (
+    ("KiCad",),
+    ("Program Files", "KiCad"),
+    ("Program Files (x86)", "KiCad"),
+    ("Programs", "KiCad"),
+)
+
+
+def _iter_windows_drive_roots() -> Iterator[str]:
+    """Yield the four fixed KiCad roots on every Windows logical drive."""
+    for drive in _list_windows_drives():
+        if not drive:
+            continue
+        for parts in _WINDOWS_DRIVE_KICAD_SUBDIRS:
+            yield ntpath.join(drive, *parts)
 
 
 class KiCadCLIManager:
@@ -303,6 +406,11 @@ class KiCadCLIManager:
             if item is not None:
                 yield item
 
+        for path in self._get_config_installation_paths():
+            item = fresh("config", path)
+            if item is not None:
+                yield item
+
         cli_name = self._get_cli_executable_name()
         path_hit = shutil.which(cli_name)
         self._last_path_lookup = path_hit
@@ -311,10 +419,22 @@ class KiCadCLIManager:
             if item is not None:
                 yield item
 
+        if self._system == "Linux":
+            for path in _iter_appimage_cli_paths():
+                item = fresh("appimage", path)
+                if item is not None:
+                    yield item
+
         for path in self._get_common_installation_paths():
             item = fresh("common", path)
             if item is not None:
                 yield item
+
+        if self._system == "Windows":
+            for path in self._get_drive_installation_paths():
+                item = fresh("drive", path)
+                if item is not None:
+                    yield item
 
         # Registry is the last resort. Being lazy, this is only reached when
         # the caller consumed every earlier candidate without accepting one,
@@ -384,6 +504,71 @@ class KiCadCLIManager:
             deduped.setdefault(self._candidate_key(path), path)
         return list(deduped.values())
 
+    def _get_config_installation_paths(self) -> list[str]:
+        """
+        Derive CLI candidates from the configured KiCad paths.
+
+        Tries ``<kicad_app_path>/<version>/bin/kicad-cli`` first, then walks
+        each configured symbol/footprint/template directory upwards looking
+        for a sibling ``bin`` directory. Only existing executables are
+        returned, so user-created library directories never add noise.
+        """
+        exe_name = self._get_cli_executable_name()
+
+        def read_config_path(name: str) -> str | None:
+            try:
+                value = getattr(config, name, None)
+            except OSError:
+                return None
+            return value if isinstance(value, str) and value else None
+
+        paths: list[str] = []
+
+        app_path = read_config_path("kicad_app_path")
+        version = read_config_path("kicad_version")
+        if app_path and version:
+            candidate = _join_path(app_path, version, "bin", exe_name)
+            if os.path.isfile(candidate):
+                paths.append(candidate)
+
+        for attr in ("kicad_symbol_dir", "kicad_footprint_dir", "kicad_template_dir"):
+            base = read_config_path(attr)
+            if not base:
+                continue
+            for ancestor in _iter_ancestor_dirs(base):
+                candidate = _join_path(ancestor, "bin", exe_name)
+                if os.path.isfile(candidate):
+                    paths.append(candidate)
+                if self._system == "Darwin":
+                    module = _path_module_for(ancestor)
+                    normalized = module.normpath(ancestor)
+                    bundle_parent = module.basename(module.dirname(normalized))
+                    if module.basename(normalized) == "Contents" and bundle_parent.lower().endswith(
+                        ".app"
+                    ):
+                        macos_candidate = module.join(ancestor, "MacOS", "kicad-cli")
+                        if os.path.isfile(macos_candidate):
+                            paths.append(macos_candidate)
+
+        deduped: dict[str, str] = {}
+        for path in paths:
+            deduped.setdefault(self._candidate_key(path), path)
+        return list(deduped.values())
+
+    def _get_drive_installation_paths(self) -> list[str]:
+        """
+        Enumerate versioned installs on every Windows logical drive.
+
+        Only four fixed roots per drive are inspected; there is no recursive
+        scan of the drive.
+        """
+        exe_name = self._get_cli_executable_name()
+        paths: list[str] = []
+        for root in _iter_windows_drive_roots():
+            for directory in self._list_version_directories(root):
+                paths.append(_join_path(root, directory, "bin", exe_name))
+        return paths
+
     def _get_versioned_installation_paths(self) -> list[str]:
         """
         Enumerate ``<root>\\<version>\\bin\\kicad-cli.exe`` on Windows.
@@ -395,7 +580,7 @@ class KiCadCLIManager:
         paths: list[str] = []
         for root in self._iter_windows_install_roots():
             for directory in self._list_version_directories(root):
-                paths.append(os.path.join(root, directory, "bin", exe_name))
+                paths.append(_join_path(root, directory, "bin", exe_name))
         return paths
 
     def _iter_windows_install_roots(self) -> Iterator[str]:
@@ -443,7 +628,7 @@ class KiCadCLIManager:
             name
             for name in names
             if _parse_version_directory(name) is not None
-            or os.path.isfile(os.path.join(root, name, "bin", exe_name))
+            or os.path.isfile(_join_path(root, name, "bin", exe_name))
         ]
         return _sort_version_directories(kept)
 
