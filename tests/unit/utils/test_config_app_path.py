@@ -163,3 +163,19 @@ def test_stripped_root_without_cli_is_rejected(tmp_path, monkeypatch):
 
     assert _derive_app_path_from_library_dirs("10") is None
     assert ServerConfig().kicad_app_path == "/usr"
+
+
+def test_major_only_version_uses_versioned_default_root(tmp_path, monkeypatch):
+    """KICAD_VERSION=10 picks the installed 10.0 root for the default tree."""
+    program_files = tmp_path / "ProgramFiles"
+    kicad_root = program_files / "KiCad"
+    _make_cli(kicad_root / "10.0" / "bin" / "kicad-cli.exe")
+    monkeypatch.setattr(config_module, "_SYSTEM", "Windows")
+    monkeypatch.setenv("ProgramFiles", str(program_files))
+    monkeypatch.setenv("KICAD_VERSION", "10")
+
+    cfg = ServerConfig()
+
+    assert cfg.kicad_version == "10"
+    assert cfg.kicad_app_path == str(kicad_root / "10.0")
+    assert cfg.kicad_symbol_dir == str(kicad_root / "10.0" / "share" / "kicad" / "symbols")

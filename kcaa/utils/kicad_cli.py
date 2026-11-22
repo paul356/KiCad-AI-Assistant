@@ -18,7 +18,7 @@ import shutil
 import subprocess  # nosec B404 -- controlled command execution, no user input
 from typing import cast
 
-from .config import config
+from .config import _root_version_variants, config
 
 logger = logging.getLogger(__name__)
 
@@ -66,14 +66,6 @@ class CLIDiagnosis:
     candidates: tuple[CLICandidate, ...]
     selected: str | None
     path_lookup: str | None = None
-
-
-def _root_version_variants(version: str) -> list[str]:
-    """Return the version, plus ``<version>.0`` when only a major was given."""
-    variants = [version]
-    if "." not in version:
-        variants.append(f"{version}.0")
-    return variants
 
 
 class KiCadCLIManager:

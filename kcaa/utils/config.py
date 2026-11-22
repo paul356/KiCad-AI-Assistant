@@ -91,11 +91,20 @@ def _app_has_cli(app_path: str) -> bool:
     return _dir_has_cli(app_path)
 
 
+def _root_version_variants(version: str) -> list[str]:
+    """Return the version, plus ``<version>.0`` when only a major was given."""
+    variants = [version]
+    if "." not in version:
+        variants.append(f"{version}.0")
+    return variants
+
+
 def _derive_app_path_from_library_dirs(version_tag: str) -> str | None:
     """
     Derive the KiCad install root from KICAD* library directory variables.
 
-    The first configured directory wins. Known suffixes (``share/kicad`` /
+    Each configured directory is tried in order; the first one that yields a
+    valid install root wins. Known suffixes (``share/kicad`` /
     ``Contents/SharedSupport``) are stripped; other layouts are walked upwards
     up to four levels. The result must contain the platform's canonical CLI.
     """
@@ -423,7 +432,14 @@ class ServerConfig:
                 path = "/Applications/KiCad/KiCad.app"
             elif self._system == "Windows":
                 program_files = os.environ.get("ProgramFiles") or r"C:\Program Files"  # noqa: SIM112
-                path = os.path.join(program_files, "KiCad", self._kicad_version or "")
+                kicad_root = os.path.join(program_files, "KiCad")
+                version = self._kicad_version or ""
+                path = os.path.join(kicad_root, version)
+                for variant in _root_version_variants(version):
+                    candidate = os.path.join(kicad_root, variant)
+                    if _app_has_cli(candidate):
+                        path = candidate
+                        break
             elif self._system == "Linux":
                 path = "/usr"
             else:
