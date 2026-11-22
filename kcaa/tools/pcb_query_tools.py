@@ -619,10 +619,12 @@ def register_pcb_query_tools(mcp: FastMCP) -> None:
 
         Identifies pads that share a net but are not yet connected by
         copper tracks, vias, or a same-net copper pour.  Every unconnected
-        pad produces exactly one record, whose ``to`` points at the
-        nearest other pad on the same net (preferring already-connected
-        pads as the reference point).  An empty list means the board is
-        fully routed.
+        pad produces exactly one directed record: ``from`` is the
+        unconnected pad, ``to`` is the nearest connected pad on the same
+        net — one that already has a track/via endpoint or sits in a
+        same-net copper pour; only when the net has no connected pad does
+        ``to`` fall back to the nearest other pad.  An empty list means
+        the board is fully routed.
 
         Pad ``x``/``y`` in the result are **world coordinates** (mm,
         +Y down) — the footprint rotation has already been applied, so
@@ -644,13 +646,17 @@ def register_pcb_query_tools(mcp: FastMCP) -> None:
             dict with:
                 unconnected: list of {net, from: {ref, pad, x, y}, to: {ref, pad, x, y}}
                     where x/y are world mm.  ``from`` is the unconnected pad,
-                    ``to`` is the nearest other pad on the same net.
+                    ``to`` is the nearest connected pad on the same net
+                    (or the nearest other pad when the net has none).
                 connected_pads: list of {net, ref, pad, x, y} (only when
                     *get_connected_pads* is ``True``).
                 unconnected_count: number of unconnected pads
-                connected_count: number of connected pads (0 when
-                    *get_connected_pads* is ``False``).
+                connected_count: number of connected pads (only when
+                    *get_connected_pads* is ``True``).
                 fully_routed: True if no unconnected pads were found
+
+            Nets with a single pad have no connection target, so they
+            appear in neither ``unconnected`` nor ``connected_pads``.
         """
         data = load_pcb(pcb_path)
 
@@ -787,8 +793,9 @@ def register_pcb_query_tools(mcp: FastMCP) -> None:
 
         # For each net with ≥2 pads, report every pad that has no same-net
         # copper at its centre (simple heuristic).  Each disconnected pad
-        # yields exactly one record whose ``to`` is the nearest other pad
-        # on the same net.
+        # yields exactly one record whose ``to`` is the nearest
+        # already-connected pad on the same net — or the nearest other pad
+        # when the net has no connected pad at all.
         unconnected = []
         connected_pads: list[dict[str, Any]] = []
         for net_name, pad_list in sorted(pads_by_net.items()):

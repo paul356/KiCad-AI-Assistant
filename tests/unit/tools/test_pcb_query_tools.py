@@ -487,6 +487,38 @@ class TestGetRatsnest:
         assert result["unconnected_count"] == 0
         assert result["fully_routed"] is True
 
+    def test_single_pad_net_appears_in_neither_list(self, tools, tmp_path):
+        """A net with one pad has no connection target, so it is not reported."""
+        board = _write_minimal_board(
+            tmp_path / "board_single_pad.kicad_pcb",
+            pads=[(1, 0, 0)],
+            # Endpoint at the pad centre: without the <2-pad skip this pad
+            # would be reported in connected_pads.
+            segments=[(0, 0, 5, 0)],
+        )
+        result = _run(tools["get_ratsnest"](pcb_path=board, ctx=None, get_connected_pads=True))
+        assert result["unconnected"] == []
+        assert result["unconnected_count"] == 0
+        assert result["fully_routed"] is True
+        assert result["connected_pads"] == []
+        assert result["connected_count"] == 0
+
+    def test_coincident_pads_reference_each_other_deterministically(self, tools, tmp_path):
+        """Two unrouted pads at the same point still get one record each."""
+        board = _write_minimal_board(
+            tmp_path / "board_coincident_pads.kicad_pcb",
+            pads=[(1, 0, 0), (2, 0, 0)],
+        )
+        first = _run(tools["get_ratsnest"](pcb_path=board, ctx=None))
+        second = _run(tools["get_ratsnest"](pcb_path=board, ctx=None))
+        assert first == second
+        assert first["unconnected_count"] == 2
+        by_from = {(r["from"]["ref"], r["from"]["pad"]): r["to"] for r in first["unconnected"]}
+        assert by_from == {
+            ("U1", "1"): {"ref": "U1", "pad": "2", "x": 0.0, "y": 0.0},
+            ("U1", "2"): {"ref": "U1", "pad": "1", "x": 0.0, "y": 0.0},
+        }
+
     def test_supports_name_only_pad_nets_without_top_level_table(self, tools, board_no_net_table):
         result = _run(tools["get_ratsnest"](pcb_path=board_no_net_table, ctx=None))
         net_a_items = [r for r in result["unconnected"] if r["net"] == "NET_A"]

@@ -9,8 +9,13 @@ Connect pads belonging to the same net with DRC-clean tracks.
 
 > **If the active model is not a vision model, do NOT call export_pcb_layer_image.**
 
-1. Call **get_ratsnest** to list the real unrouted pad pairs (world
-   coordinates, net names).  Never guess pairs — use this data source.
+1. Call **get_ratsnest** to list the real unrouted pads (world
+   coordinates, net names).  Each unconnected pad yields one directed
+   record: ``from`` is the unrouted pad and ``to`` is the nearest
+   already-connected pad on the net.  When the net has no connected pad
+   at all, ``to`` points at another unrouted pad, so the pair shows up as
+   two opposite records.  ``unconnected_count`` counts pads, not pairs.
+   Never guess — use this data source.
 2. Call **export_pcb_layer_image** to see the current board state: by default
    it renders all copper layers stacked in physical order (F.Cu red, B.Cu
    blue, inner layers green/amber/purple) plus courtyards, edge, and

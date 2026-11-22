@@ -21,6 +21,11 @@ tools: [get_board_info, list_footprints, get_footprint, list_nets, list_vias]
 4. Call **list_nets** to enumerate nets with their pad counts
    (``classify=True`` adds netclass/type).  **list_vias** accepts a
    ``net`` filter.
-5. Call **get_ratsnest** to identify unconnected pad pairs.  An empty result
-   means the board is fully routed.  Pad x/y in the ratsnest response are
+5. Call **get_ratsnest** to identify unconnected pads.  Each unconnected
+   pad yields one directed record: ``from`` is the unconnected pad and
+   ``to`` is the nearest already-connected pad on the same net.  When the
+   net has no connected pad at all, ``to`` points at another unconnected
+   pad, so such a net produces records in opposite pairs.
+   ``unconnected_count`` counts pads, not pairs.  An empty result means
+   the board is fully routed.  Pad x/y in the ratsnest response are
    already in world coordinates (rotation applied).
