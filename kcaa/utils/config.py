@@ -22,8 +22,10 @@ Dependencies:
 
 import locale
 import logging
+import ntpath
 import os
 import platform
+import re
 
 from kcaa.utils.atomic_io import read_text_utf8
 
@@ -37,6 +39,88 @@ log = logging.getLogger(__name__)
 # Determine operating system for platform-specific configuration
 # Returns 'Darwin' (macOS), 'Windows', 'Linux', or other
 _SYSTEM = platform.system()
+
+_WINDOWS_DRIVE_PATH = re.compile(r"^[A-Za-z]:[\\/]")
+_CLI_NAMES = ("kicad-cli", "kicad-cli.exe")
+
+
+def _path_module_for(path: str):
+    """Return ``ntpath`` for Windows-style paths, ``os.path`` otherwise."""
+    if os.name == "nt" or _WINDOWS_DRIVE_PATH.match(path):
+        return ntpath
+    return os.path
+
+
+def _dir_has_cli(directory: str) -> bool:
+    """Return True if ``directory/bin`` contains a kicad-cli executable."""
+    module = _path_module_for(directory)
+    return any(os.path.isfile(module.join(directory, "bin", name)) for name in _CLI_NAMES)
+
+
+def _strip_structure_suffix(path: str) -> str | None:
+    """Return the install root implied by a known KiCad directory suffix."""
+    module = _path_module_for(path)
+    normalized: str = module.normpath(path)
+    searchable = normalized.replace("\\", "/").lower()
+    for marker in ("/contents/sharedsupport", "/share/kicad"):
+        index = searchable.find(marker)
+        if index > 0:
+            return normalized[:index]
+    return None
+
+
+def _ancestor_with_cli(path: str, max_levels: int = 4) -> str | None:
+    """Return the first ancestor (up to ``max_levels``) containing ``bin/kicad-cli``."""
+    module = _path_module_for(path)
+    current: str = module.normpath(path)
+    for _ in range(max_levels):
+        if _dir_has_cli(current):
+            return current
+        parent = module.dirname(current)
+        if not parent or parent == current:
+            break
+        current = parent
+    return None
+
+
+def _app_has_cli(app_path: str) -> bool:
+    """Check the platform's canonical CLI location under ``app_path``."""
+    if _SYSTEM == "Darwin":
+        module = _path_module_for(app_path)
+        return os.path.isfile(module.join(app_path, "Contents", "MacOS", "kicad-cli"))
+    return _dir_has_cli(app_path)
+
+
+def _derive_app_path_from_library_dirs(version_tag: str) -> str | None:
+    """
+    Derive the KiCad install root from KICAD* library directory variables.
+
+    The first configured directory wins. Known suffixes (``share/kicad`` /
+    ``Contents/SharedSupport``) are stripped; other layouts are walked upwards
+    up to four levels. The result must contain the platform's canonical CLI.
+    """
+    names = (
+        "KICAD_STOCK_DATA_HOME",
+        f"KICAD{version_tag}_SYMBOL_DIR",
+        "KICAD_SYMBOL_DIR",
+        f"KICAD{version_tag}_FOOTPRINT_DIR",
+        "KICAD_FOOTPRINT_DIR",
+        f"KICAD{version_tag}_TEMPLATE_DIR",
+        "KICAD_TEMPLATE_DIR",
+    )
+    try:
+        seed = next((os.environ[name] for name in names if os.environ.get(name)), None)
+        if not seed:
+            return None
+        expanded = os.path.expanduser(seed)
+        candidate = _strip_structure_suffix(expanded)
+        if candidate is None:
+            candidate = _ancestor_with_cli(expanded)
+        if candidate and _app_has_cli(candidate):
+            return candidate
+        return None
+    except (OSError, ValueError):
+        return None
 
 
 class ServerConfig:
@@ -326,18 +410,21 @@ class ServerConfig:
             return os.path.expanduser("~/Documents/KiCad")
 
     def _resolve_app_path(self) -> str:
-        """Resolve KiCad application path from environment or defaults."""
+        """Resolve the KiCad install root from environment, derivation, or defaults."""
         env_path = os.environ.get("KICAD_APP_PATH")
         if env_path:
             path = os.path.expanduser(env_path)
         else:
-            # Platform defaults
-            if self._system == "Darwin":
+            derived = _derive_app_path_from_library_dirs(self._ver_tag)
+            if derived:
+                path = derived
+            elif self._system == "Darwin":
                 path = "/Applications/KiCad/KiCad.app"
             elif self._system == "Windows":
-                path = r"C:\Program Files\KiCad"
+                program_files = os.environ.get("ProgramFiles") or r"C:\Program Files"  # noqa: SIM112
+                path = os.path.join(program_files, "KiCad", self._kicad_version or "")
             elif self._system == "Linux":
-                path = "/usr/share/kicad"
+                path = "/usr"
             else:
                 path = "/Applications/KiCad/KiCad.app"
 
@@ -345,7 +432,8 @@ class ServerConfig:
             log.warning(
                 "KiCad application path does not exist: %s. "
                 "System symbol/footprint/template libraries will be unresolvable. "
-                "Set KICAD_APP_PATH in your .env file.",
+                "Set KICAD_APP_PATH in your .env file to the directory containing "
+                "bin/kicad-cli (e.g. C:\\Program Files\\KiCad\\10.0).",
                 path,
             )
 
@@ -385,24 +473,14 @@ class ServerConfig:
         """Return the platform-specific default KiCad system symbols directory."""
         if _SYSTEM == "Darwin":
             return os.path.join(kicad_app_path, "Contents", "SharedSupport", "symbols")
-        elif _SYSTEM == "Windows":
-            return os.path.join(kicad_app_path, kicad_version, "share", "kicad", "symbols")
-        elif _SYSTEM == "Linux":
-            return os.path.join(kicad_app_path, "symbols")
-        else:
-            return os.path.join(kicad_app_path, "symbols")
+        return os.path.join(kicad_app_path, "share", "kicad", "symbols")
 
     @staticmethod
     def _default_footprint_dir(kicad_app_path: str, kicad_version: str) -> str:
         """Return the platform-specific default KiCad system footprints directory."""
         if _SYSTEM == "Darwin":
             return os.path.join(kicad_app_path, "Contents", "SharedSupport", "footprints")
-        elif _SYSTEM == "Windows":
-            return os.path.join(kicad_app_path, kicad_version, "share", "kicad", "footprints")
-        elif _SYSTEM == "Linux":
-            return os.path.join(kicad_app_path, "footprints")
-        else:
-            return os.path.join(kicad_app_path, "footprints")
+        return os.path.join(kicad_app_path, "share", "kicad", "footprints")
 
     @staticmethod
     def _default_config_dir(kicad_version: str) -> str:
@@ -433,10 +511,7 @@ class ServerConfig:
         """Return the platform-specific default KiCad templates directory."""
         if _SYSTEM == "Darwin":
             return os.path.join(kicad_app_path, "Contents", "SharedSupport", "template")
-        elif _SYSTEM == "Windows":
-            return os.path.join(kicad_app_path, kicad_version, "share", "kicad", "template")
-        else:
-            return os.path.join(kicad_app_path, "template")
+        return os.path.join(kicad_app_path, "share", "kicad", "template")
 
     def _resolve_config_dir(self) -> str:
         """Resolve KiCad config directory from environment or defaults."""
