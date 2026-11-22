@@ -3,7 +3,7 @@ PCB board read / query tools for KiCad MCP server.
 
 Provides read-only tools to inspect a .kicad_pcb file: board metadata,
 footprint list, individual footprint detail, footprint/board bounding
-boxes, net list, and ratsnest (unconnected pad pairs).
+boxes, net list, and ratsnest (unconnected pads).
 """
 
 from collections import defaultdict
@@ -615,11 +615,14 @@ def register_pcb_query_tools(mcp: FastMCP) -> None:
         ctx: Context | None,
         get_connected_pads: bool = False,
     ) -> dict[str, Any]:
-        """Get unconnected pad pairs (ratsnest) for a KiCad PCB board.
+        """Get unconnected pads (ratsnest) for a KiCad PCB board.
 
         Identifies pads that share a net but are not yet connected by
-        copper tracks or vias.  Returns a list of unconnected pairs —
-        an empty list means the board is fully routed.
+        copper tracks, vias, or a same-net copper pour.  Every unconnected
+        pad produces exactly one record, whose ``to`` points at the
+        nearest other pad on the same net (preferring already-connected
+        pads as the reference point).  An empty list means the board is
+        fully routed.
 
         Pad ``x``/``y`` in the result are **world coordinates** (mm,
         +Y down) — the footprint rotation has already been applied, so
@@ -634,18 +637,20 @@ def register_pcb_query_tools(mcp: FastMCP) -> None:
             ctx: MCP context for progress reporting.
             get_connected_pads: When ``True``, also return ``connected_pads``
                 — pads that already have a track or via endpoint at their
-                centre.  Default ``False`` for efficiency.
+                centre (or are covered by a same-net zone).  Default
+                ``False`` for efficiency.
 
         Returns:
             dict with:
                 unconnected: list of {net, from: {ref, pad, x, y}, to: {ref, pad, x, y}}
-                    where x/y are world mm.
+                    where x/y are world mm.  ``from`` is the unconnected pad,
+                    ``to`` is the nearest other pad on the same net.
                 connected_pads: list of {net, ref, pad, x, y} (only when
                     *get_connected_pads* is ``True``).
-                unconnected_count: number of unconnected pairs
+                unconnected_count: number of unconnected pads
                 connected_count: number of connected pads (0 when
                     *get_connected_pads* is ``False``).
-                fully_routed: True if no unconnected pairs found
+                fully_routed: True if no unconnected pads were found
         """
         data = load_pcb(pcb_path)
 
@@ -780,8 +785,10 @@ def register_pcb_query_tools(mcp: FastMCP) -> None:
                     if zone_poly.covers(pt):
                         track_endpoints.add((zone_net, _rounded(px), _rounded(py)))
 
-        # For each net with ≥2 pads, report ALL pairs where neither pad
-        # has a track endpoint at its position (simple heuristic)
+        # For each net with ≥2 pads, report every pad that has no same-net
+        # copper at its centre (simple heuristic).  Each disconnected pad
+        # yields exactly one record whose ``to`` is the nearest other pad
+        # on the same net.
         unconnected = []
         connected_pads: list[dict[str, Any]] = []
         for net_name, pad_list in sorted(pads_by_net.items()):
@@ -804,18 +811,33 @@ def register_pcb_query_tools(mcp: FastMCP) -> None:
                             "y": py,
                         }
                     )
-            disconnected = [p for i, p in enumerate(pad_list) if i not in connected_indices]
-            # Report all disconnected pairs (not just first)
-            for i in range(len(disconnected)):
-                for j in range(i + 1, len(disconnected)):
-                    a, b = disconnected[i], disconnected[j]
-                    unconnected.append(
-                        {
-                            "net": net_name,
-                            "from": {"ref": a[0], "pad": a[1], "x": a[2], "y": a[3]},
-                            "to": {"ref": b[0], "pad": b[1], "x": b[2], "y": b[3]},
-                        }
-                    )
+            # Anchors for ``to``: connected pads are the most meaningful
+            # reference point; when the net has none, use its other pads.
+            anchors = [pad_list[i] for i in sorted(connected_indices)]
+            for pad_idx, pad in enumerate(pad_list):
+                if pad_idx in connected_indices:
+                    continue
+                pool = anchors or [p for i, p in enumerate(pad_list) if i != pad_idx]
+                nearest = min(
+                    pool,
+                    key=lambda p: (
+                        math.hypot(p[2] - pad[2], p[3] - pad[3]),
+                        p[0],
+                        p[1],
+                    ),
+                )
+                unconnected.append(
+                    {
+                        "net": net_name,
+                        "from": {"ref": pad[0], "pad": pad[1], "x": pad[2], "y": pad[3]},
+                        "to": {
+                            "ref": nearest[0],
+                            "pad": nearest[1],
+                            "x": nearest[2],
+                            "y": nearest[3],
+                        },
+                    }
+                )
 
         if get_connected_pads:
             return {
