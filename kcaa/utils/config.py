@@ -109,18 +109,19 @@ def _derive_app_path_from_library_dirs(version_tag: str) -> str | None:
         "KICAD_TEMPLATE_DIR",
     )
     try:
-        seed = next((os.environ[name] for name in names if os.environ.get(name)), None)
-        if not seed:
-            return None
-        expanded = os.path.expanduser(seed)
-        candidate = _strip_structure_suffix(expanded)
-        if candidate is None:
-            candidate = _ancestor_with_cli(expanded)
-        if candidate and _app_has_cli(candidate):
-            return candidate
-        return None
+        for name in names:
+            seed = os.environ.get(name)
+            if not seed:
+                continue
+            expanded = os.path.expanduser(seed)
+            candidate = _strip_structure_suffix(expanded)
+            if candidate is None:
+                candidate = _ancestor_with_cli(expanded)
+            if candidate and _app_has_cli(candidate):
+                return candidate
     except (OSError, ValueError):
         return None
+    return None
 
 
 class ServerConfig:
@@ -469,14 +470,14 @@ class ServerConfig:
         return paths
 
     @staticmethod
-    def _default_symbol_dir(kicad_app_path: str, kicad_version: str) -> str:
+    def _default_symbol_dir(kicad_app_path: str) -> str:
         """Return the platform-specific default KiCad system symbols directory."""
         if _SYSTEM == "Darwin":
             return os.path.join(kicad_app_path, "Contents", "SharedSupport", "symbols")
         return os.path.join(kicad_app_path, "share", "kicad", "symbols")
 
     @staticmethod
-    def _default_footprint_dir(kicad_app_path: str, kicad_version: str) -> str:
+    def _default_footprint_dir(kicad_app_path: str) -> str:
         """Return the platform-specific default KiCad system footprints directory."""
         if _SYSTEM == "Darwin":
             return os.path.join(kicad_app_path, "Contents", "SharedSupport", "footprints")
@@ -507,7 +508,7 @@ class ServerConfig:
             return os.path.expanduser(f"~/.local/share/kicad/{kicad_version}/3rdparty")
 
     @staticmethod
-    def _default_template_dir(kicad_app_path: str, kicad_version: str) -> str:
+    def _default_template_dir(kicad_app_path: str) -> str:
         """Return the platform-specific default KiCad templates directory."""
         if _SYSTEM == "Darwin":
             return os.path.join(kicad_app_path, "Contents", "SharedSupport", "template")
@@ -525,14 +526,14 @@ class ServerConfig:
         env_path = os.environ.get("KICAD_SYMBOL_DIR")
         if env_path:
             return os.path.expanduser(env_path)
-        return self._default_symbol_dir(self._kicad_app_path, self._kicad_version)
+        return self._default_symbol_dir(self._kicad_app_path)
 
     def _resolve_footprint_dir(self) -> str:
         """Resolve KiCad footprint directory from environment or defaults."""
         env_path = os.environ.get("KICAD_FOOTPRINT_DIR")
         if env_path:
             return os.path.expanduser(env_path)
-        return self._default_footprint_dir(self._kicad_app_path, self._kicad_version)
+        return self._default_footprint_dir(self._kicad_app_path)
 
     def _resolve_3rd_party(self) -> str:
         """Resolve KiCad 3rd-party packages directory from environment or defaults."""
@@ -546,7 +547,7 @@ class ServerConfig:
         env_path = os.environ.get("KICAD_TEMPLATE_DIR")
         if env_path:
             return os.path.expanduser(env_path)
-        return self._default_template_dir(self._kicad_app_path, self._kicad_version)
+        return self._default_template_dir(self._kicad_app_path)
 
     # ---------------------------------------------------------------------------
     # Public properties

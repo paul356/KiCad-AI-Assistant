@@ -68,6 +68,14 @@ class CLIDiagnosis:
     path_lookup: str | None = None
 
 
+def _root_version_variants(version: str) -> list[str]:
+    """Return the version, plus ``<version>.0`` when only a major was given."""
+    variants = [version]
+    if "." not in version:
+        variants.append(f"{version}.0")
+    return variants
+
+
 class KiCadCLIManager:
     """
     Manages KiCad CLI detection and validation across platforms.
@@ -299,11 +307,8 @@ class KiCadCLIManager:
             return []
 
         if self._system == "Darwin":
-            candidate = os.path.join(app_path, "Contents", "MacOS", "kicad-cli")
-        else:
-            candidate = os.path.join(app_path, "bin", self._get_cli_executable_name())
-
-        return [candidate] if os.path.isfile(candidate) else []
+            return [os.path.join(app_path, "Contents", "MacOS", "kicad-cli")]
+        return [os.path.join(app_path, "bin", self._get_cli_executable_name())]
 
     def _get_common_installation_paths(self) -> list[str]:
         """Return deterministic CLI paths for platform default install roots."""
@@ -316,7 +321,8 @@ class KiCadCLIManager:
             if version:
                 exe_name = self._get_cli_executable_name()
                 for root in self._iter_windows_install_roots():
-                    paths.append(os.path.join(root, version, "bin", exe_name))
+                    for variant in _root_version_variants(version):
+                        paths.append(os.path.join(root, variant, "bin", exe_name))
         # Linux: no hardcoded paths -- config derivation and ``which`` cover it.
 
         deduped: dict[str, str] = {}

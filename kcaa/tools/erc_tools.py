@@ -3,8 +3,8 @@
 Runs KiCad's schematic ERC headlessly via ``kicad-cli sch erc`` and returns
 the violations as structured data the assistant can read and act on (unlike
 the PCB DRC tool, which only opens a dialog over the IPC API). Requires
-``kicad-cli`` on PATH or ``KICAD_CLI_PATH`` set; it does not use the KiCad
-IPC socket.
+``kicad-cli`` located by ``find_kicad_cli()`` (configured install root, PATH,
+or platform defaults); it does not use the KiCad IPC socket.
 """
 
 import json

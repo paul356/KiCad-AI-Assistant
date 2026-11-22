@@ -14,8 +14,7 @@ from kcaa.utils.kicad_cli import KiCadCLIError, KiCadCLIManager
 @pytest.fixture(autouse=True)
 def _isolate_detection(monkeypatch):
     """Keep detection independent of the host environment."""
-    for name in ("KICAD_APP_PATH", "APPDIR", "KICAD_CLI_PATH", "KCAA_KICAD_CLI"):
-        monkeypatch.delenv(name, raising=False)
+    monkeypatch.delenv("KICAD_APP_PATH", raising=False)
     monkeypatch.setattr(shutil, "which", lambda name: None)
     monkeypatch.setattr(config, "_kicad_app_path", "")
     monkeypatch.setattr(config, "_kicad_version", "10.0")
@@ -124,6 +123,20 @@ def test_all_windows_roots_use_known_version(windows_env, monkeypatch):
     ]
 
 
+def test_major_only_version_also_tries_minor_zero(windows_env, monkeypatch):
+    """KICAD_VERSION=10 also probes the 10.0 install directory."""
+    monkeypatch.setattr(config, "_kicad_version", "10")
+    manager = KiCadCLIManager()
+
+    paths = manager._get_common_installation_paths()
+
+    root = windows_env / "KiCad"
+    assert paths == [
+        os.path.join(str(root), "10", "bin", "kicad-cli.exe"),
+        os.path.join(str(root), "10.0", "bin", "kicad-cli.exe"),
+    ]
+
+
 def test_invalid_candidate_does_not_abort_search(windows_env, monkeypatch):
     """A candidate that fails --version falls through to the next root."""
     first = _make_cli(windows_env / "KiCad" / "10.0" / "bin" / "kicad-cli.exe")
@@ -152,17 +165,26 @@ def test_linux_has_no_hardcoded_common_paths(linux_env):
     assert KiCadCLIManager()._get_common_installation_paths() == []
 
 
-def test_config_path_requires_existing_file(tmp_path, linux_env, monkeypatch):
-    """A configured root without a real CLI contributes no candidate."""
+def test_config_candidate_is_emitted_even_when_missing(tmp_path, linux_env, monkeypatch):
+    """The missing config path is reported by find_kicad_cli, not filtered early."""
     app_root = tmp_path / "app"
-    app_root.mkdir()
     monkeypatch.setattr(config, "_kicad_app_path", str(app_root))
     manager = KiCadCLIManager()
 
-    assert manager._get_config_installation_paths() == []
-
-    _make_cli(app_root / "bin" / "kicad-cli")
     assert manager._get_config_installation_paths() == [str(app_root / "bin" / "kicad-cli")]
+
+
+def test_error_message_shows_missing_config_path(tmp_path, linux_env, monkeypatch):
+    """A wrong configured root appears as a missing candidate in the error."""
+    app_root = tmp_path / "wrong-install"
+    monkeypatch.setattr(config, "_kicad_app_path", str(app_root))
+    manager = KiCadCLIManager()
+
+    with pytest.raises(KiCadCLIError) as excinfo:
+        manager.get_cli_path()
+
+    expected = str(app_root / "bin" / "kicad-cli")
+    assert f"[config] {expected} (missing)" in str(excinfo.value)
 
 
 def test_path_lookup_is_used_when_config_and_common_are_empty(tmp_path, linux_env, monkeypatch):

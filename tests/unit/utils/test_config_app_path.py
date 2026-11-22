@@ -127,3 +127,39 @@ def test_windows_default_uses_program_files_and_version(tmp_path, monkeypatch):
     cfg = ServerConfig()
 
     assert cfg.kicad_app_path == str(program_files / "KiCad" / "10.0")
+
+
+def test_derivation_tries_next_variable_when_first_has_no_cli(tmp_path, monkeypatch):
+    """A declared-but-invalid variable must not stop later variables."""
+    bad = tmp_path / "not-an-install"
+    (bad / "share" / "kicad").mkdir(parents=True)
+    root = tmp_path / "root"
+    _make_cli(root / "bin" / "kicad-cli")
+    symbol_dir = root / "share" / "kicad" / "symbols"
+    symbol_dir.mkdir(parents=True)
+    monkeypatch.setenv("KICAD_STOCK_DATA_HOME", str(bad / "share" / "kicad"))
+    monkeypatch.setenv("KICAD10_SYMBOL_DIR", str(symbol_dir))
+
+    assert _derive_app_path_from_library_dirs("10") == str(root)
+
+
+def test_ancestor_walk_finds_install_root(tmp_path, monkeypatch):
+    """A non-standard layout without share/kicad is walked upwards."""
+    root = tmp_path / "root"
+    _make_cli(root / "bin" / "kicad-cli")
+    symbol_dir = root / "libs" / "symbols"
+    symbol_dir.mkdir(parents=True)
+    monkeypatch.setenv("KICAD10_SYMBOL_DIR", str(symbol_dir))
+
+    assert _derive_app_path_from_library_dirs("10") == str(root)
+
+
+def test_stripped_root_without_cli_is_rejected(tmp_path, monkeypatch):
+    """A stripped candidate missing bin/kicad-cli is rejected, not returned."""
+    bad = tmp_path / "not-an-install"
+    symbol_dir = bad / "share" / "kicad" / "symbols"
+    symbol_dir.mkdir(parents=True)
+    monkeypatch.setenv("KICAD10_SYMBOL_DIR", str(symbol_dir))
+
+    assert _derive_app_path_from_library_dirs("10") is None
+    assert ServerConfig().kicad_app_path == "/usr"
