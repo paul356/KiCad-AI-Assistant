@@ -129,6 +129,87 @@ def board_with_outline_copy(tmp_path):
     return str(dest)
 
 
+def _write_minimal_board(path, pads, segments=(), net="N1"):
+    """Write a minimal board with one ``U1`` footprint and ``F.Cu`` tracks.
+
+    ``pads`` are ``(number, x, y)``; ``segments`` are
+    ``(start_x, start_y, end_x, end_y)``.  Pads and segments all belong
+    to *net*, and the footprint sits at the origin with no rotation, so
+    pad world coordinates equal their relative coordinates.
+    """
+    pad_sexps = "".join(
+        f'\t\t(pad "{num}" smd rect\n'
+        f"\t\t\t(at {x} {y})\n"
+        f"\t\t\t(size 0.5 0.5)\n"
+        f'\t\t\t(layers "F.Cu")\n'
+        f'\t\t\t(net "{net}")\n'
+        f"\t\t)\n"
+        for num, x, y in pads
+    )
+    segment_sexps = "".join(
+        f"\t(segment\n"
+        f"\t\t(start {x1} {y1})\n"
+        f"\t\t(end {x2} {y2})\n"
+        f"\t\t(width 0.25)\n"
+        f'\t\t(layer "F.Cu")\n'
+        f'\t\t(net "{net}")\n'
+        f"\t)\n"
+        for x1, y1, x2, y2 in segments
+    )
+    path.write_text(
+        "(kicad_pcb\n"
+        "\t(version 20260206)\n"
+        '\t(generator "pcbnew")\n'
+        '\t(generator_version "10.0")\n'
+        "\t(layers\n"
+        '\t\t(0 "F.Cu" signal)\n'
+        '\t\t(2 "B.Cu" signal)\n'
+        "\t)\n"
+        f'\t(net "{net}")\n'
+        '\t(footprint "Test:U1"\n'
+        '\t\t(layer "F.Cu")\n'
+        "\t\t(at 0 0)\n"
+        '\t\t(property "Reference" "U1"\n'
+        "\t\t\t(at 0 0 0)\n"
+        '\t\t\t(layer "F.SilkS")\n'
+        "\t\t)\n"
+        f"{pad_sexps}"
+        "\t)\n"
+        f"{segment_sexps}"
+        ")\n",
+        encoding="utf-8",
+    )
+    return str(path)
+
+
+@pytest.fixture
+def board_single_isolated_pad(tmp_path):
+    """#335: 5-pad VIN net, pads 1-4 have track endpoints, pad 5 does not."""
+    return _write_minimal_board(
+        tmp_path / "board_single_isolated_pad.kicad_pcb",
+        pads=[(1, 0, 0), (2, 1, 0), (3, 2, 0), (4, 3, 0), (5, 4, 0)],
+        segments=[(0, 0, 1, 0), (1, 0, 2, 0), (2, 0, 3, 0)],
+        net="VIN",
+    )
+
+
+@pytest.fixture
+def board_two_pads_unrouted(tmp_path):
+    return _write_minimal_board(
+        tmp_path / "board_two_pads_unrouted.kicad_pcb",
+        pads=[(1, 0, 0), (2, 10, 0)],
+    )
+
+
+@pytest.fixture
+def board_two_pads_routed(tmp_path):
+    return _write_minimal_board(
+        tmp_path / "board_two_pads_routed.kicad_pcb",
+        pads=[(1, 0, 0), (2, 10, 0)],
+        segments=[(0, 0, 5, 0), (5, 0, 10, 0)],
+    )
+
+
 class _MockMCP:
     """Minimal FastMCP stand-in that captures @mcp.tool()-decorated functions."""
 
@@ -375,7 +456,68 @@ class TestGetRatsnest:
         # NET_A has C1 pad2 and J1 pad2 — no track connects them
         result = _run(tools["get_ratsnest"](pcb_path=BOARD_FIXTURE, ctx=None))
         net_a_items = [r for r in result["unconnected"] if r["net"] == "NET_A"]
-        assert len(net_a_items) > 0
+        assert len(net_a_items) == 2
+        assert result["unconnected_count"] == len(result["unconnected"])
+
+    def test_reports_net_with_exactly_one_unconnected_pad(self, tools, board_single_isolated_pad):
+        """#335: 4 of 5 VIN pads are routed — the fifth must still be reported."""
+        result = _run(tools["get_ratsnest"](pcb_path=board_single_isolated_pad, ctx=None))
+        assert result["unconnected_count"] == 1
+        assert result["fully_routed"] is False
+        assert len(result["unconnected"]) == 1
+        record = result["unconnected"][0]
+        assert record["net"] == "VIN"
+        # ``from`` is the isolated pad itself; ``to`` is the nearest pad
+        # that is already connected (pad 4 at x=3).
+        assert record["from"] == {"ref": "U1", "pad": "5", "x": 4.0, "y": 0.0}
+        assert record["to"] == {"ref": "U1", "pad": "4", "x": 3.0, "y": 0.0}
+
+    def test_fully_unrouted_net_reports_each_pad_once(self, tools, board_two_pads_unrouted):
+        result = _run(tools["get_ratsnest"](pcb_path=board_two_pads_unrouted, ctx=None))
+        assert result["unconnected_count"] == 2
+        assert result["fully_routed"] is False
+        by_from = {(r["from"]["ref"], r["from"]["pad"]): r for r in result["unconnected"]}
+        assert set(by_from) == {("U1", "1"), ("U1", "2")}
+        assert by_from[("U1", "1")]["to"]["pad"] == "2"
+        assert by_from[("U1", "2")]["to"]["pad"] == "1"
+
+    def test_fully_routed_net_reports_nothing(self, tools, board_two_pads_routed):
+        result = _run(tools["get_ratsnest"](pcb_path=board_two_pads_routed, ctx=None))
+        assert result["unconnected"] == []
+        assert result["unconnected_count"] == 0
+        assert result["fully_routed"] is True
+
+    def test_single_pad_net_appears_in_neither_list(self, tools, tmp_path):
+        """A net with one pad has no connection target, so it is not reported."""
+        board = _write_minimal_board(
+            tmp_path / "board_single_pad.kicad_pcb",
+            pads=[(1, 0, 0)],
+            # Endpoint at the pad centre: without the <2-pad skip this pad
+            # would be reported in connected_pads.
+            segments=[(0, 0, 5, 0)],
+        )
+        result = _run(tools["get_ratsnest"](pcb_path=board, ctx=None, get_connected_pads=True))
+        assert result["unconnected"] == []
+        assert result["unconnected_count"] == 0
+        assert result["fully_routed"] is True
+        assert result["connected_pads"] == []
+        assert result["connected_count"] == 0
+
+    def test_coincident_pads_reference_each_other_deterministically(self, tools, tmp_path):
+        """Two unrouted pads at the same point still get one record each."""
+        board = _write_minimal_board(
+            tmp_path / "board_coincident_pads.kicad_pcb",
+            pads=[(1, 0, 0), (2, 0, 0)],
+        )
+        first = _run(tools["get_ratsnest"](pcb_path=board, ctx=None))
+        second = _run(tools["get_ratsnest"](pcb_path=board, ctx=None))
+        assert first == second
+        assert first["unconnected_count"] == 2
+        by_from = {(r["from"]["ref"], r["from"]["pad"]): r["to"] for r in first["unconnected"]}
+        assert by_from == {
+            ("U1", "1"): {"ref": "U1", "pad": "2", "x": 0.0, "y": 0.0},
+            ("U1", "2"): {"ref": "U1", "pad": "1", "x": 0.0, "y": 0.0},
+        }
 
     def test_supports_name_only_pad_nets_without_top_level_table(self, tools, board_no_net_table):
         result = _run(tools["get_ratsnest"](pcb_path=board_no_net_table, ctx=None))
@@ -698,6 +840,8 @@ class TestGetRatsnestZoneCoverage:
         assert len(gnd_connected) > 0, "GND pad should be zone-connected"
         # R1/2 is GND and inside the zone polygon (5,5)→(60,5)→(60,60)→(5,60)
         assert any(p["ref"] == "R1" and p["pad"] == "2" for p in gnd_connected)
+        # The whole GND net is covered by the pour, so nothing is unconnected.
+        assert [r for r in result["unconnected"] if r["net"] == "GND"] == []
 
 
 class TestBareSymbolAtoms:

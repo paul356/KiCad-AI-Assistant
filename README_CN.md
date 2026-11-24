@@ -190,7 +190,7 @@ PCM 安装时，请在 `...\3rdparty\plugins\com_github_paul356_kicad-ai-assista
 
 ```dotenv
 KICAD_SEARCH_PATHS=/home/user/pcb
-KICAD_APP_PATH=/usr/share/kicad
+KICAD_APP_PATH=/usr
 KICAD_VERSION=10.0
 KICAD_CONFIG_DIR=~/.config/kicad/10.0
 KICAD_3RD_PARTY=~/.local/share/kicad/10.0/3rdparty

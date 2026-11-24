@@ -13,8 +13,8 @@ from fastmcp import Context, FastMCP
 import pandas as pd
 
 from kcaa.utils.atomic_io import read_text_utf8
-from kcaa.utils.config import config
 from kcaa.utils.file_utils import get_project_files
+from kcaa.utils.kicad_cli import find_kicad_cli
 from kcaa.utils.project_resolution import project_name
 
 log = logging.getLogger(__name__)
@@ -689,48 +689,16 @@ async def export_bom_with_cli(
     # Output file path
     output_file = os.path.join(output_dir, f"{project_name}_bom.csv")
 
-    # Define the command based on operating system
-    if config.system == "Darwin":  # macOS
-        # Path to KiCad command-line tools on macOS
-        kicad_cli = os.path.join(config.kicad_app_path, "Contents/MacOS/kicad-cli")
-
-        if not os.path.exists(kicad_cli):
-            return {
-                "success": False,
-                "error": f"KiCad CLI tool not found at {kicad_cli}",
-                "schematic_file": schematic_file,
-            }
-
-        # Command to generate BOM
-        cmd = [kicad_cli, "sch", "export", "bom", "--output", output_file, schematic_file]
-
-    elif config.system == "Windows":
-        # Path to KiCad command-line tools on Windows
-        kicad_cli = os.path.join(config.kicad_app_path, "bin", "kicad-cli.exe")
-
-        if not os.path.exists(kicad_cli):
-            return {
-                "success": False,
-                "error": f"KiCad CLI tool not found at {kicad_cli}",
-                "schematic_file": schematic_file,
-            }
-
-        # Command to generate BOM
-        cmd = [kicad_cli, "sch", "export", "bom", "--output", output_file, schematic_file]
-
-    elif system == "Linux":
-        # Assume kicad-cli is in the PATH
-        kicad_cli = "kicad-cli"
-
-        # Command to generate BOM
-        cmd = [kicad_cli, "sch", "export", "bom", "--output", output_file, schematic_file]
-
-    else:
+    # Centralized detection owns platform-specific CLI paths.
+    kicad_cli = find_kicad_cli()
+    if not kicad_cli:
         return {
             "success": False,
-            "error": f"Unsupported operating system: {system}",
+            "error": "kicad-cli not found; set KICAD_APP_PATH or install KiCad",
             "schematic_file": schematic_file,
         }
+
+    cmd = [kicad_cli, "sch", "export", "bom", "--output", output_file, schematic_file]
 
     try:
         print(f"Running command: {' '.join(cmd)}")

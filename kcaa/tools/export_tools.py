@@ -4,14 +4,13 @@ Export tools for KiCad projects.
 
 import asyncio
 import os
-import shutil
 import subprocess  # nosec B404 -- controlled command execution, no user input
 
 from fastmcp import Context, FastMCP
 from fastmcp.utilities.types import Image
 
-from kcaa.utils.config import config
 from kcaa.utils.file_utils import get_project_files
+from kcaa.utils.kicad_cli import find_kicad_cli
 
 
 def register_export_tools(mcp: FastMCP) -> None:
@@ -124,35 +123,10 @@ async def generate_thumbnail_with_cli(pcb_file: str, ctx: Context | None):
         output_file = os.path.join(project_dir, f"{board_stem}_thumbnail.svg")
         # ---------------------------
 
-        # Check for required command-line tools based on OS
-        kicad_cli = None
-        if config.system == "Darwin":  # macOS
-            kicad_cli_path = os.path.join(config.kicad_app_path, "Contents/MacOS/kicad-cli")
-            if os.path.exists(kicad_cli_path):
-                kicad_cli = kicad_cli_path
-            elif shutil.which("kicad-cli") is not None:
-                kicad_cli = "kicad-cli"  # Try to use from PATH
-            else:
-                print(f"kicad-cli not found at {kicad_cli_path} or in PATH")
-                return None
-        elif config.system == "Windows":
-            kicad_cli_path = os.path.join(config.kicad_app_path, "bin", "kicad-cli.exe")
-            if os.path.exists(kicad_cli_path):
-                kicad_cli = kicad_cli_path
-            elif shutil.which("kicad-cli.exe") is not None:
-                kicad_cli = "kicad-cli.exe"
-            elif shutil.which("kicad-cli") is not None:
-                kicad_cli = "kicad-cli"  # Try to use from PATH (without .exe)
-            else:
-                print(f"kicad-cli not found at {kicad_cli_path} or in PATH")
-                return None
-        elif config.system == "Linux":
-            kicad_cli = shutil.which("kicad-cli")
-            if not kicad_cli:
-                print("kicad-cli not found in PATH")
-                return None
-        else:
-            print(f"Unsupported operating system: {config.system}")
+        # Centralized detection owns platform-specific CLI paths.
+        kicad_cli = find_kicad_cli()
+        if not kicad_cli:
+            print("kicad-cli not found; set KICAD_APP_PATH or install KiCad")
             return None
 
         if ctx:
