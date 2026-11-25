@@ -18,6 +18,7 @@ import json
 import logging
 import os
 import threading
+import time
 from typing import Any
 
 from .. import project_state as _pstate
@@ -477,6 +478,9 @@ if _WX_AVAILABLE:
             # _run_search_script; a second call would reset WebView's single
             # sync-result slot and could spin forever.
             self._search_script_running: bool = False
+            # Monotonic timestamp of the last read-only page probe; the
+            # per-tick diagnostic is throttled to at most once per second.
+            self._last_diag_ts: float = 0.0
             # Project-scoped session watch: tracks the open KiCad project so
             # switching projects can re-offer that project's saved sessions
             # (same flow as startup auto-restore). Started by _init_llm_client.
@@ -2999,31 +3003,95 @@ if _WX_AVAILABLE:
 
             The payload is ``{kind:"find", seq, count, query, index}``.  A
             result whose ``seq`` is older than the latest issued search is
-            dropped, so fast typing cannot let a slow result win.
+            dropped, so fast typing cannot let a slow result win.  Diagnostic
+            payloads (``kind:"diag"``) are logged instead.
             """
             try:
                 payload = json.loads(event.GetString())
-                if not isinstance(payload, dict) or payload.get("kind") != "find":
-                    return
-                seq = payload.get("seq")
-                if not isinstance(seq, int) or seq < self._search_seq:
-                    return
-                count = payload.get("count")
-                if not isinstance(count, int) or count < 0:
-                    return
-                if count == 0:
-                    self._search_count_label.SetLabel("0/0")
-                    return
-                index = payload.get("index")
-                if isinstance(index, int) and 1 <= index <= count:
-                    self._search_count_label.SetLabel(f"{index}/{count}")
-                else:
-                    self._search_count_label.SetLabel(f"1/{count}")
             except Exception as e:
-                log.debug("search: ignored malformed script message: %s", e)
+                log.debug("search: message dropped — bad payload: %s", e)
+                return
+            if not isinstance(payload, dict):
+                log.debug("search: message dropped — bad payload (not an object)")
+                return
+            kind = payload.get("kind")
+            if kind == "diag":
+                log.info("diag: ui state %s", payload)
+                return
+            if kind != "find":
+                log.debug("search: message dropped — bad payload (kind=%r)", kind)
+                return
+            seq = payload.get("seq")
+            if not isinstance(seq, int):
+                log.debug("search: message dropped — bad payload (seq=%r)", seq)
+                return
+            if seq < self._search_seq:
+                log.debug(
+                    "search: message dropped — stale seq=%d current=%d",
+                    seq,
+                    self._search_seq,
+                )
+                return
+            count = payload.get("count")
+            if not isinstance(count, int) or count < 0:
+                log.debug("search: message dropped — bad payload (count=%r)", count)
+                return
+            index = payload.get("index")
+            log.debug("search: message seq=%d count=%d index=%r", seq, count, index)
+            if count == 0:
+                self._search_count_label.SetLabel("0/0")
+                return
+            if isinstance(index, int) and 1 <= index <= count:
+                self._search_count_label.SetLabel(f"{index}/{count}")
+            else:
+                self._search_count_label.SetLabel(f"1/{count}")
+
+        def _log_ui_state(self, reason: str) -> None:
+            """Asynchronously report the live page state for diagnostics.
+
+            Read-only probe: it only issues ``RunScriptAsync`` and never
+            blocks, retries or falls back to synchronous ``RunScript``.  The
+            payload comes back through the existing ``kcaa`` channel and is
+            logged by _on_search_message's diag branch.
+            """
+            if not self._search_async_ok:
+                log.warning("diag: async unavailable, cannot probe page")
+                return
+            js = (
+                "try {"
+                "var c = document.getElementById('conversation');"
+                "window.kcaa && window.kcaa.postMessage(JSON.stringify({"
+                "kind: 'diag',"
+                f"reason: {json.dumps(reason)},"
+                "conversationChildren: c ? c.childElementCount : -1,"
+                "bodyChildren: document.body ? document.body.childElementCount : -1,"
+                "href: String(location.href),"
+                "findMatches: (window.__findMatches || []).length,"
+                "marks: document.querySelectorAll('mark.search-match').length"
+                "}));"
+                "} catch (e) {}"
+            )
+            try:
+                self._conv_view.RunScriptAsync(js)
+            except Exception as e:
+                log.debug("diag: probe failed: %s", e)
+
+        def _maybe_log_ui_state(self, reason: str) -> None:
+            """Probe the page at most once per second (used after each tick)."""
+            now = time.monotonic()
+            if now - self._last_diag_ts < 1.0:
+                return
+            self._last_diag_ts = now
+            self._log_ui_state(reason)
 
         def _on_find(self, event) -> None:
             """Show the search bar (Ctrl+F or Tools→Find)."""
+            log.debug(
+                "search: find seq=%d query_len=%d async_ok=%s",
+                self._search_seq,
+                len(self._search_query),
+                self._search_async_ok,
+            )
             self._search_ctrl.Show(True)
             self._search_prev_btn.Show(True)
             self._search_next_btn.Show(True)
@@ -3038,9 +3106,14 @@ if _WX_AVAILABLE:
             self._search_query = ""
             if self._use_webview:
                 seq = self._next_search_seq()
-                if not self._run_search_async(f"_clearFind({seq})"):
+                sent = self._run_search_async(f"_clearFind({seq})")
+                log.debug(
+                    "search: find clear seq=%d async_sent=%s fallback=%s", seq, sent, not sent
+                )
+                if not sent:
                     self._run_search_script("_clearFind()")
             self._search_count_label.SetLabel("0/0")
+            self._log_ui_state("find")
 
         def _on_search_close(self, event=None) -> None:
             """Hide search bar and clear highlights."""
@@ -3054,9 +3127,14 @@ if _WX_AVAILABLE:
             self._ui_panel.Layout()
             if self._use_webview:
                 seq = self._next_search_seq()
-                if not self._run_search_async(f"_clearFind({seq})"):
+                sent = self._run_search_async(f"_clearFind({seq})")
+                log.debug(
+                    "search: close clear seq=%d async_sent=%s fallback=%s", seq, sent, not sent
+                )
+                if not sent:
                     self._run_search_script("_clearFind()")
             self._conv_view.SetFocus()
+            self._log_ui_state("search_close")
 
         def _on_search_key(self, event) -> None:
             """Handle keyboard shortcuts in search bar."""
@@ -3085,18 +3163,39 @@ if _WX_AVAILABLE:
             counts arrive later through _on_search_message.
             """
             self._search_timer.Stop()
+            log.debug(
+                "search: tick seq=%d query_len=%d async_ok=%s",
+                self._search_seq,
+                len(self._search_query),
+                self._search_async_ok,
+            )
             if not self._use_webview:
+                self._maybe_log_ui_state("search_tick")
                 return
             if not self._search_query:
                 self._search_count_label.SetLabel("0/0")
                 seq = self._next_search_seq()
-                if not self._run_search_async(f"_clearFind({seq})"):
+                sent = self._run_search_async(f"_clearFind({seq})")
+                log.debug(
+                    "search: tick clear seq=%d async_sent=%s fallback=%s", seq, sent, not sent
+                )
+                if not sent:
                     self._run_search_script("_clearFind()")
+                self._maybe_log_ui_state("search_tick")
                 return
             seq = self._next_search_seq()
             js = f"_findTextAndJump({json.dumps(self._search_query)}, {seq})"
-            if not self._run_search_async(js):
+            sent = self._run_search_async(js)
+            log.debug(
+                "search: tick find seq=%d query_len=%d async_sent=%s fallback=%s",
+                seq,
+                len(self._search_query),
+                sent,
+                not sent,
+            )
+            if not sent:
                 self._apply_search_result(self._run_search_script(js))
+            self._maybe_log_ui_state("search_tick")
 
         def _on_search(self, event) -> None:
             """Search button clicked."""
@@ -3104,18 +3203,34 @@ if _WX_AVAILABLE:
 
         def _on_search_next(self, event=None) -> None:
             """Jump to next match."""
+            log.debug(
+                "search: next seq=%d query_len=%d async_ok=%s",
+                self._search_seq,
+                len(self._search_query),
+                self._search_async_ok,
+            )
             if not self._use_webview:
                 return
             seq = self._next_search_seq()
-            if not self._run_search_async(f"_findNext({seq})"):
+            sent = self._run_search_async(f"_findNext({seq})")
+            log.debug("search: next seq=%d async_sent=%s fallback=%s", seq, sent, not sent)
+            if not sent:
                 self._apply_search_result(self._run_search_script("_findNext()"))
 
         def _on_search_prev(self, event=None) -> None:
             """Jump to previous match."""
+            log.debug(
+                "search: prev seq=%d query_len=%d async_ok=%s",
+                self._search_seq,
+                len(self._search_query),
+                self._search_async_ok,
+            )
             if not self._use_webview:
                 return
             seq = self._next_search_seq()
-            if not self._run_search_async(f"_findPrev({seq})"):
+            sent = self._run_search_async(f"_findPrev({seq})")
+            log.debug("search: prev seq=%d async_sent=%s fallback=%s", seq, sent, not sent)
+            if not sent:
                 self._apply_search_result(self._run_search_script("_findPrev()"))
 
         def _on_autoroute(self, event) -> None:
@@ -4466,7 +4581,11 @@ if _WX_AVAILABLE:
                     len(js_entries),
                 )
             else:
-                log.debug("_updateConversation JS result: %s", result_str)
+                log.debug(
+                    "render: conversation rebuilt -> %s (entries=%d)",
+                    result_str,
+                    len(js_entries),
+                )
                 self._restore_search_after_render()
 
         def _process_pending_render(self) -> None:
@@ -4478,8 +4597,21 @@ if _WX_AVAILABLE:
             if not self._render_pending:
                 # A successful render supersedes anything deferred behind a
                 # modal dialog, so the replay poll has nothing left to do.
+                log.debug(
+                    "render: replay skipped — nothing pending (running=%s pending=%s)",
+                    self._js_running,
+                    self._render_pending,
+                )
                 self._stop_modal_render_replay()
                 return
+            log.debug(
+                "render: replaying pending render (running=%s pending=%s force=%s replace=%s follow=%s)",
+                self._js_running,
+                self._render_pending,
+                self._pending_force_scroll_to_bottom,
+                self._pending_replace,
+                self._pending_follow,
+            )
             self._render_pending = False
             wx.CallAfter(
                 self._update_conversation,
@@ -4565,6 +4697,15 @@ if _WX_AVAILABLE:
             """
             if not self._use_webview:
                 return False, None
+            started = time.monotonic()
+            log.debug(
+                "render: script start (running=%s pending=%s shell=%s loading=%s) len=%d",
+                self._js_running,
+                self._render_pending,
+                self._shell_loaded,
+                self._page_loading,
+                len(js),
+            )
             if not self._try_acquire_render_lock(probe=probe):
                 # The deferred request owns these flags; capture them now.
                 self._pending_force_scroll_to_bottom = force_scroll_to_bottom
@@ -4573,16 +4714,27 @@ if _WX_AVAILABLE:
                 return False, None  # deferred: _render_pending already set
             try:
                 ok, result = self._conv_view.RunScript(js)
+                elapsed_ms = (time.monotonic() - started) * 1000.0
                 if not ok:
-                    log.warning("_run_script: RunScript failed: %r", result)
+                    log.warning(
+                        "render: script failed in %.1f ms len=%d result=%r",
+                        elapsed_ms,
+                        len(js),
+                        result,
+                    )
                     if retry_on_failure:
                         self._render_pending = True
                         self._pending_force_scroll_to_bottom = force_scroll_to_bottom
                         self._pending_replace = replace
                         self._pending_follow = follow
+                else:
+                    log.debug("render: script done in %.1f ms len=%d", elapsed_ms, len(js))
                 return ok, result
             except Exception as e:
-                log.warning("_run_script exception: %s", e)
+                elapsed_ms = (time.monotonic() - started) * 1000.0
+                log.warning(
+                    "render: script exception in %.1f ms len=%d: %s", elapsed_ms, len(js), e
+                )
                 if retry_on_failure:
                     self._render_pending = True
                     self._pending_force_scroll_to_bottom = force_scroll_to_bottom
@@ -4609,6 +4761,11 @@ if _WX_AVAILABLE:
 
             if self._js_running:
                 self._render_pending = True
+                log.debug(
+                    "render: deferred — script in flight (running=%s pending=%s)",
+                    self._js_running,
+                    self._render_pending,
+                )
                 return False
 
             if not probe and self._blocking_dialog() is not None:
@@ -4617,7 +4774,11 @@ if _WX_AVAILABLE:
                 # re-runs the normal render path once the dialog is gone.
                 self._render_pending = True
                 self._schedule_modal_render_replay()
-                log.debug("chat: render deferred: modal dialog open")
+                log.debug(
+                    "render: deferred — modal dialog open (running=%s pending=%s)",
+                    self._js_running,
+                    self._render_pending,
+                )
                 return False
 
             # Claim first: shell detection (below) runs raw RunScript probes,

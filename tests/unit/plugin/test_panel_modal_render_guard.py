@@ -18,8 +18,10 @@ import importlib
 import json
 from pathlib import Path
 import sys
+import time
 import types
 from types import SimpleNamespace
+from unittest import mock
 
 import pytest
 
@@ -162,13 +164,17 @@ class _FakeView:
     def __init__(self) -> None:
         self.scripts: list[str] = []
         self.async_scripts: list[str] = []
+        self.diag_scripts: list[str] = []
 
     def RunScript(self, js: str) -> tuple[bool, str]:
         self.scripts.append(js)
         return True, "ok"
 
     def RunScriptAsync(self, js: str) -> bool:
-        self.async_scripts.append(js)
+        if "kind: 'diag'" in js:
+            self.diag_scripts.append(js)
+        else:
+            self.async_scripts.append(js)
         return True
 
     def SetFocus(self) -> None:
@@ -332,6 +338,7 @@ def _make_panel(panel, timer: _FakeTimer, view: _FakeView) -> object:
     obj._search_seq = 0
     obj._search_async_ok = True
     obj._search_script_running = False
+    obj._last_diag_ts = 0.0
     obj._conv_view = view
     return obj
 
@@ -792,3 +799,46 @@ def test_find_text_mark_loop_always_advances() -> None:
     source = (Path(_panel_module.__file__).parent / "shell.js").read_text(encoding="utf-8")
     assert "Math.max(1, query.length)" in source
     assert "idx <= previousIdx" in source
+
+
+# --------------------------------------------------------------------------- #
+# Diagnostics must be observation-only
+# --------------------------------------------------------------------------- #
+
+
+def test_diag_probe_warns_without_async_and_never_falls_back(panel_mod) -> None:
+    panel, _windows = panel_mod
+    timer = _FakeTimer()
+    view = _FakeView()
+    obj = _make_search_panel(panel, timer, view)
+    obj._search_async_ok = False
+
+    with mock.patch.object(panel.log, "warning") as warning:
+        obj._log_ui_state("test")
+
+    warning.assert_called_once()
+    assert "diag: async unavailable, cannot probe page" in warning.call_args.args[0]
+    assert view.scripts == [], "diagnostics must never issue a synchronous RunScript"
+    assert view.async_scripts == []
+    assert view.diag_scripts == []
+
+
+def test_diag_probe_is_throttled_and_async_only(panel_mod) -> None:
+    panel, _windows = panel_mod
+    timer = _FakeTimer()
+    view = _FakeView()
+    obj = _make_search_panel(panel, timer, view)
+
+    obj._last_diag_ts = time.monotonic()
+    obj._maybe_log_ui_state("search_tick")
+    assert view.diag_scripts == [], "a probe within one second must be throttled"
+
+    obj._last_diag_ts = 0.0
+    obj._maybe_log_ui_state("search_tick")
+
+    assert len(view.diag_scripts) == 1
+    probe = view.diag_scripts[0]
+    assert "kind: 'diag'" in probe
+    assert "conversationChildren" in probe
+    assert "window.__findMatches" in probe
+    assert view.scripts == [], "diagnostics must never issue a synchronous RunScript"
