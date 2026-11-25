@@ -481,6 +481,9 @@ if _WX_AVAILABLE:
             # Monotonic timestamp of the last read-only page probe; the
             # per-tick diagnostic is throttled to at most once per second.
             self._last_diag_ts: float = 0.0
+            # Send timestamps by search sequence number, used to log the
+            # async round-trip time.  Bounded: at most 10 outstanding seqs.
+            self._search_sent_at: dict[int, float] = {}
             # Project-scoped session watch: tracks the open KiCad project so
             # switching projects can re-offer that project's saved sessions
             # (same flow as startup auto-restore). Started by _init_llm_client.
@@ -2943,6 +2946,12 @@ if _WX_AVAILABLE:
             self._search_seq += 1
             return self._search_seq
 
+        def _note_search_sent(self, seq: int) -> None:
+            """Remember when an async find was sent so the reply can be timed."""
+            self._search_sent_at[seq] = time.monotonic()
+            while len(self._search_sent_at) > 10:
+                self._search_sent_at.pop(next(iter(self._search_sent_at)), None)
+
         def _search_async_available(self) -> bool:
             """True when find can use RunScriptAsync + script messages."""
             return self._search_async_ok and hasattr(self._conv_view, "RunScriptAsync")
@@ -3031,6 +3040,7 @@ if _WX_AVAILABLE:
             if not isinstance(seq, int):
                 log.debug("search: message dropped — bad payload (seq=%r)", seq)
                 return
+            sent_at = self._search_sent_at.pop(seq, None)
             if seq < self._search_seq:
                 log.debug(
                     "search: message dropped — stale seq=%d current=%d",
@@ -3043,7 +3053,23 @@ if _WX_AVAILABLE:
                 log.debug("search: message dropped — bad payload (count=%r)", count)
                 return
             index = payload.get("index")
-            log.debug("search: message seq=%d count=%d index=%r", seq, count, index)
+            log_index = index if isinstance(index, int) else 0
+            if sent_at is None:
+                log.debug(
+                    "search: result seq=%d count=%d index=%d rtt_ms=unknown",
+                    seq,
+                    count,
+                    log_index,
+                )
+            else:
+                rtt_ms = (time.monotonic() - sent_at) * 1000.0
+                log.debug(
+                    "search: result seq=%d count=%d index=%d rtt_ms=%.1f",
+                    seq,
+                    count,
+                    log_index,
+                    rtt_ms,
+                )
             if count == 0:
                 self._search_count_label.SetLabel("0/0")
                 return
@@ -3185,8 +3211,11 @@ if _WX_AVAILABLE:
                 log.debug(
                     "search: tick clear seq=%d async_sent=%s fallback=%s", seq, sent, not sent
                 )
-                if not sent:
+                if sent:
+                    self._note_search_sent(seq)
+                else:
                     self._run_search_script("_clearFind()")
+                    log.debug("search: result seq=%d sync_fallback=true", seq)
                 self._maybe_log_ui_state("search_tick")
                 return
             seq = self._next_search_seq()
@@ -3199,8 +3228,11 @@ if _WX_AVAILABLE:
                 sent,
                 not sent,
             )
-            if not sent:
+            if sent:
+                self._note_search_sent(seq)
+            else:
                 self._apply_search_result(self._run_search_script(js))
+                log.debug("search: result seq=%d sync_fallback=true", seq)
             self._maybe_log_ui_state("search_tick")
 
         def _on_search(self, event) -> None:
@@ -3220,8 +3252,11 @@ if _WX_AVAILABLE:
             seq = self._next_search_seq()
             sent = self._run_search_async(f"_findNext({seq})")
             log.debug("search: next seq=%d async_sent=%s fallback=%s", seq, sent, not sent)
-            if not sent:
+            if sent:
+                self._note_search_sent(seq)
+            else:
                 self._apply_search_result(self._run_search_script("_findNext()"))
+                log.debug("search: result seq=%d sync_fallback=true", seq)
 
         def _on_search_prev(self, event=None) -> None:
             """Jump to previous match."""
@@ -3236,8 +3271,11 @@ if _WX_AVAILABLE:
             seq = self._next_search_seq()
             sent = self._run_search_async(f"_findPrev({seq})")
             log.debug("search: prev seq=%d async_sent=%s fallback=%s", seq, sent, not sent)
-            if not sent:
+            if sent:
+                self._note_search_sent(seq)
+            else:
                 self._apply_search_result(self._run_search_script("_findPrev()"))
+                log.debug("search: result seq=%d sync_fallback=true", seq)
 
         def _on_autoroute(self, event) -> None:
             """Menu handler: Tools → Auto Route…

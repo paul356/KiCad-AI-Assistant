@@ -56,7 +56,57 @@ def _setup_plugin_logging() -> None:
         log.warning("Could not set up plugin logging: %s", exc)
 
 
+def _find_git_root(start: str) -> str | None:
+    """Walk up from *start* to the first directory containing a ``.git`` entry."""
+    current = os.path.dirname(os.path.abspath(start))
+    while True:
+        if os.path.exists(os.path.join(current, ".git")):
+            return current
+        parent = os.path.dirname(current)
+        if parent == current:
+            return None
+        current = parent
+
+
+def _git_rev(repo_dir: str, *args: str) -> str:
+    """Run ``git -C repo_dir args`` and return stdout, or ``unknown``."""
+    import subprocess
+
+    proc = subprocess.run(
+        ["git", "-C", repo_dir, *args],
+        capture_output=True,
+        text=True,
+        timeout=5,
+        check=False,
+    )
+    return proc.stdout.strip() or "unknown"
+
+
+def _log_build_identity() -> None:
+    """Log the running checkout/wheel identity (diagnostics only; never raises)."""
+    package_file = globals().get("__file__", "unknown")
+    package_version = globals().get("__version__", "unknown")
+    head = branch = "unknown"
+    try:
+        repo_dir = _find_git_root(package_file)
+        if repo_dir is not None:
+            head = _git_rev(repo_dir, "rev-parse", "--short", "HEAD")
+            branch = _git_rev(repo_dir, "rev-parse", "--abbrev-ref", "HEAD")
+    except Exception as exc:
+        # Missing git, no repository (PCM/wheel), or a hung/denied process.
+        log.debug("plugin: git identity unavailable: %s", exc)
+        head = branch = "unknown"
+    log.info(
+        "plugin: build file=%s version=%s head=%s branch=%s",
+        package_file,
+        package_version,
+        head,
+        branch,
+    )
+
+
 _setup_plugin_logging()
+_log_build_identity()
 
 # ---------------------------------------------------------------------------
 # Graceful import guard — pcbnew is only available inside KiCad

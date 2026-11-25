@@ -339,6 +339,7 @@ def _make_panel(panel, timer: _FakeTimer, view: _FakeView) -> object:
     obj._search_async_ok = True
     obj._search_script_running = False
     obj._last_diag_ts = 0.0
+    obj._search_sent_at = {}
     obj._conv_view = view
     return obj
 
