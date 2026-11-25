@@ -432,7 +432,7 @@ if _WX_AVAILABLE:
             self._page_loading: bool = False
             # True once the shell HTML (CSS + JS framework + empty containers)
             # has been successfully loaded into the WebView.
-            self._shell_loaded: bool = False
+            self._set_shell_loaded(False, "init")
             # True while any WebView script is in-flight.  On Windows WebView2,
             # RunScript pumps the message loop; re-entrant RunScript calls are
             # guarded by _run_script, the only place that writes this flag.
@@ -604,17 +604,23 @@ if _WX_AVAILABLE:
                 "</body></html>"
             )
 
-        def _load_shell(self) -> None:
+        def _set_shell_loaded(self, value: bool, reason: str) -> None:
+            """Assign _shell_loaded and log the transition with its reason."""
+            self._shell_loaded = value
+            log.info("render: shell_loaded -> %s (reason=%s)", value, reason)
+
+        def _load_shell(self, reason: str) -> None:
             """Load the static shell HTML into the WebView.
 
             Called once at startup and on WebView error recovery.  After this,
             all UI updates go through RunScript — SetPage is never called again
             (unless the shell needs to be reloaded).
             """
+            log.info("render: load_shell called (reason=%s)", reason)
             shell_html = self._build_shell_html()
             log.debug("Loading shell HTML: %d bytes", len(shell_html))
             self._page_loading = True
-            self._shell_loaded = False
+            self._set_shell_loaded(False, "page-load-start")
             self._stream_wrapper_visible = False
             self._page_watchdog.Start(5000, oneShot=True)
             self._conv_view.SetPage(shell_html, "")
@@ -671,7 +677,7 @@ if _WX_AVAILABLE:
                     self._search_async_ok = self._setup_search_async()
                     # Load the static shell (CSS + JS + empty containers).
                     # After this, all UI updates go through RunScript.
-                    self._load_shell()
+                    self._load_shell("startup")
                 except Exception as e:
                     log.warning("WebView init failed, falling back to HtmlWindow: %s", e)
                     self._use_webview = False
@@ -2300,7 +2306,7 @@ if _WX_AVAILABLE:
             self._shell_retry_count += 1
             self._page_loading = False
             self._js_running = False
-            self._shell_loaded = False
+            self._set_shell_loaded(False, "watchdog")
             self._stream_wrapper_visible = False
             self._render_pending = False
 
@@ -2334,7 +2340,7 @@ if _WX_AVAILABLE:
                     "color_hex": self._C_WARN_HEX,
                 }
             )
-            wx.CallAfter(self._load_shell)
+            wx.CallAfter(self._load_shell, "watchdog-retry")
 
         def _mark_tool_dirty(self, name: str) -> None:
             """Track whether a tool call modified the PCB/schematic on disk."""
@@ -4354,6 +4360,7 @@ if _WX_AVAILABLE:
             reload on WebView error recovery).  It transitions the shell
             state and triggers the first conversation render.
             """
+            log.info("render: webview loaded event")
             log.debug(
                 "_on_webview_loaded: shell ready (render_pending=%s, entries=%d)",
                 self._render_pending,
@@ -4380,7 +4387,7 @@ if _WX_AVAILABLE:
                 log.debug("WebView error description not available: %s", e)
             log.warning("WebView error: %s — reloading shell", description)
             self._page_loading = False
-            self._shell_loaded = False
+            self._set_shell_loaded(False, "webview-error")
             self._js_running = False
             self._stream_wrapper_visible = False
             self._page_watchdog.Stop()
@@ -4392,7 +4399,7 @@ if _WX_AVAILABLE:
                 }
             )
             self._render_pending = False
-            wx.CallAfter(self._load_shell)
+            wx.CallAfter(self._load_shell, "webview-error-reload")
 
         def _verify_shell_and_render(self) -> None:
             """Verify JS is working and trigger render if needed.
@@ -4453,7 +4460,7 @@ if _WX_AVAILABLE:
                 log.error("_verify_shell_and_render: exception: %s", e)
 
             if js_works:
-                self._shell_loaded = True
+                self._set_shell_loaded(True, "probe-ok")
                 log.info("_verify_shell_and_render: JS verified, _shell_loaded=True")
             else:
                 log.warning("_verify_shell_and_render: JS not working yet")
@@ -4802,14 +4809,32 @@ if _WX_AVAILABLE:
             held (_js_running=True).
             """
             for attempt in range(3):
+                cleared = False
                 try:
                     ok, result = self._conv_view.RunScript(
                         "document.getElementById('conversation') ? 'loaded' : 'not_loaded'"
                     )
                     if ok and result and "loaded" in str(result):
-                        # Also verify JS functions exist by trying to call one
+                        # Also verify JS functions exist by trying to call one.
+                        # This probe calls _updateConversation('[]'), which
+                        # really clears #conversation — log it before and after.
+                        log.info(
+                            "render: shell probe will clear conversation "
+                            "(attempt %d, shell_loaded=%s, page_loading=%s, running=%s)",
+                            attempt + 1,
+                            self._shell_loaded,
+                            self._page_loading,
+                            self._js_running,
+                        )
+                        cleared = True
                         ok2, result2 = self._conv_view.RunScript(
                             "try { _updateConversation('[]', 'none'); 'ok'; } catch(e) { e.message; }"
+                        )
+                        log.info(
+                            "render: shell probe result ok=%s result=%r (attempt %d)",
+                            ok2,
+                            result2,
+                            attempt + 1,
                         )
                         log.info("JS test attempt %d: %r", attempt + 1, result2)
                         if (
@@ -4818,13 +4843,27 @@ if _WX_AVAILABLE:
                             and ("ok" in str(result2) or "error" in str(result2).lower())
                         ):
                             log.info("Detected shell and JS working (attempt %d)", attempt + 1)
-                            self._shell_loaded = True
+                            self._set_shell_loaded(True, "probe-ok")
                             self._page_loading = False
                             return True
                         log.warning("Shell loaded but JS not working (attempt %d)", attempt + 1)
+                        log.warning(
+                            "render: shell probe failed after clearing conversation "
+                            "(attempt %d, ok=%s, result=%r)",
+                            attempt + 1,
+                            ok2,
+                            result2,
+                        )
                     else:
                         break
                 except Exception as e:
+                    if cleared:
+                        log.warning(
+                            "render: shell probe failed after clearing conversation "
+                            "(attempt %d): %s",
+                            attempt + 1,
+                            e,
+                        )
                     log.warning("Failed to detect shell state (attempt %d): %s", attempt + 1, e)
                     break
             log.warning("Shell loaded but JS not working after 3 attempts, allowing retry")
