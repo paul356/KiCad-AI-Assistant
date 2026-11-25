@@ -38,6 +38,11 @@ _PROJECT_SCAN_TICKS = 5
 # that the conversation catches up as soon as the dialog closes.
 _MODAL_RENDER_POLL_MS = 200
 
+# Find-as-you-type debounce.  EVT_TEXT must not run JS: RunScript pumps the
+# GTK loop and resets GtkEntry's caret (issue #341), and RunScriptAsync avoids
+# both the pump and the modal-dialog abort (#339).
+_SEARCH_DEBOUNCE_MS = 200
+
 
 def _same_project_content(left: dict, right: dict) -> bool:
     """Compare two state records ignoring the ``written_at`` stamp."""
@@ -459,6 +464,19 @@ if _WX_AVAILABLE:
             # #339).  Created stopped; started only while a deferred render
             # waits for that dialog to close.
             self._modal_render_timer = wx.Timer(self)
+            # Find/search runs off RunScriptAsync: EVT_TEXT only stores the
+            # query and restarts this debounce; results arrive through the
+            # "kcaa" script message handler and carry a sequence number so a
+            # stale result cannot overwrite a newer one.
+            self._search_timer = wx.Timer(self)
+            self._search_query: str = ""
+            self._search_seq: int = 0
+            self._search_async_ok: bool = False
+            # True while the synchronous find fallback's RunScript is in
+            # flight.  RunScript pumps the loop, so EVT_TEXT can re-enter
+            # _run_search_script; a second call would reset WebView's single
+            # sync-result slot and could spin forever.
+            self._search_script_running: bool = False
             # Project-scoped session watch: tracks the open KiCad project so
             # switching projects can re-offer that project's saved sessions
             # (same flow as startup auto-restore). Started by _init_llm_client.
@@ -642,6 +660,11 @@ if _WX_AVAILABLE:
                         _on_navigating,
                         self._conv_view,
                     )
+                    # Async find results.  Needs AddScriptMessageHandler
+                    # (wxWidgets 3.1.5+) and RunScriptAsync (3.1.6+); the old
+                    # webkit1 backend has neither, so search falls back to the
+                    # synchronous, modal-guarded path.
+                    self._search_async_ok = self._setup_search_async()
                     # Load the static shell (CSS + JS + empty containers).
                     # After this, all UI updates go through RunScript.
                     self._load_shell()
@@ -884,6 +907,7 @@ if _WX_AVAILABLE:
             # permanently blocked.
             self.Bind(wx.EVT_TIMER, self._on_page_watchdog, self._page_watchdog)
             self.Bind(wx.EVT_TIMER, self._on_modal_render_tick, self._modal_render_timer)
+            self.Bind(wx.EVT_TIMER, self._on_search_tick, self._search_timer)
             self.Bind(wx.EVT_TIMER, self._on_project_watch_tick, self._project_watch_timer)
             self.Bind(wx.EVT_SHOW, self._on_panel_show)
 
@@ -2897,19 +2921,106 @@ if _WX_AVAILABLE:
             )
 
         # ---- Search / Find handlers ----
+        # Find never uses synchronous RunScript while async support is
+        # available: RunScriptAsync posts its result through the "kcaa"
+        # script message handler, so EVT_TEXT never pumps the GTK loop
+        # (#341) and a modal dialog's nested loop is never entered (#339).
+        # Older webkit1 backends fall back to synchronous RunScript guarded
+        # by _blocking_dialog().
+
+        def _next_search_seq(self) -> int:
+            """Issue the next find sequence number; stale results carry lower."""
+            self._search_seq += 1
+            return self._search_seq
+
+        def _search_async_available(self) -> bool:
+            """True when find can use RunScriptAsync + script messages."""
+            return self._search_async_ok and hasattr(self._conv_view, "RunScriptAsync")
+
+        def _run_search_async(self, js: str) -> bool:
+            """Fire a find script asynchronously; False means use the fallback."""
+            if not self._search_async_available():
+                return False
+            try:
+                self._conv_view.RunScriptAsync(js)
+                return True
+            except Exception as e:
+                log.warning("search: RunScriptAsync failed, using sync fallback: %s", e)
+                return False
 
         def _run_search_script(self, js: str):
-            """Run a search/find script, or skip it while a modal dialog owns the loop.
+            """Synchronous fallback, skipped while a modal dialog owns the loop.
 
-            Search highlighting is visual only: nothing is lost by skipping it
-            while a dialog is open, so there is no replay queue here.  Returns
-            None when skipped; callers then keep the previous match-count label
-            (the user's next keystroke refreshes it once the dialog is gone).
+            Only used when script-message support is unavailable (webkit1).
+            Returns None when skipped, when a previous call is still in
+            flight, or on failure without a result tuple.  The re-entrancy
+            guard matters: RunScript pumps the event loop, so EVT_TEXT can
+            call back in while WebView's single sync-result slot is pending;
+            a second RunScript would reset that slot and spin forever.
             """
+            if self._search_script_running:
+                log.debug("search: sync RunScript already running; re-entry ignored")
+                return None
             if self._blocking_dialog() is not None:
                 log.debug("search: skipped while modal dialog open")
                 return None
-            return self._conv_view.RunScript(js)
+            self._search_script_running = True
+            try:
+                return self._conv_view.RunScript(js)
+            finally:
+                self._search_script_running = False
+
+        def _apply_search_result(self, found) -> None:
+            """Write a synchronous find result to the count label."""
+            if found is None:
+                return
+            ok, result = found
+            if ok and result:
+                self._search_count_label.SetLabel(str(result))
+
+        def _restore_search_after_render(self) -> None:
+            """Re-apply the active find after the conversation DOM changed.
+
+            A full rebuild replaces ``#conversation``'s children (and an
+            append adds nodes), invalidating the shell's match list and
+            highlight nodes.  ``_findTextAndJump`` first clears any stale
+            find state, then re-highlights the live query and posts a fresh
+            count with the newest sequence number.
+            """
+            if not self._use_webview or not self._search_query:
+                return
+            seq = self._next_search_seq()
+            js = f"_findTextAndJump({json.dumps(self._search_query)}, {seq})"
+            if not self._run_search_async(js):
+                self._apply_search_result(self._run_search_script(js))
+
+        def _on_search_message(self, event) -> None:
+            """Apply an async find result; stale or malformed messages are ignored.
+
+            The payload is ``{kind:"find", seq, count, query, index}``.  A
+            result whose ``seq`` is older than the latest issued search is
+            dropped, so fast typing cannot let a slow result win.
+            """
+            try:
+                payload = json.loads(event.GetString())
+                if not isinstance(payload, dict) or payload.get("kind") != "find":
+                    return
+                seq = payload.get("seq")
+                if not isinstance(seq, int) or seq < self._search_seq:
+                    return
+                count = payload.get("count")
+                if not isinstance(count, int) or count < 0:
+                    return
+                if count == 0:
+                    self._search_count_label.SetLabel("0/0")
+                    return
+                index = payload.get("index")
+                if isinstance(index, int) and 1 <= index <= count:
+                    self._search_count_label.SetLabel(f"{index}/{count}")
+                else:
+                    self._search_count_label.SetLabel(f"1/{count}")
+            except Exception as e:
+                log.debug("search: ignored malformed script message: %s", e)
 
         def _on_find(self, event) -> None:
             """Show the search bar (Ctrl+F or Tools→Find)."""
@@ -2920,14 +3031,21 @@ if _WX_AVAILABLE:
             self._search_close_btn.Show(True)
             self._search_ctrl.SetFocus()
             self._ui_panel.Layout()
-            # Clear previous search
+            # Clear previous search.  SetValue can fire EVT_TEXT; drop the
+            # debounce it arms so no stale query runs later.
             self._search_ctrl.SetValue("")
-            self._search_count_label.SetLabel("0/0")
+            self._search_timer.Stop()
+            self._search_query = ""
             if self._use_webview:
-                self._run_search_script("_clearFind()")
+                seq = self._next_search_seq()
+                if not self._run_search_async(f"_clearFind({seq})"):
+                    self._run_search_script("_clearFind()")
+            self._search_count_label.SetLabel("0/0")
 
         def _on_search_close(self, event=None) -> None:
             """Hide search bar and clear highlights."""
+            self._search_timer.Stop()
+            self._search_query = ""
             self._search_ctrl.Show(False)
             self._search_prev_btn.Show(False)
             self._search_next_btn.Show(False)
@@ -2935,7 +3053,9 @@ if _WX_AVAILABLE:
             self._search_close_btn.Show(False)
             self._ui_panel.Layout()
             if self._use_webview:
-                self._run_search_script("_clearFind()")
+                seq = self._next_search_seq()
+                if not self._run_search_async(f"_clearFind({seq})"):
+                    self._run_search_script("_clearFind()")
             self._conv_view.SetFocus()
 
         def _on_search_key(self, event) -> None:
@@ -2947,18 +3067,36 @@ if _WX_AVAILABLE:
             event.Skip()
 
         def _on_search_text(self, event) -> None:
-            """Search on every keystroke."""
-            query = self._search_ctrl.GetValue().strip()
-            if self._use_webview:
-                if query:
-                    found = self._run_search_script(f"_findTextAndJump({json.dumps(query)})")
-                    if found is not None:
-                        ok, result = found
-                        if ok and result:
-                            self._search_count_label.SetLabel(str(result))
-                elif self._run_search_script("_clearFind()") is not None:
-                    # Skipped behind a modal dialog: keep the previous count.
-                    self._search_count_label.SetLabel("0/0")
+            """Record the query and restart the debounce; never run JS here.
+
+            RunScript pumps the GTK main loop (wxYield) while the key event is
+            still being dispatched, which resets GtkEntry's caret/input-method
+            state: typing "hello" landed as "olleh" (issue #341).  Execution
+            happens in _on_search_tick, asynchronously.
+            """
+            self._search_query = self._search_ctrl.GetValue().strip()
+            self._search_timer.Start(_SEARCH_DEBOUNCE_MS)
+
+        def _on_search_tick(self, event=None) -> None:
+            """Run the debounced find off RunScriptAsync.
+
+            No modal gate and no replay queue: RunScriptAsync does not pump the
+            dialog's nested loop, so it is safe while a dialog is open.  Match
+            counts arrive later through _on_search_message.
+            """
+            self._search_timer.Stop()
+            if not self._use_webview:
+                return
+            if not self._search_query:
+                self._search_count_label.SetLabel("0/0")
+                seq = self._next_search_seq()
+                if not self._run_search_async(f"_clearFind({seq})"):
+                    self._run_search_script("_clearFind()")
+                return
+            seq = self._next_search_seq()
+            js = f"_findTextAndJump({json.dumps(self._search_query)}, {seq})"
+            if not self._run_search_async(js):
+                self._apply_search_result(self._run_search_script(js))
 
         def _on_search(self, event) -> None:
             """Search button clicked."""
@@ -2966,21 +3104,19 @@ if _WX_AVAILABLE:
 
         def _on_search_next(self, event=None) -> None:
             """Jump to next match."""
-            if self._use_webview:
-                found = self._run_search_script("_findNext()")
-                if found is not None:
-                    ok, result = found
-                    if ok and result:
-                        self._search_count_label.SetLabel(str(result))
+            if not self._use_webview:
+                return
+            seq = self._next_search_seq()
+            if not self._run_search_async(f"_findNext({seq})"):
+                self._apply_search_result(self._run_search_script("_findNext()"))
 
         def _on_search_prev(self, event=None) -> None:
             """Jump to previous match."""
-            if self._use_webview:
-                found = self._run_search_script("_findPrev()")
-                if found is not None:
-                    ok, result = found
-                    if ok and result:
-                        self._search_count_label.SetLabel(str(result))
+            if not self._use_webview:
+                return
+            seq = self._next_search_seq()
+            if not self._run_search_async(f"_findPrev({seq})"):
+                self._apply_search_result(self._run_search_script("_findPrev()"))
 
         def _on_autoroute(self, event) -> None:
             """Menu handler: Tools → Auto Route…
@@ -3842,6 +3978,7 @@ if _WX_AVAILABLE:
             """Called when the wx window is actually destroyed (e.g. KiCad shutdown)."""
             if event.GetEventObject() is self:
                 self._stop_modal_render_replay()
+                self._search_timer.Stop()
                 if self._update_cancel_event is not None:
                     self._update_cancel_event.set()
                 if self._update_progress_timer is not None:
@@ -4069,6 +4206,31 @@ if _WX_AVAILABLE:
                 out.append("</ul>")
 
             return "".join(out)
+
+        def _setup_search_async(self) -> bool:
+            """Register the ``kcaa`` script message handler for find results.
+
+            ``AddScriptMessageHandler`` needs wxWidgets 3.1.5 and
+            ``RunScriptAsync`` 3.1.6; the old webkit1 backend has neither.
+            Returns False so search falls back to synchronous, modal-guarded
+            ``RunScript``.
+            """
+            event_type = getattr(_wx_html2, "EVT_WEBVIEW_SCRIPT_MESSAGE_RECEIVED", None)
+            add_handler = getattr(self._conv_view, "AddScriptMessageHandler", None)
+            if event_type is None or add_handler is None:
+                log.warning("search: script message handler unavailable; using sync fallback")
+                return False
+            try:
+                if not add_handler("kcaa"):
+                    log.warning(
+                        "search: AddScriptMessageHandler('kcaa') rejected; using sync fallback"
+                    )
+                    return False
+                self.Bind(event_type, self._on_search_message, self._conv_view)
+            except Exception as e:
+                log.warning("search: async setup failed, using sync fallback: %s", e)
+                return False
+            return True
 
         def _on_webview_loaded(self, event) -> None:
             """Called when the shell HTML has finished loading.
@@ -4305,6 +4467,7 @@ if _WX_AVAILABLE:
                 )
             else:
                 log.debug("_updateConversation JS result: %s", result_str)
+                self._restore_search_after_render()
 
         def _process_pending_render(self) -> None:
             """Process any pending render after _js_running is reset.
@@ -4564,6 +4727,7 @@ if _WX_AVAILABLE:
                 )
             else:
                 log.debug("_appendEntry JS result: %s", result_str)
+                self._restore_search_after_render()
 
         def _show_stream_wrapper(self) -> None:
             """Make the stream-wrapper table visible (first streaming chunk)."""

@@ -162,7 +162,8 @@ section('7. _clearFind restores text');
 {
     _clearFind();
     _findText('resistor');
-    _clearFind();
+    const clearResult = _clearFind();
+    assert(clearResult === '0/0', '_clearFind returns explicit 0/0: got ' + clearResult);
     const marks = document.querySelectorAll('mark.search-match, mark.search-active');
     assert(marks.length === 0, 'all marks cleared: got ' + marks.length);
     const conv = document.getElementById('conversation');
@@ -209,9 +210,41 @@ section('10. Auto-expand collapsed details on match');
     assert(tool2After.hasAttribute('open'), 'tool_2 should be auto-expanded when match is inside it');
 }
 
+section('11. Script message posts kind/seq/count for async results');
+{
+    sandbox.kcaa = {
+        messages: [],
+        postMessage: function(payload) { this.messages.push(JSON.parse(payload)); },
+    };
+
+    _findTextAndJump('resistor', 7);
+    const msgs = sandbox.kcaa.messages;
+    assert(msgs.length === 1, 'one search should post one message: got ' + msgs.length);
+    assert(msgs[0].kind === 'find', 'payload kind should be find: got ' + msgs[0].kind);
+    assert(msgs[0].seq === 7, 'payload seq should echo the Python sequence: got ' + msgs[0].seq);
+    assert(msgs[0].count === 3, 'payload count should be the match total: got ' + msgs[0].count);
+    assert(msgs[0].query === 'resistor', 'payload query should be the query: got ' + msgs[0].query);
+
+    _findNext(8);
+    assert(msgs.length === 2, 'next should post another message');
+    assert(msgs[1].seq === 8 && msgs[1].count === 3,
+        'next posts the new seq and unchanged total: got ' + JSON.stringify(msgs[1]));
+
+    _clearFind(9);
+    assert(msgs.length === 3, 'clear should post a message');
+    assert(msgs[2].seq === 9 && msgs[2].count === 0,
+        'clear posts seq and zero matches: got ' + JSON.stringify(msgs[2]));
+
+    const noHit = _findTextAndJump('zzznotfound', 10);
+    assert(noHit === '0/0', 'no-match find returns explicit 0/0: got ' + noHit);
+    assert(msgs.length === 4, 'no-match find still posts one message');
+    assert(msgs[3].seq === 10 && msgs[3].count === 0,
+        'no-match posts seq and zero count: got ' + JSON.stringify(msgs[3]));
+}
+
 // ---- Click-to-collapse ----
 (async function() {
-    section('11. Body click collapses an open tool row');
+    section('12. Body click collapses an open tool row');
     {
         const tool1 = document.getElementById('tool_1');
         assert(tool1.hasAttribute('open'), 'tool_1 should start open');
@@ -223,7 +256,7 @@ section('10. Auto-expand collapsed details on match');
         assert(!tool1.hasAttribute('open'), 'tool_1 should be collapsed after a body click');
     }
 
-    section('12. Duplicate details ids: a body click closes only the clicked row');
+    section('13. Duplicate details ids: a body click closes only the clicked row');
     {
         const conv = document.getElementById('conversation');
         // Mimic a session-restore id collision: two rows share one details id.

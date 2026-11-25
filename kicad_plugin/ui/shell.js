@@ -181,6 +181,7 @@ window._updateConversation = function(entriesJson, scrollMode, replaceDocument) 
         }
         conv.innerHTML = '';
         conv.appendChild(frag);
+        _resetFindState();
         var sw = document.getElementById('stream-wrapper');
         if (sw) sw.style.display = 'none';
         document.getElementById('pending-ai-text').innerHTML = '';
@@ -211,6 +212,7 @@ window._appendEntry = function(entryJson, scrollMode) {
         var conv = document.getElementById('conversation');
         if (!conv) return 'error:no conversation div';
         conv.appendChild(_renderEntry(entry));
+        _resetFindState();
         var sw = document.getElementById('stream-wrapper');
         if (sw) sw.style.display = 'none';
         document.getElementById('pending-ai-text').innerHTML = '';
@@ -303,11 +305,37 @@ window._clearConversation = function() {
 // State: array of DOM nodes that contain matches, plus the current index.
 window.__findMatches = [];
 window.__findIdx = -1;
+window.__findQuery = '';
+
+// A conversation rebuild or append invalidates the match nodes (a rebuild
+// detaches them).  Python re-applies the live query afterwards; dropping the
+// stale references here keeps highlights from pointing at detached nodes.
+function _resetFindState() {
+    window.__findMatches = [];
+    window.__findIdx = -1;
+}
+
+// Report a find result to Python through the script message handler.  A
+// missing seq means the caller came from the synchronous fallback (or from
+// an internal call such as _findText -> _clearFind), so nothing is posted.
+function _postFindResult(seq, query) {
+    if (seq === undefined) return;
+    if (!window.kcaa || !window.kcaa.postMessage) return;
+    var count = window.__findMatches.length;
+    window.kcaa.postMessage(JSON.stringify({
+        kind: 'find',
+        seq: seq,
+        count: count,
+        query: query || '',
+        index: count > 0 ? (window.__findIdx + 1) : 0,
+    }));
+}
 
 window._findText = function(query) {
     _clearFind();
     window.__findMatches = [];
     window.__findIdx = -1;
+    window.__findQuery = query || '';
     if (!query || query.length === 0) return '0/0';
 
     var conv = document.getElementById('conversation');
@@ -348,8 +376,13 @@ window._findText = function(query) {
             mark.textContent = text.substring(idx, idx + query.length);
             fragment.appendChild(mark);
             window.__findMatches.push(mark);
-            lastEnd = idx + query.length;
+            var previousIdx = idx;
+            // Advance by at least one unit even if the matched text folds to
+            // a different length, and refuse to revisit the same index: a
+            // stale match must not spin forever.
+            lastEnd = idx + Math.max(1, query.length);
             idx = lower.indexOf(lowerQuery, lastEnd);
+            if (idx !== -1 && idx <= previousIdx) break;
         }
         // Remaining text after last match
         if (lastEnd < text.length) {
@@ -361,11 +394,12 @@ window._findText = function(query) {
     return window.__findMatches.length > 0 ? ('1/' + window.__findMatches.length) : '0/0';
 };
 
-window._findTextAndJump = function(query) {
+window._findTextAndJump = function(query, seq) {
     var result = _findText(query);
     if (window.__findMatches.length > 0) {
         _findJump(0);
     }
+    _postFindResult(seq, query);
     return result;
 };
 
@@ -393,15 +427,19 @@ window._findJump = function(idx) {
     return (newIdx + 1) + '/' + n;
 };
 
-window._findNext = function() {
-    return _findJump((window.__findIdx + 1) % (window.__findMatches.length || 1));
+window._findNext = function(seq) {
+    var result = _findJump((window.__findIdx + 1) % (window.__findMatches.length || 1));
+    _postFindResult(seq, window.__findQuery);
+    return result;
 };
 
-window._findPrev = function() {
-    return _findJump((window.__findIdx - 1 + (window.__findMatches.length || 1)) % (window.__findMatches.length || 1));
+window._findPrev = function(seq) {
+    var result = _findJump((window.__findIdx - 1 + (window.__findMatches.length || 1)) % (window.__findMatches.length || 1));
+    _postFindResult(seq, window.__findQuery);
+    return result;
 };
 
-window._clearFind = function() {
+window._clearFind = function(seq) {
     var marks = document.querySelectorAll('mark.search-match');
     for (var i = marks.length - 1; i >= 0; i--) {
         var mark = marks[i];
@@ -413,4 +451,7 @@ window._clearFind = function() {
     }
     window.__findMatches = [];
     window.__findIdx = -1;
+    window.__findQuery = '';
+    _postFindResult(seq, '');
+    return '0/0';
 };

@@ -15,6 +15,8 @@ instance of the real class, imported with a permissive fake ``wx`` module
 from __future__ import annotations
 
 import importlib
+import json
+from pathlib import Path
 import sys
 import types
 from types import SimpleNamespace
@@ -159,6 +161,25 @@ class _FakeColour:
 class _FakeView:
     def __init__(self) -> None:
         self.scripts: list[str] = []
+        self.async_scripts: list[str] = []
+
+    def RunScript(self, js: str) -> tuple[bool, str]:
+        self.scripts.append(js)
+        return True, "ok"
+
+    def RunScriptAsync(self, js: str) -> bool:
+        self.async_scripts.append(js)
+        return True
+
+    def SetFocus(self) -> None:
+        pass
+
+
+class _SyncOnlyView:
+    """Old webkit1 backend: no RunScriptAsync."""
+
+    def __init__(self) -> None:
+        self.scripts: list[str] = []
 
     def RunScript(self, js: str) -> tuple[bool, str]:
         self.scripts.append(js)
@@ -166,6 +187,14 @@ class _FakeView:
 
     def SetFocus(self) -> None:
         pass
+
+
+class _ScriptMessage:
+    def __init__(self, payload) -> None:
+        self._payload = payload if isinstance(payload, str) else json.dumps(payload)
+
+    def GetString(self) -> str:
+        return self._payload
 
 
 class _FakeControl:
@@ -298,6 +327,11 @@ def _make_panel(panel, timer: _FakeTimer, view: _FakeView) -> object:
     obj._conv_entries = []
     obj._stream_wrapper_visible = False
     obj._modal_render_timer = timer
+    obj._search_timer = _FakeTimer()
+    obj._search_query = ""
+    obj._search_seq = 0
+    obj._search_async_ok = True
+    obj._search_script_running = False
     obj._conv_view = view
     return obj
 
@@ -443,34 +477,19 @@ def test_close_stops_replay_timer(panel_mod) -> None:
 
 
 # --------------------------------------------------------------------------- #
-# Search / find scripts also bypass the render funnel (same crash vector)
+# Search: async RunScriptAsync + script messages (no sync RunScript, no gate)
 # --------------------------------------------------------------------------- #
 
-_SEARCH_CASES = [
-    ("_on_find", "_clearFind()"),
-    ("_on_search_close", "_clearFind()"),
-    ("_on_search_text", '_findTextAndJump("needle")'),
-    ("_on_search_next", "_findNext()"),
-    ("_on_search_prev", "_findPrev()"),
+_ASYNC_SEARCH_CASES = [
+    ("_on_find", "_clearFind(1)"),
+    ("_on_search_close", "_clearFind(1)"),
+    ("_on_search_next", "_findNext(1)"),
+    ("_on_search_prev", "_findPrev(1)"),
 ]
 
 
-@pytest.mark.parametrize(("handler", "expected_js"), _SEARCH_CASES)
-def test_search_script_skipped_while_modal_open(panel_mod, handler, expected_js) -> None:
-    """Ctrl+F/typing must not pump a dialog's nested loop via RunScript."""
-    panel, windows = panel_mod
-    timer = _FakeTimer()
-    view = _FakeView()
-    obj = _make_search_panel(panel, timer, view)
-    windows.append(_Dialog(modal=True))
-
-    getattr(obj, handler)(None)
-
-    assert view.scripts == [], f"{handler} must not call RunScript behind a dialog"
-
-
-@pytest.mark.parametrize(("handler", "expected_js"), _SEARCH_CASES)
-def test_search_script_runs_without_modal(panel_mod, handler, expected_js) -> None:
+@pytest.mark.parametrize(("handler", "expected_js"), _ASYNC_SEARCH_CASES)
+def test_search_script_runs_async(panel_mod, handler, expected_js) -> None:
     panel, _windows = panel_mod
     timer = _FakeTimer()
     view = _FakeView()
@@ -478,24 +497,116 @@ def test_search_script_runs_without_modal(panel_mod, handler, expected_js) -> No
 
     getattr(obj, handler)(None)
 
-    assert view.scripts == [expected_js]
+    assert view.scripts == [], "search must not use synchronous RunScript"
+    assert view.async_scripts == [expected_js]
 
 
-def test_empty_search_keeps_count_label_when_modal_open(panel_mod) -> None:
+@pytest.mark.parametrize(("handler", "expected_js"), _ASYNC_SEARCH_CASES)
+def test_search_async_is_unaffected_by_modal_dialog(panel_mod, handler, expected_js) -> None:
+    """RunScriptAsync does not pump the dialog loop, so search no longer defers."""
     panel, windows = panel_mod
     timer = _FakeTimer()
     view = _FakeView()
     obj = _make_search_panel(panel, timer, view)
-    obj._search_ctrl.SetValue("")
     windows.append(_Dialog(modal=True))
 
-    obj._on_search_text(None)
+    getattr(obj, handler)(None)
 
     assert view.scripts == []
-    assert obj._search_count_label.label == "1/3", "a skipped clear must not reset the count"
+    assert view.async_scripts == [expected_js]
 
 
-def test_empty_search_clears_count_without_modal(panel_mod) -> None:
+def test_search_text_debounces_to_one_async_find(panel_mod) -> None:
+    panel, _windows = panel_mod
+    timer = _FakeTimer()
+    view = _FakeView()
+    obj = _make_search_panel(panel, timer, view)
+
+    for text in ("h", "he", "hel", "hello"):
+        obj._search_ctrl.SetValue(text)
+        obj._on_search_text(None)
+        assert view.scripts == []
+        assert view.async_scripts == []
+
+    assert obj._search_timer.starts == [_panel_module._SEARCH_DEBOUNCE_MS] * 4
+    assert obj._search_query == "hello"
+    assert obj._search_seq == 0
+
+    obj._on_search_tick(None)
+
+    assert view.scripts == []
+    assert view.async_scripts == ['_findTextAndJump("hello", 1)']
+    assert obj._search_seq == 1
+    assert obj._search_timer.running is False
+
+
+def test_search_tick_runs_async_while_modal_open(panel_mod) -> None:
+    panel, windows = panel_mod
+    timer = _FakeTimer()
+    view = _FakeView()
+    obj = _make_search_panel(panel, timer, view)
+    obj._search_ctrl.SetValue("hello")
+    obj._on_search_text(None)
+    windows.append(_Dialog(modal=True))
+
+    obj._on_search_tick(None)
+
+    assert view.scripts == []
+    assert view.async_scripts == ['_findTextAndJump("hello", 1)']
+
+
+def test_search_message_updates_count_label(panel_mod) -> None:
+    panel, _windows = panel_mod
+    timer = _FakeTimer()
+    view = _FakeView()
+    obj = _make_search_panel(panel, timer, view)
+    obj._search_ctrl.SetValue("hello")
+    obj._on_search_text(None)
+    obj._on_search_tick(None)
+
+    obj._on_search_message(
+        _ScriptMessage({"kind": "find", "seq": 1, "count": 3, "query": "hello", "index": 2})
+    )
+
+    assert obj._search_count_label.label == "2/3"
+
+
+def test_stale_search_message_is_ignored(panel_mod) -> None:
+    panel, _windows = panel_mod
+    timer = _FakeTimer()
+    view = _FakeView()
+    obj = _make_search_panel(panel, timer, view)
+    obj._search_ctrl.SetValue("hello")
+    obj._on_search_text(None)
+    obj._on_search_tick(None)  # seq 1
+    obj._on_search_text(None)
+    obj._on_search_tick(None)  # seq 2
+
+    obj._on_search_message(
+        _ScriptMessage({"kind": "find", "seq": 1, "count": 9, "query": "hello", "index": 1})
+    )
+    assert obj._search_count_label.label == "1/3", "stale seq must not overwrite"
+
+    obj._on_search_message(
+        _ScriptMessage({"kind": "find", "seq": 2, "count": 4, "query": "hello", "index": 3})
+    )
+    assert obj._search_count_label.label == "3/4"
+
+
+def test_malformed_search_message_is_ignored(panel_mod) -> None:
+    panel, _windows = panel_mod
+    timer = _FakeTimer()
+    view = _FakeView()
+    obj = _make_search_panel(panel, timer, view)
+
+    obj._on_search_message(_ScriptMessage("not json"))
+    obj._on_search_message(_ScriptMessage({"kind": "find", "seq": "bad"}))
+    obj._on_search_message(_ScriptMessage({"kind": "other", "seq": 1}))
+
+    assert obj._search_count_label.label == "1/3"
+
+
+def test_empty_query_clears_asynchronously(panel_mod) -> None:
     panel, _windows = panel_mod
     timer = _FakeTimer()
     view = _FakeView()
@@ -503,6 +614,181 @@ def test_empty_search_clears_count_without_modal(panel_mod) -> None:
     obj._search_ctrl.SetValue("")
 
     obj._on_search_text(None)
+    obj._on_search_tick(None)
 
-    assert view.scripts == ["_clearFind()"]
+    assert view.scripts == []
+    assert view.async_scripts == ["_clearFind(1)"]
     assert obj._search_count_label.label == "0/0"
+
+
+def test_search_close_stops_debounce_timer(panel_mod) -> None:
+    panel, _windows = panel_mod
+    timer = _FakeTimer()
+    view = _FakeView()
+    obj = _make_search_panel(panel, timer, view)
+    obj._search_ctrl.SetValue("hello")
+    obj._on_search_text(None)
+    assert obj._search_timer.running is True
+
+    obj._on_search_close(None)
+
+    assert obj._search_timer.running is False
+    assert view.scripts == []
+    assert view.async_scripts == ["_clearFind(1)"]
+
+
+def test_destroy_stops_search_debounce_timer(panel_mod) -> None:
+    panel, _windows = panel_mod
+    timer = _FakeTimer()
+    view = _FakeView()
+    obj = _make_search_panel(panel, timer, view)
+    obj._update_cancel_event = None
+    obj._update_progress_timer = None
+    obj._project_watch_timer = None
+    obj._finalise_and_save_on_teardown = lambda: None
+    obj._server_mgr = SimpleNamespace(stop=lambda: None)
+    obj._search_ctrl.SetValue("hello")
+    obj._on_search_text(None)
+    assert obj._search_timer.running is True
+
+    obj._on_destroy(_DestroyEvent(obj))
+
+    assert obj._search_timer.running is False
+
+
+# ---- Fallback when script messages / RunScriptAsync are unavailable ----
+
+
+def test_search_falls_back_to_sync_when_async_disabled(panel_mod) -> None:
+    panel, _windows = panel_mod
+    timer = _FakeTimer()
+    view = _FakeView()
+    obj = _make_search_panel(panel, timer, view)
+    obj._search_async_ok = False
+    obj._search_ctrl.SetValue("hello")
+
+    obj._on_search_text(None)
+    obj._on_search_tick(None)
+
+    assert view.async_scripts == []
+    assert view.scripts == ['_findTextAndJump("hello", 1)']
+    assert obj._search_count_label.label == "ok"
+
+
+def test_search_falls_back_when_view_lacks_run_script_async(panel_mod) -> None:
+    panel, _windows = panel_mod
+    timer = _FakeTimer()
+    obj = _make_search_panel(panel, timer, _FakeView())
+    view = _SyncOnlyView()
+    obj._conv_view = view
+    obj._search_ctrl.SetValue("hello")
+
+    obj._on_search_text(None)
+    obj._on_search_tick(None)
+
+    assert view.scripts == ['_findTextAndJump("hello", 1)']
+
+
+def test_search_fallback_respects_modal_dialog(panel_mod) -> None:
+    panel, windows = panel_mod
+    timer = _FakeTimer()
+    view = _FakeView()
+    obj = _make_search_panel(panel, timer, view)
+    obj._search_async_ok = False
+    obj._search_ctrl.SetValue("hello")
+    obj._on_search_text(None)
+    windows.append(_Dialog(modal=True))
+
+    obj._on_search_tick(None)
+
+    assert view.scripts == []
+    assert obj._search_count_label.label == "1/3"
+
+
+def test_sync_search_fallback_ignores_reentrant_call(panel_mod) -> None:
+    """RunScript pumps the loop; an EVT_TEXT re-entry must not run a second JS."""
+    panel, _windows = panel_mod
+    timer = _FakeTimer()
+    view = _FakeView()
+    obj = _make_search_panel(panel, timer, view)
+    calls: list[str] = []
+
+    def _reentrant_run_script(js: str) -> tuple[bool, str]:
+        calls.append(js)
+        # Simulates _on_search_text arriving from RunScript's wxYield mid-flight.
+        assert obj._run_search_script("nested()") is None
+        obj._on_search_text(None)
+        return True, "1/2"
+
+    view.RunScript = _reentrant_run_script
+    obj._search_ctrl.SetValue("hello")
+
+    result = obj._run_search_script("outer()")
+
+    assert result == (True, "1/2")
+    assert calls == ["outer()"], "the re-entrant call must not reach RunScript"
+    assert obj._search_script_running is False, "the guard must reset in finally"
+
+
+def test_async_zero_hits_writes_zero_and_never_uses_sync(panel_mod) -> None:
+    panel, _windows = panel_mod
+    timer = _FakeTimer()
+    view = _FakeView()
+    obj = _make_search_panel(panel, timer, view)
+    obj._search_ctrl.SetValue("zzznotfound")
+
+    obj._on_search_text(None)
+    obj._on_search_tick(None)
+
+    assert view.scripts == [], "async find must not fall back without a failure"
+    assert view.async_scripts == ['_findTextAndJump("zzznotfound", 1)']
+
+    obj._on_search_message(
+        _ScriptMessage({"kind": "find", "seq": 1, "count": 0, "query": "zzznotfound", "index": 0})
+    )
+    assert obj._search_count_label.label == "0/0"
+
+
+def test_render_reapplies_active_search(panel_mod) -> None:
+    panel, _windows = panel_mod
+    timer = _FakeTimer()
+    view = _FakeView()
+    obj = _make_search_panel(panel, timer, view)
+    obj._search_ctrl.SetValue("hello")
+    obj._on_search_text(None)
+    obj._on_search_tick(None)  # seq 1
+    view.async_scripts.clear()
+
+    obj._update_conversation()
+
+    assert view.scripts and view.scripts[0].startswith("_updateConversation(")
+    assert view.async_scripts == ['_findTextAndJump("hello", 2)']
+
+
+def test_append_reapplies_active_search(panel_mod) -> None:
+    panel, _windows = panel_mod
+    timer = _FakeTimer()
+    view = _FakeView()
+    obj = _make_search_panel(panel, timer, view)
+    obj._search_ctrl.SetValue("hello")
+    obj._on_search_text(None)
+    obj._on_search_tick(None)  # seq 1
+    view.async_scripts.clear()
+
+    obj._append_entry_js({"type": "status", "text": "hi", "color_hex": "#000000"})
+
+    assert view.async_scripts == ['_findTextAndJump("hello", 2)']
+
+
+def test_clear_find_returns_explicit_result() -> None:
+    """An undefined result makes wx log a warning that KiCad shows modally."""
+    source = (Path(_panel_module.__file__).parent / "shell.js").read_text(encoding="utf-8")
+    start = source.index("window._clearFind = function")
+    body = source[start : source.index("\n};", start)]
+    assert "return '0/0';" in body
+
+
+def test_find_text_mark_loop_always_advances() -> None:
+    source = (Path(_panel_module.__file__).parent / "shell.js").read_text(encoding="utf-8")
+    assert "Math.max(1, query.length)" in source
+    assert "idx <= previousIdx" in source
