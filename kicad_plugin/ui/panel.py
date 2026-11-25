@@ -41,8 +41,9 @@ _MODAL_RENDER_POLL_MS = 200
 
 # Find-as-you-type debounce.  EVT_TEXT must not run JS: RunScript pumps the
 # GTK loop and resets GtkEntry's caret (issue #341), and RunScriptAsync avoids
-# both the pump and the modal-dialog abort (#339).
-_SEARCH_DEBOUNCE_MS = 200
+# both the pump and the modal-dialog abort (#339).  400 ms gives the user time
+# to stop typing before a search is issued.
+_SEARCH_DEBOUNCE_MS = 400
 
 
 def _same_project_content(left: dict, right: dict) -> bool:
@@ -484,6 +485,11 @@ if _WX_AVAILABLE:
             # Send timestamps by search sequence number, used to log the
             # async round-trip time.  Bounded: at most 10 outstanding seqs.
             self._search_sent_at: dict[int, float] = {}
+            # A find action deferred while a modal dialog owns the event
+            # loop.  The shared 200 ms replay timer executes it once the
+            # dialog closes; kind is search/next/prev/clear.
+            self._search_pending: bool = False
+            self._search_pending_kind: str = ""
             # Project-scoped session watch: tracks the open KiCad project so
             # switching projects can re-offer that project's saved sessions
             # (same flow as startup auto-restore). Started by _init_llm_client.
@@ -3124,6 +3130,11 @@ if _WX_AVAILABLE:
                 len(self._search_query),
                 self._search_async_ok,
             )
+            if self._blocking_dialog() is not None:
+                self._search_timer.Stop()
+                self._search_query = ""
+                self._defer_search("clear")
+                return
             self._search_ctrl.Show(True)
             self._search_prev_btn.Show(True)
             self._search_next_btn.Show(True)
@@ -3151,6 +3162,10 @@ if _WX_AVAILABLE:
             """Hide search bar and clear highlights."""
             self._search_timer.Stop()
             self._search_query = ""
+            if self._blocking_dialog() is not None:
+                # No JS now; remember only the clear-highlights intent.
+                self._defer_search("clear")
+                return
             self._search_ctrl.Show(False)
             self._search_prev_btn.Show(False)
             self._search_next_btn.Show(False)
@@ -3204,6 +3219,9 @@ if _WX_AVAILABLE:
             if not self._use_webview:
                 self._maybe_log_ui_state("search_tick")
                 return
+            if self._blocking_dialog() is not None:
+                self._defer_search("search" if self._search_query else "clear")
+                return
             if not self._search_query:
                 self._search_count_label.SetLabel("0/0")
                 seq = self._next_search_seq()
@@ -3247,6 +3265,9 @@ if _WX_AVAILABLE:
                 len(self._search_query),
                 self._search_async_ok,
             )
+            if self._blocking_dialog() is not None:
+                self._defer_search("next")
+                return
             if not self._use_webview:
                 return
             seq = self._next_search_seq()
@@ -3266,6 +3287,9 @@ if _WX_AVAILABLE:
                 len(self._search_query),
                 self._search_async_ok,
             )
+            if self._blocking_dialog() is not None:
+                self._defer_search("prev")
+                return
             if not self._use_webview:
                 return
             seq = self._next_search_seq()
@@ -4641,13 +4665,15 @@ if _WX_AVAILABLE:
             """
             if not self._render_pending:
                 # A successful render supersedes anything deferred behind a
-                # modal dialog, so the replay poll has nothing left to do.
+                # modal dialog, so the replay poll has nothing left to do --
+                # unless a search replay is still waiting on the same timer.
                 log.debug(
                     "render: replay skipped — nothing pending (running=%s pending=%s)",
                     self._js_running,
                     self._render_pending,
                 )
-                self._stop_modal_render_replay()
+                if not self._search_pending:
+                    self._stop_modal_render_replay()
                 return
             log.debug(
                 "render: replaying pending render (running=%s pending=%s force=%s replace=%s follow=%s)",
@@ -4695,15 +4721,59 @@ if _WX_AVAILABLE:
             if timer is not None:
                 timer.Stop()
 
+        def _defer_search(self, kind: str) -> None:
+            """Defer a find action until the modal dialog closes (no JS now)."""
+            self._search_pending = True
+            self._search_pending_kind = kind
+            self._schedule_modal_render_replay()
+            log.debug(
+                "search: deferred while modal dialog open (kind=%s, query_len=%d)",
+                kind,
+                len(self._search_query),
+            )
+
+        def _replay_pending_search(self) -> None:
+            """Execute the deferred find action exactly once after the dialog closes."""
+            if not self._search_pending or self._blocking_dialog() is not None:
+                return
+            kind = self._search_pending_kind or "search"
+            self._search_pending = False
+            self._search_pending_kind = ""
+            log.debug(
+                "search: replay after dialog (kind=%s, query_len=%d)",
+                kind,
+                len(self._search_query),
+            )
+            if not self._use_webview:
+                return
+            seq = self._next_search_seq()
+            if kind == "next":
+                js = f"_findNext({seq})"
+            elif kind == "prev":
+                js = f"_findPrev({seq})"
+            elif kind == "clear" or not self._search_query:
+                js = f"_clearFind({seq})"
+            else:
+                js = f"_findTextAndJump({json.dumps(self._search_query)}, {seq})"
+            sent = self._run_search_async(js)
+            log.debug("search: replay sent seq=%d async_sent=%s fallback=%s", seq, sent, not sent)
+            if sent:
+                self._note_search_sent(seq)
+            else:
+                self._apply_search_result(self._run_search_script(js))
+                log.debug("search: result seq=%d sync_fallback=true", seq)
+
         def _on_modal_render_tick(self, event) -> None:
-            """Replay the deferred render once the blocking dialog closes."""
+            """Replay deferred render and search work once the dialog closes."""
             if self._blocking_dialog() is not None:
                 return  # Still blocked; check again on the next tick.
             self._stop_modal_render_replay()
-            if not self._render_pending:
-                return
-            log.info("chat: render replayed after modal closed")
-            self._process_pending_render()
+            if self._render_pending:
+                log.info("chat: render replayed after modal closed")
+                self._process_pending_render()
+            self._replay_pending_search()
+            if not self._render_pending and not self._search_pending:
+                self._stop_modal_render_replay()
 
         # ------------------------------------------------------------------ #
         # Render protocol: single RunScript funnel
