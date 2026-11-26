@@ -69,6 +69,11 @@ const sandbox = {
     // click-to-collapse handler.
     setTimeout: (fn, ms) => setTimeout(fn, ms),
     clearTimeout: (id) => clearTimeout(id),
+    __listeners: {},
+    addEventListener: function(type, fn) {
+        if (!this.__listeners[type]) this.__listeners[type] = [];
+        this.__listeners[type].push(fn);
+    },
     getSelection: function() {
         return dom.window.getSelection ? dom.window.getSelection() : { isCollapsed: true };
     },
@@ -162,7 +167,8 @@ section('7. _clearFind restores text');
 {
     _clearFind();
     _findText('resistor');
-    _clearFind();
+    const clearResult = _clearFind();
+    assert(clearResult === '0/0', '_clearFind returns explicit 0/0: got ' + clearResult);
     const marks = document.querySelectorAll('mark.search-match, mark.search-active');
     assert(marks.length === 0, 'all marks cleared: got ' + marks.length);
     const conv = document.getElementById('conversation');
@@ -209,9 +215,41 @@ section('10. Auto-expand collapsed details on match');
     assert(tool2After.hasAttribute('open'), 'tool_2 should be auto-expanded when match is inside it');
 }
 
+section('11. Script message posts kind/seq/count for async results');
+{
+    sandbox.kcaa = {
+        messages: [],
+        postMessage: function(payload) { this.messages.push(JSON.parse(payload)); },
+    };
+
+    _findTextAndJump('resistor', 7);
+    const msgs = sandbox.kcaa.messages;
+    assert(msgs.length === 1, 'one search should post one message: got ' + msgs.length);
+    assert(msgs[0].kind === 'find', 'payload kind should be find: got ' + msgs[0].kind);
+    assert(msgs[0].seq === 7, 'payload seq should echo the Python sequence: got ' + msgs[0].seq);
+    assert(msgs[0].count === 3, 'payload count should be the match total: got ' + msgs[0].count);
+    assert(msgs[0].query === 'resistor', 'payload query should be the query: got ' + msgs[0].query);
+
+    _findNext(8);
+    assert(msgs.length === 2, 'next should post another message');
+    assert(msgs[1].seq === 8 && msgs[1].count === 3,
+        'next posts the new seq and unchanged total: got ' + JSON.stringify(msgs[1]));
+
+    _clearFind(9);
+    assert(msgs.length === 3, 'clear should post a message');
+    assert(msgs[2].seq === 9 && msgs[2].count === 0,
+        'clear posts seq and zero matches: got ' + JSON.stringify(msgs[2]));
+
+    const noHit = _findTextAndJump('zzznotfound', 10);
+    assert(noHit === '0/0', 'no-match find returns explicit 0/0: got ' + noHit);
+    assert(msgs.length === 4, 'no-match find still posts one message');
+    assert(msgs[3].seq === 10 && msgs[3].count === 0,
+        'no-match posts seq and zero count: got ' + JSON.stringify(msgs[3]));
+}
+
 // ---- Click-to-collapse ----
 (async function() {
-    section('11. Body click collapses an open tool row');
+    section('12. Body click collapses an open tool row');
     {
         const tool1 = document.getElementById('tool_1');
         assert(tool1.hasAttribute('open'), 'tool_1 should start open');
@@ -223,7 +261,7 @@ section('10. Auto-expand collapsed details on match');
         assert(!tool1.hasAttribute('open'), 'tool_1 should be collapsed after a body click');
     }
 
-    section('12. Duplicate details ids: a body click closes only the clicked row');
+    section('13. Duplicate details ids: a body click closes only the clicked row');
     {
         const conv = document.getElementById('conversation');
         // Mimic a session-restore id collision: two rows share one details id.
@@ -239,6 +277,111 @@ section('10. Auto-expand collapsed details on match');
         await new Promise((resolve) => global.setTimeout(resolve, 350));
         assert(firstRow.hasAttribute('open'), 'earlier duplicate-id row must stay open (no wrong-target collapse)');
         assert(!secondRow.hasAttribute('open'), 'clicked later row collapses despite the shared id');
+    }
+
+    section('14. Large match counts stay bounded per visible window');
+    {
+        const conv = document.getElementById('conversation');
+        const saved = conv.innerHTML;
+        let html = '';
+        for (let i = 0; i < 2000; i++) html += '<span>x</span>';
+        conv.innerHTML = html;
+
+        const result = _findText('x');
+        assert(result === '1/2000', 'true total is reported: got ' + result);
+        assert(sandbox.__findTotal === 2000, 'total hits: got ' + sandbox.__findTotal);
+        assert(sandbox.__findMatches.length <= 2000,
+            'marks stay within MAX_MARKS: got ' + sandbox.__findMatches.length);
+
+        const clearResult = _clearFind();
+        assert(clearResult === '0/0', 'clear returns explicit 0/0 after a large search');
+        assert(conv.textContent === 'x'.repeat(2000), 'clearing restores the text losslessly');
+
+        conv.innerHTML = saved;
+        _clearFind();
+    }
+
+    section('15. Only blocks near the viewport are highlighted');
+    {
+        const conv = document.getElementById('conversation');
+        const saved = conv.innerHTML;
+        const savedHeight = sandbox.innerHeight;
+        const savedScrollY = sandbox.scrollY;
+        conv.innerHTML = '';
+        for (let i = 0; i < 6; i++) {
+            const block = document.createElement('span');
+            block.textContent = 'needle';
+            block.__rect = { top: i * 1000, bottom: i * 1000 + 900, height: 900 };
+            block.getBoundingClientRect = function() { return this.__rect; };
+            conv.appendChild(block);
+        }
+        sandbox.innerHeight = 100;
+        sandbox.scrollY = 0;
+
+        const result = _findText('needle');
+        assert(result === '1/6', 'off-screen hits still count: got ' + result);
+        const blocks = Array.from(conv.children);
+        assert(blocks[0].querySelectorAll('mark.search-match').length === 1,
+            'visible block is marked');
+        assert(blocks[1].querySelectorAll('mark.search-match').length === 0,
+            'block more than two screens below is not marked');
+
+        sandbox.scrollY = 2000;
+        (sandbox.__listeners.scroll || []).forEach((fn) => fn());
+        await new Promise((resolve) => global.setTimeout(resolve, 220));
+
+        assert(blocks[1].querySelectorAll('mark.search-match').length === 1,
+            'scrolling marks the newly visible block');
+        assert(blocks[2].querySelectorAll('mark.search-match').length === 1,
+            'second-screen block marked after scroll');
+        assert(blocks[3].querySelectorAll('mark.search-match').length === 0,
+            'block beyond the window stays unmarked');
+
+        sandbox.innerHeight = savedHeight;
+        sandbox.scrollY = savedScrollY;
+        conv.innerHTML = saved;
+        _clearFind();
+    }
+
+    section('16. Clearing normalizes once per parent and is lossless');
+    {
+        const conv = document.getElementById('conversation');
+        const saved = conv.innerHTML;
+        conv.innerHTML = '';
+        for (let i = 0; i < 50; i++) {
+            const block = document.createElement('span');
+            block.textContent = 'aaa aaa aaa';
+            conv.appendChild(block);
+        }
+        const before = conv.textContent;
+
+        const NodeProto = dom.window.Node.prototype;
+        const originalNormalize = NodeProto.normalize;
+        let normalizeCalls = 0;
+        const parents = new Set();
+        NodeProto.normalize = function() {
+            normalizeCalls++;
+            parents.add(this);
+            return originalNormalize.call(this);
+        };
+        try {
+            _findText('aaa');
+            assert(sandbox.__findMatches.length === 150,
+                'three marks per block: got ' + sandbox.__findMatches.length);
+            _clearFind();
+            assert(normalizeCalls <= parents.size,
+                'one normalize per parent: ' + normalizeCalls + ' calls for ' + parents.size + ' parents');
+
+            _findText('zzznotfound');
+            _clearFind();
+            assert(normalizeCalls <= parents.size * 2,
+                'no per-mark normalize: ' + normalizeCalls + ' calls for ' + parents.size + ' parents');
+            assert(conv.textContent === before, 'conversation text is unchanged after clearing');
+        } finally {
+            NodeProto.normalize = originalNormalize;
+            conv.innerHTML = saved;
+            _clearFind();
+        }
     }
 
     // ---- Summary ----

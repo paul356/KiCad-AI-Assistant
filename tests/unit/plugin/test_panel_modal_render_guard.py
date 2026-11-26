@@ -1,0 +1,1824 @@
+"""Regression tests for issue #339: renders during a modal dialog.
+
+``wxWebView::RunScript`` pumps the wx event loop.  While a KiCad modal or
+quasi-modal (``ShowQuasiModal``) dialog owns a nested loop, that pump runs
+inside the dialog's loop, WebKit creates a JS context and GTK aborts the
+process.  The panel must therefore defer conversation renders while such a
+dialog is open and replay them once it closes.
+
+The panel cannot be instantiated without wx, so the pure blocker predicate is
+tested directly and the render protocol is exercised on an ``object.__new__``
+instance of the real class, imported with a permissive fake ``wx`` module
+(same technique as ``test_panel_icons.py``).
+"""
+
+from __future__ import annotations
+
+import ast
+import collections
+import importlib
+import json
+from pathlib import Path
+import sys
+import threading
+import time
+import types
+from types import SimpleNamespace
+from unittest import mock
+
+import pytest
+
+import kicad_plugin.ui.panel as _panel_module
+from kicad_plugin.ui.panel import _render_blocking_window
+
+
+class _Window:
+    """Non-dialog top-level window (frame/panel)."""
+
+    def __init__(self, *, shown: bool = True, enabled: bool = True) -> None:
+        self._shown = shown
+        self._enabled = enabled
+
+    def IsShown(self) -> bool:
+        return self._shown
+
+    def IsEnabled(self) -> bool:
+        return self._enabled
+
+
+class _Dialog(_Window):
+    """Dialog-like window: ``IsModal``/``ShowModal`` mark the wx type."""
+
+    def __init__(
+        self,
+        *,
+        shown: bool = True,
+        enabled: bool = True,
+        modal: bool = True,
+        parent: object | None = None,
+    ) -> None:
+        super().__init__(shown=shown, enabled=enabled)
+        self._modal = modal
+        self._parent = parent
+
+    def IsModal(self) -> bool:
+        return self._modal
+
+    def ShowModal(self) -> int:
+        return 0
+
+    def GetParent(self) -> object | None:
+        return self._parent
+
+
+def _not_plugin(_window: object) -> bool:
+    return False
+
+
+# --------------------------------------------------------------------------- #
+# Pure blocking predicate
+# --------------------------------------------------------------------------- #
+
+
+def test_empty_window_list_does_not_block() -> None:
+    assert _render_blocking_window([], _not_plugin) is None
+
+
+def test_shown_modal_dialog_blocks() -> None:
+    dialog = _Dialog(modal=True)
+    assert _render_blocking_window([dialog], _not_plugin) is dialog
+
+
+def test_hidden_dialog_does_not_block() -> None:
+    assert _render_blocking_window([_Dialog(shown=False)], _not_plugin) is None
+
+
+def test_non_dialog_top_level_window_does_not_block() -> None:
+    assert _render_blocking_window([_Window()], _not_plugin) is None
+
+
+def test_plugin_window_does_not_block_by_itself() -> None:
+    panel = _Window(shown=True, enabled=True)
+    assert _render_blocking_window([panel], lambda w: w is panel) is None
+
+
+def test_quasi_modal_blocks_through_disabled_plugin_window() -> None:
+    """A truly modal dialog disables other top-level windows; ours blocks."""
+    quasi = _Dialog(modal=False)
+    plugin = _Window(shown=True, enabled=False)
+    assert _render_blocking_window([quasi, plugin], lambda w: w is plugin) is plugin
+
+
+def test_quasi_modal_blocks_through_disabled_dialog_parent() -> None:
+    """Issue #339: ShowQuasiModal disables only the dialog's parent."""
+    editor = _Window(shown=True, enabled=False)
+    quasi = _Dialog(modal=False, parent=editor)
+    plugin = _Window(shown=True, enabled=True)
+    assert _render_blocking_window([quasi, plugin], lambda w: w is plugin) is quasi
+
+
+def test_non_modal_dialog_with_enabled_parent_does_not_block() -> None:
+    dialog = _Dialog(modal=False, parent=_Window(shown=True, enabled=True))
+    assert _render_blocking_window([dialog], _not_plugin) is None
+
+
+def test_hidden_quasi_modal_dialog_does_not_block() -> None:
+    dialog = _Dialog(shown=False, modal=False, parent=_Window(enabled=False))
+    assert _render_blocking_window([dialog], _not_plugin) is None
+
+
+def test_non_modal_dialog_without_parent_does_not_block() -> None:
+    """No disabled parent means no observable nested loop; stay conservative."""
+    assert _render_blocking_window([_Dialog(modal=False, parent=None)], _not_plugin) is None
+
+
+def test_disabled_non_plugin_window_does_not_block() -> None:
+    """The disabled-window signal is only meaningful for our own windows."""
+    assert _render_blocking_window([_Window(enabled=False)], _not_plugin) is None
+
+
+def test_window_that_vanishes_during_probe_is_ignored() -> None:
+    """A destroyed wx window raises on probing; the scan must continue."""
+
+    class _Vanishing(_Window):
+        def IsShown(self) -> bool:
+            raise RuntimeError("window destroyed")
+
+    dialog = _Dialog(modal=True)
+    assert _render_blocking_window([_Vanishing(), dialog], _not_plugin) is dialog
+
+
+# --------------------------------------------------------------------------- #
+# Render protocol with a fake wx
+# --------------------------------------------------------------------------- #
+
+
+class _Dummy:
+    def __init__(self, *args, **kwargs) -> None:
+        pass
+
+
+class _FakeColour:
+    def __init__(self, *args, **kwargs) -> None:
+        pass
+
+
+class _FakeView:
+    def __init__(self) -> None:
+        self.scripts: list[str] = []
+        self.async_scripts: list[str] = []
+        self.diag_scripts: list[str] = []
+
+    def RunScript(self, js: str) -> tuple[bool, str]:
+        self.scripts.append(js)
+        return True, "ok"
+
+    def RunScriptAsync(self, js: str) -> bool:
+        if "conversationChildren" in js:
+            self.diag_scripts.append(js)
+        else:
+            self.async_scripts.append(js)
+        return True
+
+    def SetFocus(self) -> None:
+        pass
+
+
+class _SyncOnlyView:
+    """Old webkit1 backend: no RunScriptAsync."""
+
+    def __init__(self) -> None:
+        self.scripts: list[str] = []
+
+    def RunScript(self, js: str) -> tuple[bool, str]:
+        self.scripts.append(js)
+        return True, "ok"
+
+    def SetFocus(self) -> None:
+        pass
+
+
+class _ScriptMessage:
+    def __init__(self, payload) -> None:
+        self._payload = payload if isinstance(payload, str) else json.dumps(payload)
+
+    def GetString(self) -> str:
+        return self._payload
+
+
+class _FakeControl:
+    def __init__(self, value: str = "") -> None:
+        self.value = value
+        self.shown = True
+
+    def Show(self, flag: bool) -> None:
+        self.shown = flag
+
+    def SetFocus(self) -> None:
+        pass
+
+    def SetValue(self, value: str) -> None:
+        self.value = value
+
+    def GetValue(self) -> str:
+        return self.value
+
+
+class _FakeLabel:
+    def __init__(self, label: str = "1/1") -> None:
+        self.label = label
+        self.shown = True
+
+    def Show(self, flag: bool) -> None:
+        self.shown = flag
+
+    def SetLabel(self, label: str) -> None:
+        self.label = label
+
+
+class _FakeTimer:
+    def __init__(self) -> None:
+        self.running = False
+        self.starts: list[int] = []
+        self.stops = 0
+
+    def Start(self, milliseconds: int, oneShot: bool = False) -> None:
+        self.running = True
+        self.starts.append(milliseconds)
+
+    def Stop(self) -> None:
+        self.running = False
+        self.stops += 1
+
+    def IsRunning(self) -> bool:
+        return self.running
+
+
+class _DestroyEvent:
+    def __init__(self, source: object) -> None:
+        self._source = source
+        self.skipped = False
+
+    def GetEventObject(self) -> object:
+        return self._source
+
+    def Skip(self) -> None:
+        self.skipped = True
+
+
+class _CloseEvent:
+    def __init__(self, can_veto: bool = True) -> None:
+        self._can_veto = can_veto
+        self.vetoed = False
+
+    def CanVeto(self) -> bool:
+        return self._can_veto
+
+    def Veto(self) -> None:
+        self.vetoed = True
+
+
+def _build_fake_wx(windows: list[object]) -> types.ModuleType:
+    fake_wx = types.ModuleType("wx")
+    fake_wx.Frame = _Dummy
+    fake_wx.FileDropTarget = _Dummy
+    fake_wx.Colour = _FakeColour
+    fake_wx.GetTopLevelWindows = lambda: list(windows)
+    # Replay runs synchronously so the test observes the render it triggers.
+    fake_wx.CallAfter = lambda callback, *args, **kwargs: callback(*args, **kwargs)
+    fake_wx.html = types.ModuleType("wx.html")
+    fake_wx.html2 = types.ModuleType("wx.html2")
+    fake_wx.__getattr__ = lambda name: _Dummy
+    return fake_wx
+
+
+@pytest.fixture
+def panel_mod():
+    """Import panel.py with a fake wx whose top-level-window list is mutable."""
+    windows: list[object] = []
+    fake_wx = _build_fake_wx(windows)
+    module_names = ("wx", "wx.html", "wx.html2", "kicad_plugin.ui.panel")
+    missing = object()
+    saved_modules = {name: sys.modules.get(name, missing) for name in module_names}
+    ui_pkg = sys.modules.get("kicad_plugin.ui")
+    saved_panel_attr = getattr(ui_pkg, "panel", None) if ui_pkg is not None else None
+    try:
+        sys.modules["wx"] = fake_wx
+        sys.modules["wx.html"] = fake_wx.html
+        sys.modules["wx.html2"] = fake_wx.html2
+        sys.modules.pop("kicad_plugin.ui.panel", None)
+        panel = importlib.import_module("kicad_plugin.ui.panel")
+        yield panel, windows
+    finally:
+        for name, previous in saved_modules.items():
+            if previous is missing:
+                sys.modules.pop(name, None)
+            else:
+                sys.modules[name] = previous  # type: ignore[assignment]
+        current_ui_pkg = sys.modules.get("kicad_plugin.ui")
+        if current_ui_pkg is not None:
+            if saved_panel_attr is None:
+                current_ui_pkg.__dict__.pop("panel", None)
+            else:
+                current_ui_pkg.panel = saved_panel_attr  # type: ignore[attr-defined]
+
+
+_USER_JS_START = ";var r=null;var e=null;try{r=(function(){"
+_USER_JS_END = "})();}catch(x)"
+
+
+def _user_js(script: str) -> str:
+    """Return the USER_JS body wrapped by _dispatch_render (either mode)."""
+    start = script.index(_USER_JS_START) + len(_USER_JS_START)
+    return script[start : script.index(_USER_JS_END, start)].strip()
+
+
+def _expression_js(script: str) -> str:
+    """Return the user expression of an expression-mode wrapper."""
+    body = _user_js(script)
+    prefix, suffix = "return (", ");"
+    assert body.startswith(prefix) and body.endswith(suffix), body
+    return body[len(prefix) : -len(suffix)].strip()
+
+
+def _seq_of(script: str) -> int:
+    """Return the sequence number of a wrapped dispatch script."""
+    marker = "var s="
+    start = script.index(marker) + len(marker)
+    return int(script[start : script.index(";", start)])
+
+
+def _reply(obj, seq: int, *, ok: bool = True, result=None, error=None) -> None:
+    obj._on_script_message(
+        _ScriptMessage({"kind": "exec", "seq": seq, "ok": ok, "result": result, "error": error})
+    )
+
+
+def _make_panel(panel, timer: _FakeTimer, view: _FakeView) -> object:
+    obj = object.__new__(panel.AssistantPanel)
+    obj._use_webview = True
+    obj._js_running = False
+    obj._render_pending = False
+    obj._pending_force_scroll_to_bottom = False
+    obj._pending_replace = False
+    obj._pending_follow = False
+    obj._shell_loaded = True
+    obj._page_loading = False
+    obj._conv_entries = []
+    obj._stream_wrapper_visible = False
+    obj._modal_render_timer = timer
+    obj._search_timer = _FakeTimer()
+    obj._search_query = ""
+    obj._search_seq = 0
+    obj._script_channel_ok = True
+    obj._script_seq = 0
+    obj._script_requests = {}
+    obj._script_timeout_timer = _FakeTimer()
+    obj._shell_probe_timer = _FakeTimer()
+    obj._shell_probe_attempts = 0
+    obj._shell_probe_timeouts = 0
+    obj._page_generation = 0
+    obj._page_watchdog = _FakeTimer()
+    obj._event_gen = 0
+    obj._stream_delta_chars = 0
+    obj._stream_events = collections.deque()
+    obj._conv_version = 0
+    obj._search_script_running = False
+    obj._last_diag_ts = 0.0
+    obj._search_sent_at = {}
+    obj._search_pending = False
+    obj._search_pending_kind = ""
+    obj._conv_view = view
+    return obj
+
+
+def _plugin_window(panel, *, shown: bool = True, enabled: bool = True) -> object:
+    window = object.__new__(panel.AssistantPanel)
+    window.IsShown = lambda: shown
+    window.IsEnabled = lambda: enabled
+    return window
+
+
+def _make_search_panel(panel, timer: _FakeTimer, view: _FakeView) -> object:
+    obj = _make_panel(panel, timer, view)
+    obj._search_ctrl = _FakeControl("needle")
+    obj._search_prev_btn = _FakeControl()
+    obj._search_next_btn = _FakeControl()
+    obj._search_close_btn = _FakeControl()
+    obj._search_count_label = _FakeLabel("1/3")
+    obj._ui_panel = SimpleNamespace(Layout=lambda: None)
+    return obj
+
+
+def test_modal_dialog_defers_render_and_replays_after_close(panel_mod) -> None:
+    panel, windows = panel_mod
+    timer = _FakeTimer()
+    view = _FakeView()
+    obj = _make_panel(panel, timer, view)
+    windows.append(_Dialog(modal=True))
+
+    obj._update_conversation(force_scroll_to_bottom=True, replace=True, follow=True)
+
+    assert view.scripts == [], "RunScript must not run inside the dialog's loop"
+    assert obj._render_pending is True
+    assert obj._pending_force_scroll_to_bottom is True
+    assert obj._pending_replace is True
+    assert obj._pending_follow is True
+    assert timer.running is True
+    assert timer.starts == [_panel_module._MODAL_RENDER_POLL_MS]
+
+    # Another blocked render must not stack additional timer starts.
+    obj._update_conversation(force_scroll_to_bottom=True, replace=True, follow=True)
+    assert timer.starts == [_panel_module._MODAL_RENDER_POLL_MS]
+
+    # Dialog still open: the tick leaves the render deferred.
+    obj._on_modal_render_tick(None)
+    assert view.scripts == []
+    assert obj._render_pending is True
+    assert timer.running is True
+
+    # Dialog closed: exactly one replay through the normal render path.
+    windows.clear()
+    obj._on_modal_render_tick(None)
+
+    assert view.scripts == [], "renders never use the synchronous RunScript"
+    assert len(view.async_scripts) == 1
+    js = _expression_js(view.async_scripts[0])
+    assert js.startswith("_updateConversation(")
+    assert '"bottom"' in js
+    assert js.endswith(", true)")
+    assert obj._render_pending is False
+    assert timer.running is False
+
+
+def test_quasi_modal_defers_render_with_enabled_plugin_window(panel_mod) -> None:
+    """Issue #339 scenario: only the PCB editor is disabled, panel stays enabled."""
+    panel, windows = panel_mod
+    timer = _FakeTimer()
+    view = _FakeView()
+    obj = _make_panel(panel, timer, view)
+    editor = _Window(shown=True, enabled=False)
+    windows.extend(
+        [
+            _Dialog(modal=False, parent=editor),
+            _plugin_window(panel, shown=True, enabled=True),
+        ]
+    )
+
+    obj._update_conversation(force_scroll_to_bottom=True)
+
+    assert view.scripts == [], "RunScript must not run inside the quasi-modal loop"
+    assert obj._render_pending is True
+    assert obj._pending_force_scroll_to_bottom is True
+    assert timer.running is True
+
+
+def test_probe_script_still_respects_modal_gate(panel_mod) -> None:
+    """A probe skips the shell-loaded gate, never the dialog gate."""
+    panel, windows = panel_mod
+    timer = _FakeTimer()
+    view = _FakeView()
+    obj = _make_panel(panel, timer, view)
+    obj._shell_loaded = False
+    windows.append(_Dialog(modal=True))
+
+    dispatched = obj._dispatch_render("1 + 1", kind=_panel_module._SCRIPT_KIND_PROBE, label="probe")
+
+    assert dispatched is False
+    assert view.scripts == [], "RunScript must not run inside the dialog loop"
+    assert view.async_scripts == []
+    assert obj._js_running is False
+    assert obj._script_requests == {}
+
+
+def test_shell_probe_defers_while_modal_open(panel_mod) -> None:
+    panel, _windows = panel_mod
+    timer = _FakeTimer()
+    view = _FakeView()
+    obj = _make_panel(panel, timer, view)
+    obj._shell_loaded = False
+
+    with (
+        mock.patch.object(obj, "_blocking_dialog", return_value=object()) as blocking,
+        mock.patch.object(obj, "_schedule_modal_render_replay") as schedule,
+    ):
+        obj._request_shell_probe()
+
+    assert blocking.called
+    assert view.scripts == [], "no probe may run behind a dialog"
+    assert view.async_scripts == []
+    assert obj._render_pending is True
+    schedule.assert_called_once()
+
+
+def test_shell_probe_is_async_and_non_destructive(panel_mod) -> None:
+    panel, _windows = panel_mod
+    timer = _FakeTimer()
+    view = _FakeView()
+    obj = _make_panel(panel, timer, view)
+    obj._shell_loaded = False
+    obj._conv_entries = []
+    obj._render_pending = False
+
+    obj._request_shell_probe()
+
+    assert view.scripts == [], "the probe must never run synchronously"
+    assert len(view.async_scripts) == 1
+    probe = _expression_js(view.async_scripts[0])
+    assert "_updateConversation('[]'" not in probe
+    assert "document.getElementById('conversation')" in probe
+    assert "_updateConversation" in probe
+    assert probe.startswith("JSON.stringify("), "the probe reports a JSON string"
+    assert obj._js_running is False, "probes never take the render lock"
+
+    seq = _seq_of(view.async_scripts[0])
+    _reply(obj, seq, result={"conv": True, "js": True, "font": "Arial"})
+
+    assert obj._shell_loaded is True
+    assert obj._js_running is False
+    assert obj._script_requests == {}
+    assert obj._render_pending is False
+
+
+def test_replay_timer_stops_when_nothing_is_pending(panel_mod) -> None:
+    panel, _windows = panel_mod
+    timer = _FakeTimer()
+    obj = _make_panel(panel, timer, _FakeView())
+    timer.Start(_panel_module._MODAL_RENDER_POLL_MS)
+
+    obj._process_pending_render()
+
+    assert timer.running is False
+
+
+def test_destroy_stops_replay_timer(panel_mod) -> None:
+    panel, _windows = panel_mod
+    timer = _FakeTimer()
+    obj = _make_panel(panel, timer, _FakeView())
+    obj._update_cancel_event = None
+    obj._update_progress_timer = None
+    obj._project_watch_timer = None
+    obj._finalise_and_save_on_teardown = lambda: None
+    obj._server_mgr = SimpleNamespace(stop=lambda: None)
+    timer.Start(_panel_module._MODAL_RENDER_POLL_MS)
+    event = _DestroyEvent(obj)
+
+    obj._on_destroy(event)
+
+    assert timer.running is False
+    assert event.skipped is True
+
+
+def test_close_stops_replay_timer(panel_mod) -> None:
+    panel, _windows = panel_mod
+    timer = _FakeTimer()
+    obj = _make_panel(panel, timer, _FakeView())
+    obj.Hide = lambda: None
+    timer.Start(_panel_module._MODAL_RENDER_POLL_MS)
+    event = _CloseEvent(can_veto=True)
+
+    obj._on_close(event)
+
+    assert event.vetoed is True
+    assert timer.running is False
+
+
+# --------------------------------------------------------------------------- #
+# Search: async RunScriptAsync + script messages (no sync RunScript, no gate)
+# --------------------------------------------------------------------------- #
+
+_ASYNC_SEARCH_CASES = [
+    ("_on_find", "_clearFind(1)"),
+    ("_on_search_close", "_clearFind(1)"),
+    ("_on_search_next", "_findNext(1)"),
+    ("_on_search_prev", "_findPrev(1)"),
+]
+
+
+@pytest.mark.parametrize(("handler", "expected_js"), _ASYNC_SEARCH_CASES)
+def test_search_script_runs_async(panel_mod, handler, expected_js) -> None:
+    panel, _windows = panel_mod
+    timer = _FakeTimer()
+    view = _FakeView()
+    obj = _make_search_panel(panel, timer, view)
+
+    getattr(obj, handler)(None)
+
+    assert view.scripts == [], "search must not use synchronous RunScript"
+    assert view.async_scripts == [expected_js]
+
+
+@pytest.mark.parametrize(
+    ("handler", "kind"),
+    [
+        ("_on_find", "clear"),
+        ("_on_search_close", "clear"),
+        ("_on_search_next", "next"),
+        ("_on_search_prev", "prev"),
+    ],
+)
+def test_search_defers_while_modal_dialog(panel_mod, handler, kind) -> None:
+    """No JS at all while a dialog owns the loop; the intent is remembered."""
+    panel, windows = panel_mod
+    timer = _FakeTimer()
+    view = _FakeView()
+    obj = _make_search_panel(panel, timer, view)
+    obj._script_channel_ok = False
+    obj._search_ctrl.SetValue("hello")
+    label_before = obj._search_count_label.label
+    windows.append(_Dialog(modal=True))
+
+    getattr(obj, handler)(None)
+
+    assert view.scripts == []
+    assert view.async_scripts == []
+    assert view.diag_scripts == [], "deferral must not even probe the page"
+    assert obj._search_pending is True
+    assert obj._search_pending_kind == kind
+    assert obj._search_count_label.label == label_before, (
+        "a deferred search must not touch the count"
+    )
+    assert timer.running is True, "the shared replay timer must be armed"
+
+
+def test_search_text_debounces_to_one_async_find(panel_mod) -> None:
+    panel, _windows = panel_mod
+    timer = _FakeTimer()
+    view = _FakeView()
+    obj = _make_search_panel(panel, timer, view)
+
+    for text in ("h", "he", "hel", "hello"):
+        obj._search_ctrl.SetValue(text)
+        obj._on_search_text(None)
+        assert view.scripts == []
+        assert view.async_scripts == []
+
+    assert obj._search_timer.starts == [_panel_module._SEARCH_DEBOUNCE_MS] * 4
+    assert obj._search_query == "hello"
+    assert obj._search_seq == 0
+
+    obj._on_search_tick(None)
+
+    assert view.scripts == []
+    assert view.async_scripts == ['_findTextAndJump("hello", 1)']
+    assert obj._search_seq == 1
+    assert obj._search_timer.running is False
+
+
+def test_search_tick_defers_while_modal_open(panel_mod) -> None:
+    panel, windows = panel_mod
+    timer = _FakeTimer()
+    view = _FakeView()
+    obj = _make_search_panel(panel, timer, view)
+    obj._script_channel_ok = False
+    obj._search_ctrl.SetValue("hello")
+    obj._on_search_text(None)
+    label_before = obj._search_count_label.label
+    windows.append(_Dialog(modal=True))
+
+    obj._on_search_tick(None)
+
+    assert view.scripts == []
+    assert view.async_scripts == []
+    assert view.diag_scripts == []
+    assert obj._search_pending is True
+    assert obj._search_pending_kind == "search"
+    assert obj._search_count_label.label == label_before
+
+
+def test_search_replays_latest_query_once_after_modal_closes(panel_mod) -> None:
+    panel, windows = panel_mod
+    timer = _FakeTimer()
+    view = _FakeView()
+    obj = _make_search_panel(panel, timer, view)
+    obj._script_channel_ok = False
+    windows.append(_Dialog(modal=True))
+
+    for text in ("h", "he", "hel", "hello"):
+        obj._search_ctrl.SetValue(text)
+        obj._on_search_text(None)
+        obj._on_search_tick(None)
+        assert view.scripts == []
+        assert view.async_scripts == []
+
+    assert obj._search_pending is True
+    assert obj._search_pending_kind == "search"
+
+    windows.clear()
+    obj._script_channel_ok = True
+    obj._on_modal_render_tick(None)
+
+    assert view.async_scripts == ['_findTextAndJump("hello", 5)']
+    assert obj._search_pending is False
+    assert obj._search_pending_kind == ""
+    assert obj._modal_render_timer.running is False
+
+
+def test_search_close_deferred_replays_clear_only(panel_mod) -> None:
+    panel, windows = panel_mod
+    timer = _FakeTimer()
+    view = _FakeView()
+    obj = _make_search_panel(panel, timer, view)
+    obj._script_channel_ok = False
+    obj._search_ctrl.SetValue("hello")
+    obj._on_search_text(None)
+    label_before = obj._search_count_label.label
+    windows.append(_Dialog(modal=True))
+
+    obj._on_search_close(None)
+
+    assert view.scripts == []
+    assert view.async_scripts == []
+    assert obj._search_pending is True
+    assert obj._search_pending_kind == "clear"
+    assert obj._search_count_label.label == label_before
+
+    windows.clear()
+    obj._script_channel_ok = True
+    obj._on_modal_render_tick(None)
+
+    assert view.async_scripts == ["_clearFind(2)"], "close replays a clear, never a find"
+    assert obj._search_pending is False
+    assert obj._modal_render_timer.running is False
+
+
+def test_search_debounce_waits_for_typing_pause() -> None:
+    assert _panel_module._SEARCH_DEBOUNCE_MS == 750
+
+
+def test_search_message_updates_count_label(panel_mod) -> None:
+    panel, _windows = panel_mod
+    timer = _FakeTimer()
+    view = _FakeView()
+    obj = _make_search_panel(panel, timer, view)
+    obj._search_ctrl.SetValue("hello")
+    obj._on_search_text(None)
+    obj._on_search_tick(None)
+
+    obj._on_script_message(
+        _ScriptMessage({"kind": "find", "seq": 1, "count": 3, "query": "hello", "index": 2})
+    )
+
+    assert obj._search_count_label.label == "2/3"
+
+
+def test_search_message_uses_total_count_and_logs_marked(panel_mod) -> None:
+    panel, _windows = panel_mod
+    timer = _FakeTimer()
+    view = _FakeView()
+    obj = _make_search_panel(panel, timer, view)
+
+    with mock.patch.object(panel.log, "debug") as debug:
+        obj._on_script_message(
+            _ScriptMessage(
+                {
+                    "kind": "find",
+                    "seq": 1,
+                    "count": 56409,
+                    "marked": 1200,
+                    "query": "o",
+                    "index": 1,
+                }
+            )
+        )
+
+    assert obj._search_count_label.label == "1/56409", "the label uses the true total"
+    debug.assert_any_call(
+        "search: result seq=%d count=%d index=%d marked=%d rtt_ms=unknown",
+        1,
+        56409,
+        1,
+        1200,
+    )
+
+
+def test_stale_search_message_is_ignored(panel_mod) -> None:
+    panel, _windows = panel_mod
+    timer = _FakeTimer()
+    view = _FakeView()
+    obj = _make_search_panel(panel, timer, view)
+    obj._search_ctrl.SetValue("hello")
+    obj._on_search_text(None)
+    obj._on_search_tick(None)  # seq 1
+    obj._on_search_text(None)
+    obj._on_search_tick(None)  # seq 2
+
+    obj._on_script_message(
+        _ScriptMessage({"kind": "find", "seq": 1, "count": 9, "query": "hello", "index": 1})
+    )
+    assert obj._search_count_label.label == "1/3", "stale seq must not overwrite"
+
+    obj._on_script_message(
+        _ScriptMessage({"kind": "find", "seq": 2, "count": 4, "query": "hello", "index": 3})
+    )
+    assert obj._search_count_label.label == "3/4"
+
+
+def test_malformed_search_message_is_ignored(panel_mod) -> None:
+    panel, _windows = panel_mod
+    timer = _FakeTimer()
+    view = _FakeView()
+    obj = _make_search_panel(panel, timer, view)
+
+    obj._on_script_message(_ScriptMessage("not json"))
+    obj._on_script_message(_ScriptMessage({"kind": "find", "seq": "bad"}))
+    obj._on_script_message(_ScriptMessage({"kind": "other", "seq": 1}))
+
+    assert obj._search_count_label.label == "1/3"
+
+
+def test_empty_query_clears_asynchronously(panel_mod) -> None:
+    panel, _windows = panel_mod
+    timer = _FakeTimer()
+    view = _FakeView()
+    obj = _make_search_panel(panel, timer, view)
+    obj._search_ctrl.SetValue("")
+
+    obj._on_search_text(None)
+    obj._on_search_tick(None)
+
+    assert view.scripts == []
+    assert view.async_scripts == ["_clearFind(1)"]
+
+    obj._on_script_message(
+        _ScriptMessage({"kind": "find", "seq": 1, "count": 0, "query": "", "index": 0})
+    )
+    assert obj._search_count_label.label == "0/0"
+
+
+def test_search_close_stops_debounce_timer(panel_mod) -> None:
+    panel, _windows = panel_mod
+    timer = _FakeTimer()
+    view = _FakeView()
+    obj = _make_search_panel(panel, timer, view)
+    obj._search_ctrl.SetValue("hello")
+    obj._on_search_text(None)
+    assert obj._search_timer.running is True
+
+    obj._on_search_close(None)
+
+    assert obj._search_timer.running is False
+    assert view.scripts == []
+    assert view.async_scripts == ["_clearFind(1)"]
+
+
+def test_destroy_stops_search_debounce_timer(panel_mod) -> None:
+    panel, _windows = panel_mod
+    timer = _FakeTimer()
+    view = _FakeView()
+    obj = _make_search_panel(panel, timer, view)
+    obj._update_cancel_event = None
+    obj._update_progress_timer = None
+    obj._project_watch_timer = None
+    obj._finalise_and_save_on_teardown = lambda: None
+    obj._server_mgr = SimpleNamespace(stop=lambda: None)
+    obj._search_ctrl.SetValue("hello")
+    obj._on_search_text(None)
+    assert obj._search_timer.running is True
+
+    obj._on_destroy(_DestroyEvent(obj))
+
+    assert obj._search_timer.running is False
+
+
+# ---- Fallback when script messages / RunScriptAsync are unavailable ----
+
+
+def test_search_falls_back_to_sync_when_async_disabled(panel_mod) -> None:
+    panel, _windows = panel_mod
+    timer = _FakeTimer()
+    view = _FakeView()
+    obj = _make_search_panel(panel, timer, view)
+    obj._script_channel_ok = False
+    obj._search_ctrl.SetValue("hello")
+
+    obj._on_search_text(None)
+    obj._on_search_tick(None)
+
+    assert view.async_scripts == []
+    assert view.scripts == ['_findTextAndJump("hello", 1)']
+    assert obj._search_count_label.label == "ok"
+
+
+def test_search_falls_back_when_view_lacks_run_script_async(panel_mod) -> None:
+    panel, _windows = panel_mod
+    timer = _FakeTimer()
+    obj = _make_search_panel(panel, timer, _FakeView())
+    view = _SyncOnlyView()
+    obj._conv_view = view
+    obj._search_ctrl.SetValue("hello")
+
+    obj._on_search_text(None)
+    obj._on_search_tick(None)
+
+    assert view.scripts == ['_findTextAndJump("hello", 1)']
+
+
+def test_search_fallback_defers_then_runs_sync_after_modal(panel_mod) -> None:
+    panel, windows = panel_mod
+    timer = _FakeTimer()
+    view = _FakeView()
+    obj = _make_search_panel(panel, timer, view)
+    obj._script_channel_ok = False
+    obj._search_ctrl.SetValue("hello")
+    obj._on_search_text(None)
+    windows.append(_Dialog(modal=True))
+
+    obj._on_search_tick(None)
+
+    assert view.scripts == []
+    assert view.async_scripts == []
+    assert obj._search_pending is True
+
+    windows.clear()
+    obj._on_modal_render_tick(None)
+
+    assert view.scripts == ['_findTextAndJump("hello", 2)']
+    assert obj._search_count_label.label == "ok"
+
+
+def test_execute_find_is_the_only_dispatch_point(panel_mod) -> None:
+    panel, _windows = panel_mod
+
+    def _tick(obj, view):
+        obj._search_ctrl.SetValue("hello")
+        obj._on_search_text(None)
+        obj._on_search_tick(None)
+
+    def _restore(obj, view):
+        obj._search_query = "hello"
+        obj._restore_search_after_render()
+
+    scenarios = [
+        ("tick", _tick),
+        ("next", lambda obj, view: obj._on_search_next(None)),
+        ("prev", lambda obj, view: obj._on_search_prev(None)),
+        ("find", lambda obj, view: obj._on_find(None)),
+        ("close", lambda obj, view: obj._on_search_close(None)),
+        ("restore", _restore),
+    ]
+    for name, run in scenarios:
+        timer = _FakeTimer()
+        view = _FakeView()
+        obj = _make_search_panel(panel, timer, view)
+
+        run(obj, view)
+
+        total = len(view.scripts) + len(view.async_scripts)
+        assert total == 1, f"{name}: find JS must be dispatched exactly once, got {total}"
+        assert len(view.async_scripts) == 1, f"{name}: async channel is preferred"
+
+
+def test_run_script_async_exception_runs_one_sync_fallback(panel_mod) -> None:
+    panel, _windows = panel_mod
+    timer = _FakeTimer()
+
+    class _RaisingView(_FakeView):
+        def __init__(self):
+            super().__init__()
+            self.async_attempts = 0
+
+        def RunScriptAsync(self, js):
+            if "conversationChildren" in js:
+                self.diag_scripts.append(js)
+                return True
+            self.async_attempts += 1
+            raise RuntimeError("boom")
+
+    view = _RaisingView()
+    obj = _make_search_panel(panel, timer, view)
+    obj._search_ctrl.SetValue("hello")
+    obj._on_search_text(None)
+
+    obj._on_search_tick(None)
+
+    assert view.async_attempts == 1, "the failed async script must not be retried"
+    assert view.async_scripts == []
+    assert view.scripts == ['_findTextAndJump("hello", 1)'], "exactly one sync fallback"
+    assert obj._search_count_label.label == "ok"
+
+
+def test_execute_find_deferred_when_modal_and_async_unavailable(panel_mod) -> None:
+    panel, windows = panel_mod
+    timer = _FakeTimer()
+    view = _FakeView()
+    obj = _make_search_panel(panel, timer, view)
+    obj._script_channel_ok = False
+    windows.append(_Dialog(modal=True))
+
+    mode = obj._execute_find('_findTextAndJump("hello", 1)', 1)
+
+    assert mode == _panel_module._SEARCH_DEFERRED
+    assert view.scripts == []
+    assert view.async_scripts == []
+
+
+def test_execute_find_failed_when_sync_already_running(panel_mod) -> None:
+    panel, _windows = panel_mod
+    timer = _FakeTimer()
+    view = _FakeView()
+    obj = _make_search_panel(panel, timer, view)
+    obj._script_channel_ok = False
+    obj._search_script_running = True
+
+    mode = obj._execute_find('_findTextAndJump("hello", 1)', 1)
+
+    assert mode == _panel_module._SEARCH_FAILED
+    assert view.scripts == []
+    assert view.async_scripts == []
+
+
+def test_async_zero_hits_writes_zero_and_never_uses_sync(panel_mod) -> None:
+    panel, _windows = panel_mod
+    timer = _FakeTimer()
+    view = _FakeView()
+    obj = _make_search_panel(panel, timer, view)
+    obj._search_ctrl.SetValue("zzznotfound")
+
+    obj._on_search_text(None)
+    obj._on_search_tick(None)
+
+    assert view.scripts == [], "async find must not fall back without a failure"
+    assert view.async_scripts == ['_findTextAndJump("zzznotfound", 1)']
+
+    obj._on_script_message(
+        _ScriptMessage({"kind": "find", "seq": 1, "count": 0, "query": "zzznotfound", "index": 0})
+    )
+    assert obj._search_count_label.label == "0/0"
+
+
+def test_render_reapplies_active_search(panel_mod) -> None:
+    panel, _windows = panel_mod
+    timer = _FakeTimer()
+    view = _FakeView()
+    obj = _make_search_panel(panel, timer, view)
+    obj._search_ctrl.SetValue("hello")
+    obj._on_search_text(None)
+    obj._on_search_tick(None)  # seq 1
+    view.async_scripts.clear()
+
+    obj._update_conversation()
+
+    assert view.scripts == [], "renders never use the synchronous RunScript"
+    assert len(view.async_scripts) == 1
+    render = view.async_scripts[0]
+    assert _expression_js(render).startswith("_updateConversation(")
+
+    # The find re-apply rides on the render reply, not the dispatch.
+    _reply(obj, _seq_of(render))
+
+    assert view.async_scripts[1:] == ['_findTextAndJump("hello", 2)']
+
+
+def test_append_reapplies_active_search(panel_mod) -> None:
+    panel, _windows = panel_mod
+    timer = _FakeTimer()
+    view = _FakeView()
+    obj = _make_search_panel(panel, timer, view)
+    obj._search_ctrl.SetValue("hello")
+    obj._on_search_text(None)
+    obj._on_search_tick(None)  # seq 1
+    view.async_scripts.clear()
+
+    obj._append_entry_js({"type": "status", "text": "hi", "color_hex": "#000000"})
+
+    assert len(view.async_scripts) == 1
+    append = view.async_scripts[0]
+    assert _expression_js(append).startswith("_appendEntry(")
+
+    _reply(obj, _seq_of(append))
+
+    assert view.async_scripts[1:] == ['_findTextAndJump("hello", 2)']
+
+
+def test_clear_find_returns_explicit_result() -> None:
+    """An undefined result makes wx log a warning that KiCad shows modally."""
+    source = (Path(_panel_module.__file__).parent / "shell.js").read_text(encoding="utf-8")
+    start = source.index("window._clearFind = function")
+    body = source[start : source.index("\n};", start)]
+    assert "return '0/0';" in body
+
+
+def test_find_text_mark_loop_always_advances() -> None:
+    source = (Path(_panel_module.__file__).parent / "shell.js").read_text(encoding="utf-8")
+    assert "Math.max(1, lowerQuery.length)" in source
+    assert "idx <= previousIdx" in source
+
+
+def test_clear_marks_normalizes_each_parent_once() -> None:
+    """Per-mark normalize() made clearing quadratic on huge conversations."""
+    source = (Path(_panel_module.__file__).parent / "shell.js").read_text(encoding="utf-8")
+    start = source.index("function _clearMarkNodes()")
+    body = source[start : source.index("\n}\n", start)]
+    assert body.count(".normalize()") == 1, "one normalize() for all marks of a parent"
+    assert "groupParents" in body
+
+
+# --------------------------------------------------------------------------- #
+# Diagnostics must be observation-only
+# --------------------------------------------------------------------------- #
+
+
+def test_diag_probe_warns_without_async_and_never_falls_back(panel_mod) -> None:
+    panel, _windows = panel_mod
+    timer = _FakeTimer()
+    view = _FakeView()
+    obj = _make_search_panel(panel, timer, view)
+    obj._script_channel_ok = False
+
+    with mock.patch.object(panel.log, "warning") as warning:
+        obj._log_ui_state("test")
+
+    warning.assert_called_once()
+    assert "diag: async unavailable, cannot probe page" in warning.call_args.args[0]
+    assert view.scripts == [], "diagnostics must never issue a synchronous RunScript"
+    assert view.async_scripts == []
+    assert view.diag_scripts == []
+
+
+def test_diag_probe_is_throttled_and_async_only(panel_mod) -> None:
+    panel, _windows = panel_mod
+    timer = _FakeTimer()
+    view = _FakeView()
+    obj = _make_search_panel(panel, timer, view)
+
+    obj._last_diag_ts = time.monotonic()
+    obj._maybe_log_ui_state("search_tick")
+    assert view.diag_scripts == [], "a probe within one second must be throttled"
+
+    obj._last_diag_ts = 0.0
+    obj._maybe_log_ui_state("search_tick")
+
+    assert len(view.diag_scripts) == 1
+    probe = _user_js(view.diag_scripts[0])
+    assert "conversationChildren" in probe
+    assert "window.__findMatches" in probe
+    assert "postMessage" not in probe, "the probe result rides the exec reply"
+    assert view.scripts == [], "diagnostics must never issue a synchronous RunScript"
+
+
+# --------------------------------------------------------------------------- #
+# Async render dispatch: one funnel, one reply, one timeout (issue #342)
+# --------------------------------------------------------------------------- #
+
+
+def test_dispatch_holds_the_lock_until_the_reply(panel_mod) -> None:
+    """One wrapped script appears; the lock survives until the exec reply."""
+    panel, _windows = panel_mod
+    timer = _FakeTimer()
+    view = _FakeView()
+    obj = _make_panel(panel, timer, view)
+
+    dispatched = obj._dispatch_render(
+        "_jumpToStart()", label="jump_start", force_scroll_to_bottom=True
+    )
+
+    assert dispatched is True
+    assert view.scripts == [], "renders must never use the synchronous RunScript"
+    assert len(view.async_scripts) == 1
+    script = view.async_scripts[0]
+    assert "'exec'" in script, "the wrapper posts an exec reply"
+    assert "kcaa.postMessage" in script
+    assert _user_js(script) == "_jumpToStart()"
+    assert obj._js_running is True, "the lock must not be released after dispatch"
+    assert list(obj._script_requests) == [_seq_of(script)]
+    assert obj._script_timeout_timer.running is True
+    assert obj._script_timeout_timer.starts == [_panel_module._SCRIPT_SWEEP_MS]
+
+    request = obj._script_requests[_seq_of(script)]
+    assert request.kind == _panel_module._SCRIPT_KIND_RENDER
+    assert request.label == "jump_start"
+    assert request.force_scroll_to_bottom is True
+    assert request.js_len == len("_jumpToStart()")
+
+
+def test_ok_reply_releases_the_lock_and_clears_the_request(panel_mod) -> None:
+    panel, _windows = panel_mod
+    timer = _FakeTimer()
+    view = _FakeView()
+    obj = _make_panel(panel, timer, view)
+    obj._search_query = "hello"
+    obj._stream_wrapper_visible = True
+    obj._dispatch_render(
+        "_updateConversation('[]', \"none\", true)",
+        label=_panel_module._SCRIPT_LABEL_REBUILD,
+        restore_search=True,
+    )
+    seq = next(iter(obj._script_requests))
+
+    _reply(obj, seq, result="ok")
+
+    assert obj._script_requests == {}
+    assert obj._js_running is False
+    assert obj._render_pending is False
+    assert obj._stream_wrapper_visible is False, "a rebuild resets the wrapper flag"
+    assert obj._script_timeout_timer.running is False, "the sweep stops when nothing is pending"
+    # The per-request post-processing ran: the live query was re-applied.
+    assert view.async_scripts[1:] == ['_findTextAndJump("hello", 1)']
+
+
+def test_error_reply_keeps_retry_semantics_and_per_request_flags(panel_mod) -> None:
+    """A failed request replays *its own* flags, not a later deferral's."""
+    panel, _windows = panel_mod
+    timer = _FakeTimer()
+    view = _FakeView()
+    obj = _make_panel(panel, timer, view)
+    replayed: list[tuple] = []
+    obj._update_conversation = lambda *args: replayed.append(args)
+
+    obj._dispatch_render(
+        "_updateConversation('[]', \"none\", true)",
+        retry_on_failure=True,
+        replace=True,
+        label=_panel_module._SCRIPT_LABEL_REBUILD,
+    )
+    seq = next(iter(obj._script_requests))
+
+    # A later render is deferred behind the in-flight script and stores its
+    # own flags — which must not be donated to the failing request.
+    obj._dispatch_render("_jumpToStart()", follow=True)
+
+    _reply(obj, seq, ok=False, error="boom")
+
+    assert obj._script_requests == {}
+    assert obj._js_running is False
+    assert replayed == [(False, True, False)], "force/replace/follow of the failed request"
+
+    # A request without retry_on_failure replays nothing.
+    replayed.clear()
+    obj._dispatch_render("_jumpToLatest()", label="jump_latest")
+    seq = next(iter(obj._script_requests))
+    _reply(obj, seq, ok=False, error="boom")
+    assert replayed == []
+    assert obj._render_pending is False
+
+
+def test_script_timeout_fails_the_request_and_replays(panel_mod) -> None:
+    panel, _windows = panel_mod
+    timer = _FakeTimer()
+    view = _FakeView()
+    obj = _make_panel(panel, timer, view)
+    replayed: list[tuple] = []
+    obj._update_conversation = lambda *args: replayed.append(args)
+
+    obj._dispatch_render("_jumpToLatest()", force_scroll_to_bottom=True, label="jump_latest")
+    seq = next(iter(obj._script_requests))
+    obj._script_requests[seq].deadline = time.monotonic() - 0.001
+
+    with mock.patch.object(panel.log, "warning") as warning:
+        obj._on_script_sweep(None)
+
+    warning.assert_called_once_with(
+        "render: async script timeout after %d ms (seq=%d, len=%d)",
+        _panel_module._SCRIPT_TIMEOUT_MS,
+        seq,
+        len("_jumpToLatest()"),
+    )
+    assert obj._script_requests == {}
+    assert obj._js_running is False
+    assert obj._script_timeout_timer.running is False
+    assert replayed == [(True, False, False)], "the timed-out request's flags drive the replay"
+
+
+def test_unknown_stale_and_duplicate_replies_are_ignored(panel_mod) -> None:
+    panel, _windows = panel_mod
+    timer = _FakeTimer()
+    view = _FakeView()
+    obj = _make_panel(panel, timer, view)
+    obj._stream_wrapper_visible = True
+
+    obj._dispatch_render("_jumpToStart()", label="jump_start", force_scroll_to_bottom=True)
+    seq = next(iter(obj._script_requests))
+
+    before = dict(obj._script_requests)
+    obj._on_script_message(
+        _ScriptMessage({"kind": "exec", "seq": 999, "ok": True, "result": None, "error": None})
+    )
+    obj._on_script_message(_ScriptMessage({"kind": "exec", "seq": "bad", "ok": True}))
+    obj._on_script_message(_ScriptMessage({"kind": "exec", "seq": seq, "ok": "yes"}))
+    assert obj._script_requests == before, "bad or unknown replies must not touch state"
+    assert obj._js_running is True
+    assert obj._stream_wrapper_visible is True
+
+    _reply(obj, seq, result="ok")
+    assert obj._script_requests == {}
+    assert obj._js_running is False
+
+    # Duplicate: the request is gone, so the second reply is a no-op.
+    after = dict(obj._script_requests)
+    with mock.patch.object(panel.log, "warning") as warning:
+        _reply(obj, seq, ok=False, error="late")
+    assert warning.call_count == 0, "a stale reply must not be reported as a failure"
+    assert obj._script_requests == after
+    assert obj._js_running is False
+    assert obj._render_pending is False
+
+
+def test_dialog_open_defers_dispatch_and_arms_the_replay(panel_mod) -> None:
+    panel, windows = panel_mod
+    timer = _FakeTimer()
+    view = _FakeView()
+    obj = _make_panel(panel, timer, view)
+    windows.append(_Dialog(modal=True))
+
+    dispatched = obj._dispatch_render(
+        "_jumpToLatest()",
+        force_scroll_to_bottom=True,
+        replace=True,
+        follow=True,
+        label="jump_latest",
+    )
+
+    assert dispatched is False
+    assert view.scripts == []
+    assert view.async_scripts == []
+    assert obj._script_requests == {}
+    assert obj._js_running is False
+    assert obj._render_pending is True
+    assert obj._pending_force_scroll_to_bottom is True
+    assert obj._pending_replace is True
+    assert obj._pending_follow is True
+    assert timer.running is True
+
+
+def test_sync_fallback_runs_once_and_stays_behind_the_dialog_gate(panel_mod) -> None:
+    """No script channel: one RunScript, still gated by the dialog check."""
+    panel, windows = panel_mod
+    timer = _FakeTimer()
+    view = _FakeView()
+    obj = _make_panel(panel, timer, view)
+    obj._script_channel_ok = False
+    obj._stream_wrapper_visible = True
+
+    dispatched = obj._dispatch_render(
+        "_updateConversation('[]', \"none\", true)",
+        label=_panel_module._SCRIPT_LABEL_REBUILD,
+    )
+
+    assert dispatched is True, "the fallback executed the script"
+    assert len(view.scripts) == 1, "exactly one synchronous call"
+    assert view.async_scripts == []
+    js = view.scripts[0]
+    assert js.startswith("_updateConversation("), "the fallback runs the raw script"
+    assert "kcaa.postMessage" not in js
+    assert obj._js_running is False, "the fallback releases the lock immediately"
+    assert obj._script_requests == {}
+    assert obj._stream_wrapper_visible is False
+
+    # Dialog open: the fallback must not run at all.
+    windows.append(_Dialog(modal=True))
+    view.scripts.clear()
+    assert obj._dispatch_render("_jumpToStart()", label="jump_start") is False
+    assert view.scripts == []
+
+
+def test_watchdog_clears_requests_stops_the_sweep_and_frees_the_lock(panel_mod) -> None:
+    panel, _windows = panel_mod
+    timer = _FakeTimer()
+    view = _FakeView()
+    obj = _make_panel(panel, timer, view)
+    obj._page_loading = True
+    obj._shell_retry_count = 0
+    obj._load_shell = lambda reason=None: None
+    obj._dispatch_render("_jumpToStart()", label="jump_start")
+    assert obj._script_timeout_timer.running is True
+    assert obj._js_running is True
+
+    obj._on_page_watchdog(None)
+
+    assert obj._script_requests == {}
+    assert obj._script_timeout_timer.running is False
+    assert obj._js_running is False
+
+
+def test_render_dispatch_enforces_the_structural_single_dispatch_point() -> None:
+    """Only _execute_find and _dispatch_render may touch the script API.
+
+    Mapped through the AST (enclosing ``def`` per call site) so a new
+    synchronous call cannot slip back into a render path.
+    """
+    source = Path(_panel_module.__file__).read_text(encoding="utf-8")
+    tree = ast.parse(source)
+
+    enclosing: dict[str, set[str]] = {"RunScript": set(), "RunScriptAsync": set()}
+    hits: dict[str, int] = {"RunScript": 0, "RunScriptAsync": 0}
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.FunctionDef):
+            continue
+        for inner in ast.walk(node):
+            if (
+                isinstance(inner, ast.Call)
+                and isinstance(inner.func, ast.Attribute)
+                and inner.func.attr in enclosing
+                and node.lineno <= inner.lineno <= (node.end_lineno or node.lineno)
+            ):
+                enclosing[inner.func.attr].add(node.name)
+                hits[inner.func.attr] += 1
+
+    assert enclosing["RunScript"] == {"_execute_find", "_dispatch_render"}
+    assert enclosing["RunScriptAsync"] == {"_execute_find", "_dispatch_render"}
+    assert hits == {"RunScript": 2, "RunScriptAsync": 2}, (
+        "exactly one sync and one async call per dispatcher"
+    )
+
+
+# --------------------------------------------------------------------------- #
+# Probe recovery: retries, legacy replies, stale generations (issue #342 review)
+# --------------------------------------------------------------------------- #
+
+
+def _settle(obj, view) -> None:
+    """Deliver an ok reply for every script still awaiting one."""
+    for script in list(view.async_scripts):
+        seq = _seq_of(script)
+        if seq in obj._script_requests:
+            _reply(obj, seq, result=None)
+
+
+def test_sync_probe_reply_confirms_the_shell(panel_mod) -> None:
+    """The WebKit1 path answers with a JSON string; it must still confirm."""
+    panel, _windows = panel_mod
+    timer = _FakeTimer()
+
+    class _JsonProbeView(_SyncOnlyView):
+        def RunScript(self, js: str):
+            self.scripts.append(js)
+            return True, json.dumps({"conv": True, "js": True, "font": "Arial"})
+
+    view = _JsonProbeView()
+    obj = _make_panel(panel, timer, _FakeView())
+    obj._conv_view = view
+    obj._script_channel_ok = False
+    obj._shell_loaded = False
+    obj._render_pending = True
+    obj._conv_entries = [{"type": "status", "text": "hi", "color_hex": "#000000"}]
+
+    obj._request_shell_probe()
+
+    assert len(view.scripts) == 2, "probe plus the render it releases, both sync"
+    assert "JSON.stringify" in view.scripts[0]
+    assert obj._shell_loaded is True
+    assert obj._render_pending is False
+    assert view.scripts[1].startswith("_updateConversation(")
+
+
+def test_probe_state_accepts_legacy_tokens(panel_mod) -> None:
+    panel, _windows = panel_mod
+    obj = _make_panel(panel, _FakeTimer(), _FakeView())
+
+    assert obj._probe_state({"conv": True}) == {"conv": True}
+    assert obj._probe_state('{"conv": true, "js": true}') == {"conv": True, "js": True}
+    assert obj._probe_state("loaded") == {"conv": True, "js": True, "font": None}
+    assert obj._probe_state(" ok ") == {"conv": True, "js": True, "font": None}
+    assert obj._probe_state("garbage") is None
+    assert obj._probe_state(None) is None
+    assert obj._probe_state(3) is None
+
+
+def _fire_probe_timer(obj) -> None:
+    """Model a one-shot probe timer firing: it stops itself, then runs."""
+    assert obj._shell_probe_timer.running, "the probe timer must be armed"
+    obj._shell_probe_timer.Stop()
+    obj._on_shell_probe_tick(None)
+
+
+def test_lost_shell_probe_retries_then_recovers(panel_mod) -> None:
+    """A lost probe arms a retry; exhaustion logs one error; a later reply renders."""
+    panel, _windows = panel_mod
+    timer = _FakeTimer()
+    view = _FakeView()
+    obj = _make_panel(panel, timer, view)
+    obj._shell_loaded = False
+    obj._render_pending = True
+    replayed: list[tuple] = []
+    obj._update_conversation = lambda *args: replayed.append(args)
+
+    obj._request_shell_probe()
+    assert obj._shell_probe_attempts == 1
+    seq = next(iter(obj._script_requests))
+
+    # The reply never arrives: the sweep fails it and arms the next attempt.
+    obj._script_requests[seq].deadline = time.monotonic() - 0.001
+    with mock.patch.object(panel.log, "warning") as warning:
+        obj._on_script_sweep(None)
+
+    assert [call.args[0] for call in warning.call_args_list] == [
+        "probe: script timeout after %d ms (attempt %d/%d, seq=%d, len=%d)"
+    ], "probe timeouts are logged as probes, never as render timeouts"
+    assert obj._shell_probe_timer.running is True
+    assert obj._shell_probe_timer.starts[-1] == _panel_module._SHELL_PROBE_RETRY_MS[0]
+    assert obj._render_pending is True
+
+    # Burn the rest of the budget: every timeout retries until it is spent.
+    with (
+        mock.patch.object(panel.log, "warning"),
+        mock.patch.object(panel.log, "error") as error,
+    ):
+        while obj._shell_probe_attempts < _panel_module._SHELL_PROBE_MAX_ATTEMPTS:
+            _fire_probe_timer(obj)  # the armed retry fires
+            seq = next(iter(obj._script_requests))
+            obj._script_requests[seq].deadline = time.monotonic() - 0.001
+            obj._on_script_sweep(None)  # expire it -> arms the next retry
+            if obj._shell_probe_attempts < _panel_module._SHELL_PROBE_MAX_ATTEMPTS:
+                assert error.call_count == 0, "attempts were still left"
+
+        assert obj._shell_probe_attempts == _panel_module._SHELL_PROBE_MAX_ATTEMPTS
+        assert obj._shell_probe_timer.running is True, "the quiet-period retry is armed"
+        assert obj._shell_probe_timer.starts[-1] == _panel_module._SHELL_PROBE_IDLE_RESET_MS
+        error.assert_called_once(), "one error, on the last attempt, makes it visible"
+
+    # A new generation resets the budget; the pending render then runs.
+    obj._shell_probe_attempts = 0
+    obj._request_shell_probe()
+    seq = next(iter(obj._script_requests))
+    _reply(obj, seq, result=json.dumps({"conv": True, "js": True, "font": "Arial"}))
+
+    assert obj._shell_loaded is True
+    assert replayed == [(True,)], "the pending render is released"
+
+
+def test_render_deferred_for_shell_arms_a_probe(panel_mod) -> None:
+    """Shell-not-loaded must not leave _render_pending with nothing armed."""
+    panel, _windows = panel_mod
+    timer = _FakeTimer()
+    obj = _make_panel(panel, timer, _FakeView())
+    obj._shell_loaded = False
+
+    obj._update_conversation()
+
+    assert obj._render_pending is True
+    assert obj._shell_probe_timer.running is True
+
+
+def test_probe_does_not_pump_during_an_in_flight_render(panel_mod) -> None:
+    """Without a channel the probe would run RunScript: defer it instead."""
+    panel, _windows = panel_mod
+    timer = _FakeTimer()
+    view = _FakeView()
+    obj = _make_panel(panel, timer, view)
+    obj._script_channel_ok = False
+    obj._shell_loaded = False
+    obj._js_running = True
+
+    obj._request_shell_probe()
+
+    assert view.scripts == [], "no RunScript while a render is in flight"
+    assert obj._script_requests == {}
+    assert obj._shell_probe_timer.running is True, "the probe is retried later"
+
+
+def test_stale_probe_reply_cannot_confirm_a_reloaded_page(panel_mod) -> None:
+    panel, _windows = panel_mod
+    timer = _FakeTimer()
+    view = _FakeView()
+    obj = _make_panel(panel, timer, view)
+    obj._shell_loaded = False
+
+    obj._request_shell_probe()
+    seq = next(iter(obj._script_requests))
+
+    obj._page_generation += 1  # a reload started after the probe was sent
+    _reply(obj, seq, result=json.dumps({"conv": True, "js": True}))
+
+    assert obj._shell_loaded is False
+
+
+# --------------------------------------------------------------------------- #
+# Real script results: shell-side errors and streaming throughput
+# --------------------------------------------------------------------------- #
+
+
+def test_rebuild_error_result_is_logged_and_skips_find_restore(panel_mod) -> None:
+    panel, _windows = panel_mod
+    timer = _FakeTimer()
+    view = _FakeView()
+    obj = _make_panel(panel, timer, view)
+    obj._search_query = "hello"
+    obj._dispatch_render(
+        "_updateConversation('[]', \"none\", true)",
+        label=_panel_module._SCRIPT_LABEL_REBUILD,
+        restore_search=True,
+        expression=True,
+    )
+    seq = next(iter(obj._script_requests))
+
+    with mock.patch.object(panel.log, "error") as error:
+        _reply(obj, seq, result="error:no conversation div")
+
+    error.assert_called_once()
+    assert "error:no conversation div" in str(error.call_args)
+    assert obj._script_requests == {}
+    assert obj._js_running is False
+    assert view.async_scripts[1:] == [], "a failed rebuild must not re-apply the find"
+
+
+def test_superseded_stream_update_does_not_schedule_a_rebuild(panel_mod) -> None:
+    """A busy lock drops the draft update; the next flush re-sends it."""
+    panel, _windows = panel_mod
+    timer = _FakeTimer()
+    view = _FakeView()
+    obj = _make_panel(panel, timer, view)
+    obj._pending_ai_text = "draft"
+    obj._follow_output_to_bottom = False
+
+    obj._dispatch_render(
+        "_updateConversation('[]', \"none\", true)",
+        label=_panel_module._SCRIPT_LABEL_REBUILD,
+        expression=True,
+    )
+    assert obj._js_running is True
+
+    assert obj._incremental_stream_update() is False, "superseded, not queued"
+    assert obj._render_pending is False, "no rebuild may be scheduled for a draft update"
+    assert obj._stream_wrapper_visible is False
+
+
+def test_stream_flushes_stay_incremental(panel_mod) -> None:
+    """One flush interval of reply latency must not escalate to rebuilds."""
+    panel, _windows = panel_mod
+    timer = _FakeTimer()
+    view = _FakeView()
+    obj = _make_panel(panel, timer, view)
+    obj._busy = True
+    obj._cancel_event = None
+    obj._tool_calls_made = False
+    obj._turn_had_text = False
+    obj._follow_output_to_bottom = False
+    obj._stream_timer = _FakeTimer()
+    obj._pending_ai_text = ""
+    obj._hide_stream_wrapper = lambda: None
+    obj._render_conversation = lambda *args, **kwargs: None
+
+    for _ in range(10):
+        obj._stream_events.append({"type": "text_chunk", "content": "x", "_gen": 0})
+        obj._on_stream_flush(None)
+        _settle(obj, view)  # the reply lands before the next flush
+
+    scripts = [_user_js(script) for script in view.async_scripts]
+    rebuilds = [js for js in scripts if js.startswith("_updateConversation(")]
+    updates = [js for js in scripts if js.startswith("_updateStream(")]
+
+    assert rebuilds == [], "streaming must never escalate to a full rebuild"
+    assert len(updates) >= 9, "every flush after the first carries the draft"
+    assert obj._stream_wrapper_visible is True
+    assert obj._script_requests == {}
+
+
+# --------------------------------------------------------------------------- #
+# Round 2 review notes: turn-end bookkeeping and probe cadence
+# --------------------------------------------------------------------------- #
+
+
+def _begin_turn(obj) -> None:
+    """Minimal live-turn state for _on_stream_flush / _finish_turn / _on_stop."""
+    obj._busy = True
+    obj._cancel_event = threading.Event()
+    obj._tool_calls_made = False
+    obj._turn_had_text = False
+    obj._follow_output_to_bottom = False
+    obj._pending_ai_text = ""
+    obj._stream_timer = _FakeTimer()
+    obj._toggle_send_stop = lambda busy: None
+    obj._save_session_to_disk = lambda: None
+
+
+def _hide_scripts(view) -> list[str]:
+    return [
+        js for js in (_user_js(script) for script in view.async_scripts) if "stream-wrapper" in js
+    ]
+
+
+def _rebuild_scripts(view) -> list[str]:
+    return [
+        js
+        for js in (_user_js(script) for script in view.async_scripts)
+        if "_updateConversation(" in js
+    ]
+
+
+def test_turn_end_hide_folds_into_the_in_flight_rebuild(panel_mod) -> None:
+    """The entry render is already out: the hide joins it, no second rebuild."""
+    panel, _windows = panel_mod
+    timer = _FakeTimer()
+    view = _FakeView()
+    obj = _make_panel(panel, timer, view)
+    _begin_turn(obj)
+    obj._stream_wrapper_visible = True
+    obj._pending_ai_text = "hi"  # text_end finalises this draft
+
+    obj._stream_events.extend(
+        [
+            {"type": "text_end", "_gen": 0},
+            {"type": "turn_end", "_gen": 0},
+        ]
+    )
+    obj._on_stream_flush(None)
+
+    assert len(_rebuild_scripts(view)) == 1, "the entry render is dispatched"
+    assert len(obj._script_requests) == 1
+    assert _hide_scripts(view) == [], "no second script fights the render for the lock"
+    assert obj._stream_wrapper_visible is False, "the hide is folded, not dropped"
+
+    _settle(obj, view)  # the rebuild's reply must not replay another one
+
+    assert len(_rebuild_scripts(view)) == 1, "no redundant rebuild at turn end"
+
+
+def test_turn_end_folds_the_wrapper_hide_into_the_pending_render(panel_mod) -> None:
+    """The entry render hides the wrapper itself; no second hide, one rebuild."""
+    panel, _windows = panel_mod
+    timer = _FakeTimer()
+    view = _FakeView()
+    obj = _make_panel(panel, timer, view)
+    _begin_turn(obj)
+    obj._stream_wrapper_visible = True
+
+    obj._stream_events.extend(
+        [
+            {"type": "text_chunk", "content": "hi", "_gen": 0},
+            {"type": "text_end", "_gen": 0},
+            {"type": "turn_end", "_gen": 0},
+        ]
+    )
+    obj._on_stream_flush(None)
+
+    assert _hide_scripts(view) == [], "the deferred entry render owns the hide"
+    assert obj._stream_wrapper_visible is False
+    assert obj._render_pending is True, "the entry render waits behind the stream update"
+    assert len(view.async_scripts) == 1, "only the incremental update went out"
+    assert _user_js(view.async_scripts[0]).startswith("_updateStream(")
+
+    _settle(obj, view)  # the stream update replies -> the replay renders
+
+    assert len(_rebuild_scripts(view)) == 1, "exactly one full rebuild"
+    _settle(obj, view)
+    assert _hide_scripts(view) == [], "still no separate hide"
+
+
+def test_cancelled_turn_still_hides_the_wrapper(panel_mod) -> None:
+    """The cancel path has no following rebuild, so the hide must dispatch."""
+    panel, _windows = panel_mod
+    timer = _FakeTimer()
+    view = _FakeView()
+    obj = _make_panel(panel, timer, view)
+    _begin_turn(obj)
+    obj._stream_wrapper_visible = True
+
+    obj._on_stop(None)
+
+    assert len(view.async_scripts) == 1, "the hide reaches the view"
+    assert _hide_scripts(view) == [_user_js(view.async_scripts[0])]
+    assert "pending-ai-text" in _hide_scripts(view)[0]
+    assert obj._stream_wrapper_visible is False
+    assert obj._render_pending is False, "the hide is not folded into a render that never comes"
+
+
+def test_shell_probe_is_not_re_requested_while_in_flight(panel_mod) -> None:
+    panel, _windows = panel_mod
+    timer = _FakeTimer()
+    view = _FakeView()
+    obj = _make_panel(panel, timer, view)
+    obj._shell_loaded = False
+
+    obj._request_shell_probe()
+    obj._request_shell_probe()  # e.g. a modal tick while the first is outstanding
+
+    assert len(view.async_scripts) == 1
+    assert len(obj._script_requests) == 1
+    assert obj._shell_probe_attempts == 1, "only dispatched probes count"
+
+    # A "not ready" reply leaves the shell unconfirmed; the next call probes.
+    seq = next(iter(obj._script_requests))
+    _reply(obj, seq, result=json.dumps({"conv": False, "js": False}))
+    obj._shell_probe_timer.Stop()
+    obj._request_shell_probe()
+
+    assert len(view.async_scripts) == 2
+    assert obj._shell_probe_attempts == 2
+
+
+def test_exhausted_probe_retries_once_per_idle_period(panel_mod) -> None:
+    """After the budget, probes wait one idle window instead of every tick."""
+    panel, _windows = panel_mod
+    timer = _FakeTimer()
+    view = _FakeView()
+    obj = _make_panel(panel, timer, view)
+    obj._shell_loaded = False
+    obj._shell_probe_attempts = _panel_module._SHELL_PROBE_MAX_ATTEMPTS
+    obj._shell_probe_last_ts = time.monotonic()
+
+    for _ in range(5):  # five modal ticks inside the quiet period
+        obj._request_shell_probe()
+
+    assert view.async_scripts == [], "no probe during the quiet period"
+    assert obj._render_pending is True
+    assert obj._shell_probe_timer.running is True
+    assert obj._shell_probe_timer.starts[-1] == _panel_module._SHELL_PROBE_IDLE_RESET_MS
+
+    # The idle window elapses: exactly one probe, and a fresh budget.
+    obj._shell_probe_last_ts -= _panel_module._SHELL_PROBE_IDLE_RESET_S + 1
+    _fire_probe_timer(obj)
+
+    assert len(view.async_scripts) == 1
+    assert obj._shell_probe_attempts == 1, "the budget restarted"
+    assert obj._shell_probe_timer.running is False

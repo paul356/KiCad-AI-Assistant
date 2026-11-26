@@ -109,9 +109,9 @@ def test_update_conversation_maps_the_three_scroll_modes() -> None:
     assert {'"bottom"', '"follow"', '"none"'} <= assigned
 
 
-def test_update_conversation_forwards_replace_and_follow_to_run_script() -> None:
-    calls = _calls(_function("_update_conversation"), "_run_script")
-    assert calls, "_update_conversation should call _run_script"
+def test_update_conversation_forwards_replace_and_follow_to_dispatch_render() -> None:
+    calls = _calls(_function("_update_conversation"), "_dispatch_render")
+    assert calls, "_update_conversation should call _dispatch_render"
     assert any(
         _keyword_name(call, "replace", "replace") and _keyword_name(call, "follow", "follow")
         for call in calls
@@ -157,8 +157,8 @@ def test_incremental_stream_update_passes_follow_mode() -> None:
     assert "_updateStream(" in source
     assert """scroll_arg = '"follow"' if follow else '"none"'""" in source
 
-    calls = _calls(fn, "_run_script")
-    assert calls, "_incremental_stream_update should call _run_script"
+    calls = _calls(fn, "_dispatch_render")
+    assert calls, "_incremental_stream_update should call _dispatch_render"
     assert any(_keyword_name(call, "follow", "follow") for call in calls)
 
 
@@ -194,15 +194,15 @@ def test_conversation_replacement_renders_with_replace() -> None:
         )
 
 
-def test_run_script_stores_pending_flags_on_deferral() -> None:
+def test_dispatch_render_stores_pending_flags_on_deferral() -> None:
     """A deferred render keeps its own force/replace/follow flags for replay."""
-    fn = _function("_run_script")
+    fn = _function("_dispatch_render")
     deferral_branches = [
         node
         for node in ast.walk(fn)
         if isinstance(node, ast.If) and "_try_acquire_render_lock" in _source(node.test)
     ]
-    assert deferral_branches, "_run_script should gate on _try_acquire_render_lock"
+    assert deferral_branches, "_dispatch_render should gate on _try_acquire_render_lock"
 
     expected = {
         "_pending_force_scroll_to_bottom",

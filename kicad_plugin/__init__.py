@@ -56,7 +56,162 @@ def _setup_plugin_logging() -> None:
         log.warning("Could not set up plugin logging: %s", exc)
 
 
+_BUILD_IDENTITY_MAX_BYTES = 1024 * 1024
+
+
+def _read_small_text(path: str, what: str) -> str | None:
+    """Read a small UTF-8 file; ``None`` on failure or when it exceeds 1 MiB."""
+    try:
+        if os.path.getsize(path) > _BUILD_IDENTITY_MAX_BYTES:
+            log.debug("build identity: %s too large: %s", what, path)
+            return None
+        with open(path, encoding="utf-8", errors="strict") as handle:
+            content = handle.read(_BUILD_IDENTITY_MAX_BYTES + 1)
+    except (OSError, UnicodeDecodeError) as exc:
+        log.debug("build identity: cannot read %s (%s): %s", what, exc, path)
+        return None
+    if len(content) > _BUILD_IDENTITY_MAX_BYTES:
+        log.debug("build identity: %s too large: %s", what, path)
+        return None
+    return content
+
+
+def _resolve_git_dir(start: str) -> str | None:
+    """Locate the git directory for the checkout containing *start*.
+
+    ``.git`` may be a directory, or a worktree/submodule file holding a
+    ``gitdir: <path>`` line (relative paths resolve against that directory).
+    """
+    current = os.path.dirname(os.path.abspath(start))
+    while True:
+        dot_git = os.path.join(current, ".git")
+        if os.path.isdir(dot_git):
+            return dot_git
+        if os.path.isfile(dot_git):
+            content = _read_small_text(dot_git, ".git file")
+            if content is None:
+                return None
+            for line in content.splitlines():
+                stripped = line.strip()
+                if not stripped.lower().startswith("gitdir:"):
+                    continue
+                target = stripped.split(":", 1)[1].strip()
+                if not target:
+                    log.debug("build identity: empty gitdir in %s", dot_git)
+                    return None
+                if not os.path.isabs(target):
+                    target = os.path.join(current, target)
+                return os.path.normpath(target)
+            log.debug("build identity: no gitdir line in %s", dot_git)
+            return None
+        parent = os.path.dirname(current)
+        if parent == current:
+            log.debug("build identity: no .git above %s", start)
+            return None
+        current = parent
+
+
+def _common_git_dir(git_dir: str) -> str:
+    """Follow a linked worktree's ``commondir`` so refs resolve correctly."""
+    content = _read_small_text(os.path.join(git_dir, "commondir"), "commondir")
+    if content:
+        target = content.strip()
+        if target:
+            if not os.path.isabs(target):
+                target = os.path.join(git_dir, target)
+            return os.path.normpath(target)
+    return git_dir
+
+
+def _looks_like_sha(value: str) -> bool:
+    return len(value) == 40 and all(c in "0123456789abcdefABCDEF" for c in value)
+
+
+def _packed_ref(git_dir: str, ref: str) -> str | None:
+    content = _read_small_text(os.path.join(git_dir, "packed-refs"), "packed-refs")
+    if content is None:
+        return None
+    for line in content.splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#") or stripped.startswith("^"):
+            continue
+        parts = stripped.split(None, 1)
+        if len(parts) == 2 and parts[1] == ref and _looks_like_sha(parts[0]):
+            return parts[0]
+    return None
+
+
+def _read_ref(git_dir: str, ref: str) -> str | None:
+    """Read a ref's 40-char sha from its loose file, else ``packed-refs``."""
+    if not ref.startswith("refs/") or ".." in ref.split("/"):
+        log.debug("build identity: refusing odd ref %r", ref)
+        return None
+    root = os.path.normpath(git_dir)
+    ref_path = os.path.normpath(os.path.join(root, ref))
+    try:
+        inside = os.path.commonpath([root, ref_path]) == root
+    except ValueError:
+        inside = False
+    if not inside:
+        log.debug("build identity: ref escapes git dir: %r", ref)
+        return None
+    loose = _read_small_text(ref_path, "ref")
+    if loose is not None:
+        sha = loose.strip()
+        if _looks_like_sha(sha):
+            return sha
+        log.debug("build identity: invalid loose ref %r", ref)
+    packed = _packed_ref(git_dir, ref)
+    if packed is None:
+        log.debug("build identity: ref not found: %r", ref)
+    return packed
+
+
+def _read_head(git_dir: str) -> tuple[str, str]:
+    """Return (short_sha, branch) for HEAD; ``unknown`` on any failure."""
+    content = _read_small_text(os.path.join(git_dir, "HEAD"), "HEAD")
+    if content is None:
+        return "unknown", "unknown"
+    value = content.strip()
+    if not value:
+        return "unknown", "unknown"
+    if value.startswith("ref:"):
+        ref = value.split(":", 1)[1].strip()
+        sha = _read_ref(_common_git_dir(git_dir), ref)
+        if sha is None:
+            return "unknown", "unknown"
+        branch = ref[len("refs/heads/") :] if ref.startswith("refs/heads/") else ref
+        return sha[:7], branch
+    if _looks_like_sha(value):
+        return value[:7], "detached"
+    log.debug("build identity: unrecognised HEAD contents")
+    return "unknown", "unknown"
+
+
+def _log_build_identity() -> None:
+    """Log the running checkout/wheel identity (diagnostics only; never raises)."""
+    package_file = globals().get("__file__", "unknown")
+    package_version = globals().get("__version__", "unknown")
+    head = branch = "unknown"
+    try:
+        git_dir = _resolve_git_dir(package_file)
+        if git_dir is not None:
+            head, branch = _read_head(git_dir)
+    except Exception as exc:
+        # No repository (PCM/wheel), unreadable/oversize metadata, odd refs.
+        log.debug("build identity: failed: %s", exc)
+        head = branch = "unknown"
+    log.info(
+        "plugin: build file=%s version=%s head=%s branch=%s",
+        package_file,
+        package_version,
+        head,
+        branch,
+    )
+
+
 _setup_plugin_logging()
+_log_build_identity()
 
 # ---------------------------------------------------------------------------
 # Graceful import guard — pcbnew is only available inside KiCad
