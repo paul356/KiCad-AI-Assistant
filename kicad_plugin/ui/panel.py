@@ -84,7 +84,10 @@ _SCRIPT_LABEL_DIAG = "diag_probe"
 _SHELL_PROBE_FIRST_DELAY_MS = 1000
 _SHELL_PROBE_RETRY_MS = (250, 500, 1000, 2000)
 _SHELL_PROBE_MAX_ATTEMPTS = 5
-_SHELL_PROBE_ERROR_AFTER = 3  # consecutive timeouts before one log.error
+# Once the budget is spent the probe is not retried on every modal tick: it
+# waits one quiet period and then starts a fresh budget (issue #342 note 3).
+_SHELL_PROBE_IDLE_RESET_S = 10.0
+_SHELL_PROBE_IDLE_RESET_MS = int(_SHELL_PROBE_IDLE_RESET_S * 1000)
 
 
 @dataclasses.dataclass
@@ -571,6 +574,7 @@ if _WX_AVAILABLE:
             self._shell_probe_timer = wx.Timer(self)
             self._shell_probe_attempts: int = 0
             self._shell_probe_timeouts: int = 0
+            self._shell_probe_last_ts: float = 0.0
             self._page_generation: int = 0
             # Find/search runs off RunScriptAsync: EVT_TEXT only stores the
             # query and restarts this debounce; results arrive through the
@@ -4647,11 +4651,17 @@ if _WX_AVAILABLE:
             """
             if not self._use_webview or self._shell_loaded:
                 return
+            timer = self._shell_probe_timer
             if self._shell_probe_attempts >= _SHELL_PROBE_MAX_ATTEMPTS:
+                # Budget spent: keep exactly one probe per idle window instead
+                # of re-arming on every modal tick.
+                if timer is not None and not timer.IsRunning():
+                    timer.Start(_SHELL_PROBE_IDLE_RESET_MS, oneShot=True)
                 log.debug(
-                    "render: shell probe budget exhausted (%d/%d attempts)",
+                    "render: shell probe budget exhausted (%d/%d) — next attempt in %d ms",
                     self._shell_probe_attempts,
                     _SHELL_PROBE_MAX_ATTEMPTS,
+                    _SHELL_PROBE_IDLE_RESET_MS,
                 )
                 return
             if delay_ms is None:
@@ -4659,7 +4669,6 @@ if _WX_AVAILABLE:
                 # timed out or answered "not ready yet".
                 index = max(0, min(self._shell_probe_attempts - 1, len(_SHELL_PROBE_RETRY_MS) - 1))
                 delay_ms = _SHELL_PROBE_RETRY_MS[index]
-            timer = self._shell_probe_timer
             if timer is not None and not timer.IsRunning():
                 timer.Start(delay_ms, oneShot=True)
 
@@ -4687,16 +4696,32 @@ if _WX_AVAILABLE:
             """
             if not self._use_webview or self._shell_loaded:
                 return
-            if self._shell_probe_attempts >= _SHELL_PROBE_MAX_ATTEMPTS:
-                # Budget spent: do not probe on every modal tick.  Only a new
-                # page generation (EVT_WEBVIEW_LOADED / reload) resets it.
-                log.debug(
-                    "render: shell probe skipped — attempt budget exhausted (%d/%d)",
-                    self._shell_probe_attempts,
-                    _SHELL_PROBE_MAX_ATTEMPTS,
-                )
-                self._render_pending = True
+            if any(
+                request.label == _SCRIPT_LABEL_SHELL for request in self._script_requests.values()
+            ):
+                # One probe in flight at a time: re-requesting it on every
+                # modal tick would burn the budget in dispatches nobody waits
+                # for, and two replies could each trigger a render.
+                log.debug("render: shell probe already in flight — not re-probing")
                 return
+            if self._shell_probe_attempts >= _SHELL_PROBE_MAX_ATTEMPTS:
+                idle_s = time.monotonic() - self._shell_probe_last_ts
+                if idle_s < _SHELL_PROBE_IDLE_RESET_S:
+                    # Quiet period: renders stay deferred and exactly one
+                    # probe is retried per idle window (see _schedule_shell_probe).
+                    log.debug(
+                        "render: shell probe skipped — %.1f s of the quiet period left",
+                        _SHELL_PROBE_IDLE_RESET_S - idle_s,
+                    )
+                    self._render_pending = True
+                    self._schedule_shell_probe()
+                    return
+                log.info(
+                    "render: shell probe quiet period elapsed (%.0f s) — new attempt budget",
+                    idle_s,
+                )
+                self._shell_probe_attempts = 0
+                self._shell_probe_timeouts = 0
             # A dialog owning the loop forbids the synchronous fallback.
             if self._blocking_dialog() is not None:
                 self._render_pending = True
@@ -4719,6 +4744,7 @@ if _WX_AVAILABLE:
                 self._schedule_shell_probe()
                 return
             self._shell_probe_attempts += 1
+            self._shell_probe_last_ts = time.monotonic()
             log.debug(
                 "render: shell probe dispatched (attempt %d/%d)",
                 self._shell_probe_attempts,
@@ -5340,11 +5366,14 @@ if _WX_AVAILABLE:
                 request.seq,
                 request.js_len,
             )
-            if self._shell_probe_timeouts == _SHELL_PROBE_ERROR_AFTER:
+            if self._shell_probe_attempts >= _SHELL_PROBE_MAX_ATTEMPTS:
+                # Only once, and only after the whole budget is spent: two
+                # attempts are still pending before this point.
                 log.error(
-                    "render: script channel unresponsive — %d consecutive shell probe "
-                    "timeouts; renders stay deferred until a probe answers",
+                    "render: script channel unresponsive — %d shell probe(s) timed out; "
+                    "renders stay deferred, a fresh probe budget starts after %d s",
                     self._shell_probe_timeouts,
+                    int(_SHELL_PROBE_IDLE_RESET_S),
                 )
             self._render_pending = True
             self._schedule_shell_probe()
@@ -5449,10 +5478,34 @@ if _WX_AVAILABLE:
                     len(text),
                 )
 
+        def _conversation_render_pending_or_in_flight(self) -> bool:
+            """True when a full conversation render will rewrite the wrapper.
+
+            Both ``_updateConversation`` and ``_appendEntry`` hide the stream
+            wrapper and clear ``#pending-ai-text`` in JS, and every pending
+            replay is one of those.  A separate hide script would only defer
+            behind that render and schedule a redundant rebuild of it.
+            """
+            if self._render_pending:
+                return True
+            return any(
+                request.label in (_SCRIPT_LABEL_REBUILD, _SCRIPT_LABEL_APPEND)
+                for request in self._script_requests.values()
+            )
+
         def _hide_stream_wrapper(self) -> None:
             """Hide the stream-wrapper table and clear pending text."""
             if not self._shell_loaded or not self._stream_wrapper_visible:
                 return  # No-op
+
+            if self._conversation_render_pending_or_in_flight():
+                # The in-flight/pending render hides the wrapper itself; fold
+                # the hide into it instead of deferring behind it (issue #342
+                # note 1).  This is not a supersedable drop: a hide with no
+                # following render (the cancel path) still dispatches below.
+                self._stream_wrapper_visible = False
+                log.debug("render: stream wrapper hide folded into the pending render")
+                return
 
             if self._dispatch_render(
                 "var w=document.getElementById('stream-wrapper');"

@@ -20,6 +20,7 @@ import importlib
 import json
 from pathlib import Path
 import sys
+import threading
 import time
 import types
 from types import SimpleNamespace
@@ -1474,6 +1475,13 @@ def test_probe_state_accepts_legacy_tokens(panel_mod) -> None:
     assert obj._probe_state(3) is None
 
 
+def _fire_probe_timer(obj) -> None:
+    """Model a one-shot probe timer firing: it stops itself, then runs."""
+    assert obj._shell_probe_timer.running, "the probe timer must be armed"
+    obj._shell_probe_timer.Stop()
+    obj._on_shell_probe_tick(None)
+
+
 def test_lost_shell_probe_retries_then_recovers(panel_mod) -> None:
     """A lost probe arms a retry; exhaustion logs one error; a later reply renders."""
     panel, _windows = panel_mod
@@ -1507,15 +1515,17 @@ def test_lost_shell_probe_retries_then_recovers(panel_mod) -> None:
         mock.patch.object(panel.log, "error") as error,
     ):
         while obj._shell_probe_attempts < _panel_module._SHELL_PROBE_MAX_ATTEMPTS:
-            obj._on_shell_probe_tick(None)  # the armed retry fires
+            _fire_probe_timer(obj)  # the armed retry fires
             seq = next(iter(obj._script_requests))
             obj._script_requests[seq].deadline = time.monotonic() - 0.001
             obj._on_script_sweep(None)  # expire it -> arms the next retry
-            obj._shell_probe_timer.Stop()
+            if obj._shell_probe_attempts < _panel_module._SHELL_PROBE_MAX_ATTEMPTS:
+                assert error.call_count == 0, "attempts were still left"
 
         assert obj._shell_probe_attempts == _panel_module._SHELL_PROBE_MAX_ATTEMPTS
-        assert obj._shell_probe_timer.running is False, "no retry past the budget"
-        error.assert_called_once(), "one error makes the dead channel visible"
+        assert obj._shell_probe_timer.running is True, "the quiet-period retry is armed"
+        assert obj._shell_probe_timer.starts[-1] == _panel_module._SHELL_PROBE_IDLE_RESET_MS
+        error.assert_called_once(), "one error, on the last attempt, makes it visible"
 
     # A new generation resets the budget; the pending render then runs.
     obj._shell_probe_attempts = 0
@@ -1652,3 +1662,163 @@ def test_stream_flushes_stay_incremental(panel_mod) -> None:
     assert len(updates) >= 9, "every flush after the first carries the draft"
     assert obj._stream_wrapper_visible is True
     assert obj._script_requests == {}
+
+
+# --------------------------------------------------------------------------- #
+# Round 2 review notes: turn-end bookkeeping and probe cadence
+# --------------------------------------------------------------------------- #
+
+
+def _begin_turn(obj) -> None:
+    """Minimal live-turn state for _on_stream_flush / _finish_turn / _on_stop."""
+    obj._busy = True
+    obj._cancel_event = threading.Event()
+    obj._tool_calls_made = False
+    obj._turn_had_text = False
+    obj._follow_output_to_bottom = False
+    obj._pending_ai_text = ""
+    obj._stream_timer = _FakeTimer()
+    obj._toggle_send_stop = lambda busy: None
+    obj._save_session_to_disk = lambda: None
+
+
+def _hide_scripts(view) -> list[str]:
+    return [
+        js for js in (_user_js(script) for script in view.async_scripts) if "stream-wrapper" in js
+    ]
+
+
+def _rebuild_scripts(view) -> list[str]:
+    return [
+        js
+        for js in (_user_js(script) for script in view.async_scripts)
+        if "_updateConversation(" in js
+    ]
+
+
+def test_turn_end_hide_folds_into_the_in_flight_rebuild(panel_mod) -> None:
+    """The entry render is already out: the hide joins it, no second rebuild."""
+    panel, _windows = panel_mod
+    timer = _FakeTimer()
+    view = _FakeView()
+    obj = _make_panel(panel, timer, view)
+    _begin_turn(obj)
+    obj._stream_wrapper_visible = True
+    obj._pending_ai_text = "hi"  # text_end finalises this draft
+
+    obj._stream_events.extend(
+        [
+            {"type": "text_end", "_gen": 0},
+            {"type": "turn_end", "_gen": 0},
+        ]
+    )
+    obj._on_stream_flush(None)
+
+    assert len(_rebuild_scripts(view)) == 1, "the entry render is dispatched"
+    assert len(obj._script_requests) == 1
+    assert _hide_scripts(view) == [], "no second script fights the render for the lock"
+    assert obj._stream_wrapper_visible is False, "the hide is folded, not dropped"
+
+    _settle(obj, view)  # the rebuild's reply must not replay another one
+
+    assert len(_rebuild_scripts(view)) == 1, "no redundant rebuild at turn end"
+
+
+def test_turn_end_folds_the_wrapper_hide_into_the_pending_render(panel_mod) -> None:
+    """The entry render hides the wrapper itself; no second hide, one rebuild."""
+    panel, _windows = panel_mod
+    timer = _FakeTimer()
+    view = _FakeView()
+    obj = _make_panel(panel, timer, view)
+    _begin_turn(obj)
+    obj._stream_wrapper_visible = True
+
+    obj._stream_events.extend(
+        [
+            {"type": "text_chunk", "content": "hi", "_gen": 0},
+            {"type": "text_end", "_gen": 0},
+            {"type": "turn_end", "_gen": 0},
+        ]
+    )
+    obj._on_stream_flush(None)
+
+    assert _hide_scripts(view) == [], "the deferred entry render owns the hide"
+    assert obj._stream_wrapper_visible is False
+    assert obj._render_pending is True, "the entry render waits behind the stream update"
+    assert len(view.async_scripts) == 1, "only the incremental update went out"
+    assert _user_js(view.async_scripts[0]).startswith("_updateStream(")
+
+    _settle(obj, view)  # the stream update replies -> the replay renders
+
+    assert len(_rebuild_scripts(view)) == 1, "exactly one full rebuild"
+    _settle(obj, view)
+    assert _hide_scripts(view) == [], "still no separate hide"
+
+
+def test_cancelled_turn_still_hides_the_wrapper(panel_mod) -> None:
+    """The cancel path has no following rebuild, so the hide must dispatch."""
+    panel, _windows = panel_mod
+    timer = _FakeTimer()
+    view = _FakeView()
+    obj = _make_panel(panel, timer, view)
+    _begin_turn(obj)
+    obj._stream_wrapper_visible = True
+
+    obj._on_stop(None)
+
+    assert len(view.async_scripts) == 1, "the hide reaches the view"
+    assert _hide_scripts(view) == [_user_js(view.async_scripts[0])]
+    assert "pending-ai-text" in _hide_scripts(view)[0]
+    assert obj._stream_wrapper_visible is False
+    assert obj._render_pending is False, "the hide is not folded into a render that never comes"
+
+
+def test_shell_probe_is_not_re_requested_while_in_flight(panel_mod) -> None:
+    panel, _windows = panel_mod
+    timer = _FakeTimer()
+    view = _FakeView()
+    obj = _make_panel(panel, timer, view)
+    obj._shell_loaded = False
+
+    obj._request_shell_probe()
+    obj._request_shell_probe()  # e.g. a modal tick while the first is outstanding
+
+    assert len(view.async_scripts) == 1
+    assert len(obj._script_requests) == 1
+    assert obj._shell_probe_attempts == 1, "only dispatched probes count"
+
+    # A "not ready" reply leaves the shell unconfirmed; the next call probes.
+    seq = next(iter(obj._script_requests))
+    _reply(obj, seq, result=json.dumps({"conv": False, "js": False}))
+    obj._shell_probe_timer.Stop()
+    obj._request_shell_probe()
+
+    assert len(view.async_scripts) == 2
+    assert obj._shell_probe_attempts == 2
+
+
+def test_exhausted_probe_retries_once_per_idle_period(panel_mod) -> None:
+    """After the budget, probes wait one idle window instead of every tick."""
+    panel, _windows = panel_mod
+    timer = _FakeTimer()
+    view = _FakeView()
+    obj = _make_panel(panel, timer, view)
+    obj._shell_loaded = False
+    obj._shell_probe_attempts = _panel_module._SHELL_PROBE_MAX_ATTEMPTS
+    obj._shell_probe_last_ts = time.monotonic()
+
+    for _ in range(5):  # five modal ticks inside the quiet period
+        obj._request_shell_probe()
+
+    assert view.async_scripts == [], "no probe during the quiet period"
+    assert obj._render_pending is True
+    assert obj._shell_probe_timer.running is True
+    assert obj._shell_probe_timer.starts[-1] == _panel_module._SHELL_PROBE_IDLE_RESET_MS
+
+    # The idle window elapses: exactly one probe, and a fresh budget.
+    obj._shell_probe_last_ts -= _panel_module._SHELL_PROBE_IDLE_RESET_S + 1
+    _fire_probe_timer(obj)
+
+    assert len(view.async_scripts) == 1
+    assert obj._shell_probe_attempts == 1, "the budget restarted"
+    assert obj._shell_probe_timer.running is False
