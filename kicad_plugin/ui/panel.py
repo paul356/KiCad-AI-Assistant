@@ -3037,7 +3037,10 @@ if _WX_AVAILABLE:
                 return
             kind = payload.get("kind")
             if kind == "diag":
-                log.info("diag: ui state %s", payload)
+                if payload.get("level") == "warning":
+                    log.warning("%s", payload.get("message", "diagnostic"))
+                else:
+                    log.info("diag: ui state %s", payload)
                 return
             if kind != "find":
                 log.debug("search: message dropped — bad payload (kind=%r)", kind)
@@ -3060,20 +3063,25 @@ if _WX_AVAILABLE:
                 return
             index = payload.get("index")
             log_index = index if isinstance(index, int) else 0
+            marked = payload.get("marked")
+            if not isinstance(marked, int) or marked < 0:
+                marked = 0
             if sent_at is None:
                 log.debug(
-                    "search: result seq=%d count=%d index=%d rtt_ms=unknown",
+                    "search: result seq=%d count=%d index=%d marked=%d rtt_ms=unknown",
                     seq,
                     count,
                     log_index,
+                    marked,
                 )
             else:
                 rtt_ms = (time.monotonic() - sent_at) * 1000.0
                 log.debug(
-                    "search: result seq=%d count=%d index=%d rtt_ms=%.1f",
+                    "search: result seq=%d count=%d index=%d marked=%d rtt_ms=%.1f",
                     seq,
                     count,
                     log_index,
+                    marked,
                     rtt_ms,
                 )
             if count == 0:

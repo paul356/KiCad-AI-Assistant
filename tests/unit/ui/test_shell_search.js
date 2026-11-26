@@ -69,6 +69,11 @@ const sandbox = {
     // click-to-collapse handler.
     setTimeout: (fn, ms) => setTimeout(fn, ms),
     clearTimeout: (id) => clearTimeout(id),
+    __listeners: {},
+    addEventListener: function(type, fn) {
+        if (!this.__listeners[type]) this.__listeners[type] = [];
+        this.__listeners[type].push(fn);
+    },
     getSelection: function() {
         return dom.window.getSelection ? dom.window.getSelection() : { isCollapsed: true };
     },
@@ -272,6 +277,111 @@ section('11. Script message posts kind/seq/count for async results');
         await new Promise((resolve) => global.setTimeout(resolve, 350));
         assert(firstRow.hasAttribute('open'), 'earlier duplicate-id row must stay open (no wrong-target collapse)');
         assert(!secondRow.hasAttribute('open'), 'clicked later row collapses despite the shared id');
+    }
+
+    section('14. Large match counts stay bounded per visible window');
+    {
+        const conv = document.getElementById('conversation');
+        const saved = conv.innerHTML;
+        let html = '';
+        for (let i = 0; i < 2000; i++) html += '<span>x</span>';
+        conv.innerHTML = html;
+
+        const result = _findText('x');
+        assert(result === '1/2000', 'true total is reported: got ' + result);
+        assert(sandbox.__findTotal === 2000, 'total hits: got ' + sandbox.__findTotal);
+        assert(sandbox.__findMatches.length <= 2000,
+            'marks stay within MAX_MARKS: got ' + sandbox.__findMatches.length);
+
+        const clearResult = _clearFind();
+        assert(clearResult === '0/0', 'clear returns explicit 0/0 after a large search');
+        assert(conv.textContent === 'x'.repeat(2000), 'clearing restores the text losslessly');
+
+        conv.innerHTML = saved;
+        _clearFind();
+    }
+
+    section('15. Only blocks near the viewport are highlighted');
+    {
+        const conv = document.getElementById('conversation');
+        const saved = conv.innerHTML;
+        const savedHeight = sandbox.innerHeight;
+        const savedScrollY = sandbox.scrollY;
+        conv.innerHTML = '';
+        for (let i = 0; i < 6; i++) {
+            const block = document.createElement('span');
+            block.textContent = 'needle';
+            block.__rect = { top: i * 1000, bottom: i * 1000 + 900, height: 900 };
+            block.getBoundingClientRect = function() { return this.__rect; };
+            conv.appendChild(block);
+        }
+        sandbox.innerHeight = 100;
+        sandbox.scrollY = 0;
+
+        const result = _findText('needle');
+        assert(result === '1/6', 'off-screen hits still count: got ' + result);
+        const blocks = Array.from(conv.children);
+        assert(blocks[0].querySelectorAll('mark.search-match').length === 1,
+            'visible block is marked');
+        assert(blocks[1].querySelectorAll('mark.search-match').length === 0,
+            'block more than two screens below is not marked');
+
+        sandbox.scrollY = 2000;
+        (sandbox.__listeners.scroll || []).forEach((fn) => fn());
+        await new Promise((resolve) => global.setTimeout(resolve, 220));
+
+        assert(blocks[1].querySelectorAll('mark.search-match').length === 1,
+            'scrolling marks the newly visible block');
+        assert(blocks[2].querySelectorAll('mark.search-match').length === 1,
+            'second-screen block marked after scroll');
+        assert(blocks[3].querySelectorAll('mark.search-match').length === 0,
+            'block beyond the window stays unmarked');
+
+        sandbox.innerHeight = savedHeight;
+        sandbox.scrollY = savedScrollY;
+        conv.innerHTML = saved;
+        _clearFind();
+    }
+
+    section('16. Clearing normalizes once per parent and is lossless');
+    {
+        const conv = document.getElementById('conversation');
+        const saved = conv.innerHTML;
+        conv.innerHTML = '';
+        for (let i = 0; i < 50; i++) {
+            const block = document.createElement('span');
+            block.textContent = 'aaa aaa aaa';
+            conv.appendChild(block);
+        }
+        const before = conv.textContent;
+
+        const NodeProto = dom.window.Node.prototype;
+        const originalNormalize = NodeProto.normalize;
+        let normalizeCalls = 0;
+        const parents = new Set();
+        NodeProto.normalize = function() {
+            normalizeCalls++;
+            parents.add(this);
+            return originalNormalize.call(this);
+        };
+        try {
+            _findText('aaa');
+            assert(sandbox.__findMatches.length === 150,
+                'three marks per block: got ' + sandbox.__findMatches.length);
+            _clearFind();
+            assert(normalizeCalls <= parents.size,
+                'one normalize per parent: ' + normalizeCalls + ' calls for ' + parents.size + ' parents');
+
+            _findText('zzznotfound');
+            _clearFind();
+            assert(normalizeCalls <= parents.size * 2,
+                'no per-mark normalize: ' + normalizeCalls + ' calls for ' + parents.size + ' parents');
+            assert(conv.textContent === before, 'conversation text is unchanged after clearing');
+        } finally {
+            NodeProto.normalize = originalNormalize;
+            conv.innerHTML = saved;
+            _clearFind();
+        }
     }
 
     // ---- Summary ----

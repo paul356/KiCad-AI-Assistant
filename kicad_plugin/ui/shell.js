@@ -302,17 +302,87 @@ window._clearConversation = function() {
 })();
 
 // ---- Search / Find in conversation ----
-// State: array of DOM nodes that contain matches, plus the current index.
+// Highlight only matches near the viewport.  A one-character query can hit
+// tens of thousands of times; creating a <mark> for each hit made clearing
+// O(marks * siblings) and exhausted WebKit memory.  Matches are collected
+// first (strings only); <mark> nodes are built on demand for visible blocks.
+var MAX_MARKS = 2000;
+// Refuse to scan pathologically large conversations.
+var MSK_MAX_TEXT_NODES = 200000;
+var FIND_SCROLL_DEBOUNCE_MS = 120;
+
+// __findMatches: created <mark> nodes.  __findNodes/__findNodeIdx/
+// __findOffsets describe every hit; __findTotal is the true hit count.
 window.__findMatches = [];
+window.__findNodes = [];
+window.__findNodeIdx = [];
+window.__findOffsets = [];
+window.__findNodeBlock = [];
+window.__findMarkByIndex = {};
+window.__findTotal = 0;
 window.__findIdx = -1;
 window.__findQuery = '';
+window.__findCapWarnedQuery = '';
+
+function _notifyWarning(message) {
+    if (!window.kcaa || !window.kcaa.postMessage) return;
+    window.kcaa.postMessage(JSON.stringify({
+        kind: 'diag',
+        level: 'warning',
+        message: message,
+    }));
+}
 
 // A conversation rebuild or append invalidates the match nodes (a rebuild
 // detaches them).  Python re-applies the live query afterwards; dropping the
 // stale references here keeps highlights from pointing at detached nodes.
 function _resetFindState() {
     window.__findMatches = [];
+    window.__findNodes = [];
+    window.__findNodeIdx = [];
+    window.__findOffsets = [];
+    window.__findNodeBlock = [];
+    window.__findMarkByIndex = {};
+    window.__findTotal = 0;
     window.__findIdx = -1;
+}
+
+// Remove every mark currently in the DOM, grouping by parent so normalize()
+// runs once per parent instead of once per mark (the old clear was
+// O(marks * siblings) and could balloon WebKit memory).
+function _clearMarkNodes() {
+    var marks = window.__findMatches.slice();
+    var domMarks = document.querySelectorAll('mark.search-match');
+    for (var d = 0; d < domMarks.length; d++) {
+        // Include marks whose reference was dropped by _resetFindState().
+        if (marks.indexOf(domMarks[d]) === -1) marks.push(domMarks[d]);
+    }
+    var groupParents = [];
+    var groupMarks = [];
+    for (var i = 0; i < marks.length; i++) {
+        var mark = marks[i];
+        var parent = mark.parentNode;
+        if (!parent) continue;
+        var gi = groupParents.indexOf(parent);
+        if (gi === -1) {
+            groupParents.push(parent);
+            groupMarks.push([mark]);
+        } else {
+            groupMarks[gi].push(mark);
+        }
+    }
+    for (var g = 0; g < groupParents.length; g++) {
+        var holder = groupParents[g];
+        var group = groupMarks[g];
+        for (var j = 0; j < group.length; j++) {
+            var m = group[j];
+            holder.replaceChild(document.createTextNode(m.textContent), m);
+        }
+        // One normalize per parent, after all its marks are gone.
+        holder.normalize();
+    }
+    window.__findMatches = [];
+    window.__findMarkByIndex = {};
 }
 
 // Report a find result to Python through the script message handler.  A
@@ -321,137 +391,258 @@ function _resetFindState() {
 function _postFindResult(seq, query) {
     if (seq === undefined) return;
     if (!window.kcaa || !window.kcaa.postMessage) return;
-    var count = window.__findMatches.length;
+    var count = window.__findTotal;
     window.kcaa.postMessage(JSON.stringify({
         kind: 'find',
         seq: seq,
         count: count,
+        marked: window.__findMatches.length,
         query: query || '',
         index: count > 0 ? (window.__findIdx + 1) : 0,
     }));
 }
 
-window._findText = function(query) {
+// The direct child of #conversation that owns this text node, or null.
+function _blockElement(node) {
+    var conv = document.getElementById('conversation');
+    if (!conv) return null;
+    var el = node.parentNode;
+    while (el && el !== conv) {
+        if (el.parentNode === conv) return el;
+        el = el.parentNode;
+    }
+    return null;
+}
+
+function _blockIndexOf(node, conv) {
+    var block = _blockElement(node);
+    if (!block) return -1;
+    return Array.prototype.indexOf.call(conv.children, block);
+}
+
+// Collect every hit as text-node index + character offset.  Creates no DOM.
+window._collectMatches = function(query) {
     _clearFind();
-    window.__findMatches = [];
-    window.__findIdx = -1;
     window.__findQuery = query || '';
-    if (!query || query.length === 0) return '0/0';
+    if (!query || query.length === 0) return;
 
     var conv = document.getElementById('conversation');
-    if (!conv) return '0/0';
+    if (!conv) return;
 
-    // Walk all text nodes inside the conversation container
     var walker = document.createTreeWalker(conv, NodeFilter.SHOW_TEXT, null, false);
     var lowerQuery = query.toLowerCase();
-    var textNodes = [];
+    var nodes = [];
     while (walker.nextNode()) {
         var node = walker.currentNode;
         // Skip nodes inside <style> or <script>
         if (node.parentNode && (node.parentNode.tagName === 'STYLE' || node.parentNode.tagName === 'SCRIPT')) continue;
         // Skip empty / whitespace-only nodes
         if (!node.nodeValue || !node.nodeValue.trim()) continue;
-        textNodes.push(node);
+        nodes.push(node);
     }
 
-    for (var i = 0; i < textNodes.length; i++) {
-        var node = textNodes[i];
-        var text = node.nodeValue;
-        var lower = text.toLowerCase();
-        var idx = lower.indexOf(lowerQuery);
-        if (idx === -1) continue;
+    if (nodes.length > MSK_MAX_TEXT_NODES) {
+        _notifyWarning('search: conversation too large (' + nodes.length +
+            ' text nodes), highlighting disabled');
+        return;
+    }
 
-        // Replace all occurrences in this text node with <mark> wrappers
-        var parent = node.parentNode;
-        var fragment = document.createDocumentFragment();
-        var lastEnd = 0;
+    window.__findNodes = nodes;
+    window.__findNodeBlock = [];
+    for (var i = 0; i < nodes.length; i++) {
+        window.__findNodeBlock.push(_blockIndexOf(nodes[i], conv));
+        var lower = nodes[i].nodeValue.toLowerCase();
+        var idx = lower.indexOf(lowerQuery);
         while (idx !== -1) {
-            // Text before match
-            if (idx > lastEnd) {
-                fragment.appendChild(document.createTextNode(text.substring(lastEnd, idx)));
-            }
-            // The match wrapped in <mark>
-            var mark = document.createElement('mark');
-            mark.className = 'search-match';
-            mark.textContent = text.substring(idx, idx + query.length);
-            fragment.appendChild(mark);
-            window.__findMatches.push(mark);
             var previousIdx = idx;
-            // Advance by at least one unit even if the matched text folds to
-            // a different length, and refuse to revisit the same index: a
-            // stale match must not spin forever.
-            lastEnd = idx + Math.max(1, query.length);
-            idx = lower.indexOf(lowerQuery, lastEnd);
+            window.__findNodeIdx.push(i);
+            window.__findOffsets.push(idx);
+            // Advance by at least one unit even if the text folds to a
+            // different length, and refuse to revisit the same index.
+            idx = lower.indexOf(lowerQuery, idx + Math.max(1, lowerQuery.length));
             if (idx !== -1 && idx <= previousIdx) break;
         }
-        // Remaining text after last match
-        if (lastEnd < text.length) {
-            fragment.appendChild(document.createTextNode(text.substring(lastEnd)));
-        }
-        parent.replaceChild(fragment, node);
+    }
+    window.__findTotal = window.__findOffsets.length;
+};
+
+// Read every block rect once, before any DOM mutation, then decide which
+// blocks are visible: one screen above and two screens below the viewport.
+function _visibleBlocks() {
+    var conv = document.getElementById('conversation');
+    var visible = [];
+    if (!conv) return visible;
+    var children = conv.children;
+    var rects = [];
+    var anyHeight = false;
+    for (var i = 0; i < children.length; i++) {
+        var rect = children[i].getBoundingClientRect();
+        rects.push(rect);
+        if (rect.height > 0) anyHeight = true;
+    }
+    var innerHeight = window.innerHeight || 0;
+    if (innerHeight <= 0 || !anyHeight) {
+        // jsdom / no-layout environments: treat everything as visible.
+        for (i = 0; i < children.length; i++) visible[i] = true;
+        return visible;
+    }
+    var scrollY = window.scrollY || 0;
+    for (i = 0; i < children.length; i++) {
+        var r = rects[i];
+        visible[i] = r.bottom >= -1.0 * innerHeight &&
+            r.top <= scrollY + 2.0 * innerHeight;
+    }
+    return visible;
+}
+
+// Rebuild <mark> nodes for the visible blocks only.  Re-collects matches so
+// the text-node references stay valid after the previous bulk clear/normalize.
+function _renderWindow() {
+    var query = window.__findQuery;
+    if (!query) {
+        _clearMarkNodes();
+        return;
+    }
+    var savedIdx = window.__findIdx;
+    _collectMatches(query);
+    window.__findIdx = savedIdx;
+    if (window.__findTotal <= 0) return;
+
+    var visible = _visibleBlocks();
+    var total = window.__findTotal;
+    var byNode = {};
+    for (var m = 0; m < total; m++) {
+        var ni = window.__findNodeIdx[m];
+        var bi = window.__findNodeBlock[ni];
+        if (bi >= 0 && !visible[bi]) continue;
+        if (!byNode[ni]) byNode[ni] = [];
+        byNode[ni].push(m);
     }
 
-    return window.__findMatches.length > 0 ? ('1/' + window.__findMatches.length) : '0/0';
+    var qlen = query.length;
+    for (var key in byNode) {
+        var node = window.__findNodes[parseInt(key, 10)];
+        if (!node || !node.parentNode) continue;
+        var indices = byNode[key];
+        // Descending offsets keep the earlier offsets valid as the node shrinks.
+        for (var k = indices.length - 1; k >= 0; k--) {
+            if (window.__findMatches.length >= MAX_MARKS) {
+                if (window.__findCapWarnedQuery !== query && total > MAX_MARKS) {
+                    _notifyWarning('search: window capped at ' +
+                        window.__findMatches.length + ' of ' + total + ' matches');
+                    window.__findCapWarnedQuery = query;
+                }
+                return;
+            }
+            var mi = indices[k];
+            var off = window.__findOffsets[mi];
+            var value = node.nodeValue;
+            if (!value || off < 0 || off + qlen > value.length) continue;
+            var parent = node.parentNode;
+            var mark = document.createElement('mark');
+            mark.className = 'search-match';
+            mark.textContent = value.substring(off, off + qlen);
+            node.nodeValue = value.substring(0, off);
+            parent.insertBefore(mark, node.nextSibling);
+            parent.insertBefore(document.createTextNode(value.substring(off + qlen)), mark.nextSibling);
+            window.__findMatches.push(mark);
+            window.__findMarkByIndex[mi] = mark;
+        }
+    }
+}
+
+// Compatibility helper: collect and render the visible window immediately.
+window._findText = function(query) {
+    _collectMatches(query);
+    if (window.__findTotal === 0) return '0/0';
+    window.__findIdx = 0;
+    _renderWindow();
+    var mark = window.__findMarkByIndex[0];
+    if (mark) mark.classList.add('search-active');
+    return '1/' + window.__findTotal;
 };
 
 window._findTextAndJump = function(query, seq) {
-    var result = _findText(query);
-    if (window.__findMatches.length > 0) {
-        _findJump(0);
+    _collectMatches(query);
+    var result = '0/0';
+    if (window.__findTotal > 0) {
+        window.__findIdx = 0;
+        result = _findJump(0);
     }
     _postFindResult(seq, query);
     return result;
 };
 
 window._findJump = function(idx) {
-    if (window.__findMatches.length === 0) return '0/0';
-    // De-highlight previous
-    for (var i = 0; i < window.__findMatches.length; i++) {
-        window.__findMatches[i].classList.remove('search-active');
-    }
-    // Clamp index
-    var n = window.__findMatches.length;
-    var newIdx = ((idx % n) + n) % n;
+    if (window.__findTotal <= 0) return '0/0';
+    var total = window.__findTotal;
+    var newIdx = ((idx % total) + total) % total;
     window.__findIdx = newIdx;
-    var el = window.__findMatches[newIdx];
-    el.classList.add('search-active');
-    // Walk up and expand any parent <details> elements so the match is visible
-    var parent = el.parentNode;
-    while (parent) {
-        if (parent.tagName === 'DETAILS' && !parent.hasAttribute('open')) {
-            parent.setAttribute('open', '');
+    var node = window.__findNodes[window.__findNodeIdx[newIdx]];
+    var conv = document.getElementById('conversation');
+    if (node && node.parentNode) {
+        // Expand collapsed tool rows so the target is visible.
+        var el = node.parentNode;
+        while (el && el !== conv) {
+            if (el.tagName === 'DETAILS' && !el.hasAttribute('open')) {
+                el.setAttribute('open', '');
+            }
+            el = el.parentNode;
         }
-        parent = parent.parentNode;
+        var block = _blockElement(node);
+        if (block && block.scrollIntoView) {
+            block.scrollIntoView({ block: 'center' });
+        }
     }
-    el.scrollIntoView({ behavior: 'smooth', block: 'center' });
-    return (newIdx + 1) + '/' + n;
+    _renderWindow();
+    var mark = window.__findMarkByIndex[newIdx];
+    if (mark && mark.classList) {
+        mark.classList.add('search-active');
+        if (mark.scrollIntoView) {
+            mark.scrollIntoView({ block: 'center' });
+        }
+    }
+    return (newIdx + 1) + '/' + total;
 };
 
 window._findNext = function(seq) {
-    var result = _findJump((window.__findIdx + 1) % (window.__findMatches.length || 1));
+    var total = window.__findTotal;
+    var result = total > 0 ? _findJump(window.__findIdx + 1) : '0/0';
     _postFindResult(seq, window.__findQuery);
     return result;
 };
 
 window._findPrev = function(seq) {
-    var result = _findJump((window.__findIdx - 1 + (window.__findMatches.length || 1)) % (window.__findMatches.length || 1));
+    var total = window.__findTotal;
+    var result = total > 0 ? _findJump(window.__findIdx - 1) : '0/0';
     _postFindResult(seq, window.__findQuery);
     return result;
 };
 
 window._clearFind = function(seq) {
-    var marks = document.querySelectorAll('mark.search-match');
-    for (var i = marks.length - 1; i >= 0; i--) {
-        var mark = marks[i];
-        var parent = mark.parentNode;
-        if (parent) {
-            parent.replaceChild(document.createTextNode(mark.textContent), mark);
-            parent.normalize();
-        }
-    }
-    window.__findMatches = [];
+    _clearMarkNodes();
+    window.__findNodes = [];
+    window.__findNodeIdx = [];
+    window.__findOffsets = [];
+    window.__findNodeBlock = [];
+    window.__findTotal = 0;
     window.__findIdx = -1;
     window.__findQuery = '';
     _postFindResult(seq, '');
     return '0/0';
 };
+
+// Re-highlight as the reader scrolls.  No postMessage: scrolling must not
+// move the count label or race the search sequence.
+(function _installFindScroll() {
+    if (!window.addEventListener) return;
+    var timer = null;
+    window.addEventListener('scroll', function() {
+        if (!window.__findQuery) return;
+        if (timer !== null) clearTimeout(timer);
+        timer = setTimeout(function() {
+            timer = null;
+            if (window.__findQuery) _renderWindow();
+        }, FIND_SCROLL_DEBOUNCE_MS);
+    });
+})();

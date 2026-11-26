@@ -659,6 +659,36 @@ def test_search_message_updates_count_label(panel_mod) -> None:
     assert obj._search_count_label.label == "2/3"
 
 
+def test_search_message_uses_total_count_and_logs_marked(panel_mod) -> None:
+    panel, _windows = panel_mod
+    timer = _FakeTimer()
+    view = _FakeView()
+    obj = _make_search_panel(panel, timer, view)
+
+    with mock.patch.object(panel.log, "debug") as debug:
+        obj._on_search_message(
+            _ScriptMessage(
+                {
+                    "kind": "find",
+                    "seq": 1,
+                    "count": 56409,
+                    "marked": 1200,
+                    "query": "o",
+                    "index": 1,
+                }
+            )
+        )
+
+    assert obj._search_count_label.label == "1/56409", "the label uses the true total"
+    debug.assert_any_call(
+        "search: result seq=%d count=%d index=%d marked=%d rtt_ms=unknown",
+        1,
+        56409,
+        1,
+        1200,
+    )
+
+
 def test_stale_search_message_is_ignored(panel_mod) -> None:
     panel, _windows = panel_mod
     timer = _FakeTimer()
@@ -885,8 +915,17 @@ def test_clear_find_returns_explicit_result() -> None:
 
 def test_find_text_mark_loop_always_advances() -> None:
     source = (Path(_panel_module.__file__).parent / "shell.js").read_text(encoding="utf-8")
-    assert "Math.max(1, query.length)" in source
+    assert "Math.max(1, lowerQuery.length)" in source
     assert "idx <= previousIdx" in source
+
+
+def test_clear_marks_normalizes_each_parent_once() -> None:
+    """Per-mark normalize() made clearing quadratic on huge conversations."""
+    source = (Path(_panel_module.__file__).parent / "shell.js").read_text(encoding="utf-8")
+    start = source.index("function _clearMarkNodes()")
+    body = source[start : source.index("\n}\n", start)]
+    assert body.count(".normalize()") == 1, "one normalize() for all marks of a parent"
+    assert "groupParents" in body
 
 
 # --------------------------------------------------------------------------- #
