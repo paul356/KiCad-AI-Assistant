@@ -78,7 +78,7 @@ def test_shell_html_has_no_floating_jump_button() -> None:
 
 
 def test_shell_html_inlines_both_jump_hooks() -> None:
-    """The native buttons call these hooks through RunScript."""
+    """The native buttons call these hooks through the async dispatcher."""
     head, _ = _SHELL_HTML.split("<body>", 1)
     assert "window._jumpToLatest = function()" in head
     assert "window._jumpToStart = function()" in head
@@ -381,17 +381,23 @@ class _FakePanel:
         self.scripts: list[str] = []
         self._script_error = script_error
 
-    def _run_script(self, script: str) -> tuple[bool, None]:
+    def _dispatch_render(self, script: str, **_kwargs) -> bool:
         self.scripts.append(script)
         if self._script_error:
             raise RuntimeError("backend down")
-        return True, None
+        return True
 
 
 def _handler(name: str):
     namespace = {
         "wx": SimpleNamespace(VERTICAL=_WX_VERTICAL),
         "log": logging.getLogger(__name__),
+        # The handlers name their dispatch label through module constants.
+        **{
+            attr: getattr(_panel_module, attr)
+            for attr in dir(_panel_module)
+            if attr.startswith("_SCRIPT_LABEL_")
+        },
     }
     exec(textwrap.dedent(_source(_function(name))), namespace)
     return namespace[name]
