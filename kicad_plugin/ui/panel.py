@@ -70,9 +70,21 @@ _SCRIPT_KIND_PROBE = "probe"
 # Request labels that decide post-reply bookkeeping.
 _SCRIPT_LABEL_REBUILD = "update_conversation"
 _SCRIPT_LABEL_APPEND = "append_entry"
-_SCRIPT_LABEL_WRAPPER_SHOW = "show_stream_wrapper"
+_SCRIPT_LABEL_STREAM_UPDATE = "stream_update"
+_SCRIPT_LABEL_WRAPPER_HIDE = "hide_stream_wrapper"
+_SCRIPT_LABEL_JUMP_START = "jump_start"
+_SCRIPT_LABEL_JUMP_LATEST = "jump_latest"
 _SCRIPT_LABEL_SHELL = "shell_probe"
 _SCRIPT_LABEL_DIAG = "diag_probe"
+
+# Shell readiness probe (issue #342 review): EVT_WEBVIEW_LOADED is not raised
+# on every WebView2 version, so the probe is the only readiness source and a
+# single lost reply must not stall rendering forever.  Retries are bounded;
+# the first one waits for the page's scripts, the rest back off.
+_SHELL_PROBE_FIRST_DELAY_MS = 1000
+_SHELL_PROBE_RETRY_MS = (250, 500, 1000, 2000)
+_SHELL_PROBE_MAX_ATTEMPTS = 5
+_SHELL_PROBE_ERROR_AFTER = 3  # consecutive timeouts before one log.error
 
 
 @dataclasses.dataclass
@@ -94,19 +106,31 @@ class _PendingScript:
     replace: bool
     follow: bool
     restore_search: bool = False
+    generation: int = 0  # page generation at dispatch (stale replies dropped)
 
 
-def _wrap_script(seq: int, js: str) -> str:
+def _wrap_script(seq: int, js: str, *, expression: bool = False) -> str:
     """Wrap one script so its result comes back over the "kcaa" channel.
 
-    ``js`` is either an expression or a statement block, so all production
-    call strings work unchanged.  The wrapper posts
-    ``{kind:'exec', seq, ok, result, error}``; braces are concatenated here,
-    never formatted into the template.
+    ``expression=True`` evaluates ``js`` as an expression and reports its
+    value (``return (js);``); without it ``js`` runs as a statement block and
+    the reply carries ``result: null``.  A statement-mode block would
+    otherwise return ``undefined``, which ``JSON.stringify`` drops — so the
+    wrapper normalises ``undefined`` to ``null`` for both modes.
+
+    The payload is ``{kind:'exec', seq, ok, result, error}``.  Braces are
+    concatenated here, never formatted into the template, and every ``js`` is
+    followed by a newline so a trailing ``//`` comment cannot comment out the
+    wrapper tail.
     """
+    if expression:
+        body = "return (\n" + js + "\n);"
+    else:
+        body = js + "\n"
     return (
         "(function(){var s=" + str(seq) + ";var r=null;var e=null;"
-        "try{r=(function(){" + js + "})();}catch(x){e=String(x&&x.message||x);}"
+        "try{r=(function(){\n" + body + "})();}catch(x){e=String(x&&x.message||x);}"
+        "if(r===undefined){r=null;}"
         "try{kcaa.postMessage(JSON.stringify({kind:'exec',seq:s,ok:e===null,"
         "result:r,error:e}));}catch(_){}})()"
     )
@@ -540,6 +564,14 @@ if _WX_AVAILABLE:
             self._script_seq: int = 0
             self._script_requests: dict[int, _PendingScript] = {}
             self._script_timeout_timer = wx.Timer(self)
+            # Shell readiness probe: bounded retries with backoff, armed from
+            # EVT_WEBVIEW_LOADED and from every probe timeout.  The page
+            # generation increments whenever the shell is (re)loaded; a probe
+            # reply from an older generation is discarded.
+            self._shell_probe_timer = wx.Timer(self)
+            self._shell_probe_attempts: int = 0
+            self._shell_probe_timeouts: int = 0
+            self._page_generation: int = 0
             # Find/search runs off RunScriptAsync: EVT_TEXT only stores the
             # query and restarts this debounce; results arrive through the
             # "kcaa" script message handler and carry a sequence number so a
@@ -694,6 +726,8 @@ if _WX_AVAILABLE:
         def _set_shell_loaded(self, value: bool, reason: str) -> None:
             """Assign _shell_loaded and log the transition with its reason."""
             self._shell_loaded = value
+            if value:
+                self._cancel_shell_probe()
             log.info("render: shell_loaded -> %s (reason=%s)", value, reason)
 
         def _load_shell(self, reason: str) -> None:
@@ -707,6 +741,14 @@ if _WX_AVAILABLE:
             log.info("render: load_shell called (reason=%s)", reason)
             shell_html = self._build_shell_html()
             log.debug("Loading shell HTML: %d bytes", len(shell_html))
+            # A new page invalidates everything in flight: requests from the
+            # old document cannot be answered and a probe reply must not
+            # confirm a page that is being replaced.
+            self._page_generation += 1
+            self._abort_script_requests()
+            self._cancel_shell_probe()
+            self._shell_probe_attempts = 0
+            self._shell_probe_timeouts = 0
             self._page_loading = True
             self._set_shell_loaded(False, "page-load-start")
             self._stream_wrapper_visible = False
@@ -765,13 +807,7 @@ if _WX_AVAILABLE:
                     # from EVT_WEBVIEW_LOADED: on GTK the handler needs the
                     # native view, which does not exist yet here.
                     self._script_channel_ok = self._setup_script_channel()
-                    log.info(
-                        "script: channel async_ok=%s run_script_async=%s script_messages=%s retried=%s",
-                        self._script_channel_ok,
-                        hasattr(self._conv_view, "RunScriptAsync"),
-                        getattr(_wx_html2, "EVT_WEBVIEW_SCRIPT_MESSAGE_RECEIVED", None) is not None,
-                        False,
-                    )
+                    self._log_script_channel(retried=False)
                     # Load the static shell (CSS + JS + empty containers).
                     # After this, all UI updates go through _dispatch_render.
                     self._load_shell("startup")
@@ -1015,6 +1051,7 @@ if _WX_AVAILABLE:
             self.Bind(wx.EVT_TIMER, self._on_page_watchdog, self._page_watchdog)
             self.Bind(wx.EVT_TIMER, self._on_modal_render_tick, self._modal_render_timer)
             self.Bind(wx.EVT_TIMER, self._on_script_sweep, self._script_timeout_timer)
+            self.Bind(wx.EVT_TIMER, self._on_shell_probe_tick, self._shell_probe_timer)
             self.Bind(wx.EVT_TIMER, self._on_search_tick, self._search_timer)
             self.Bind(wx.EVT_TIMER, self._on_project_watch_tick, self._project_watch_timer)
             self.Bind(wx.EVT_SHOW, self._on_panel_show)
@@ -1884,7 +1921,7 @@ if _WX_AVAILABLE:
             """Scroll the conversation to its first entry."""
             try:
                 if self._use_webview and self._shell_loaded:
-                    self._dispatch_render("_jumpToStart()", label="jump_start")
+                    self._dispatch_render("_jumpToStart()", label=_SCRIPT_LABEL_JUMP_START)
                 elif not self._use_webview:
                     self._conv_view.Scroll(0, 0)
             except Exception as e:
@@ -1894,7 +1931,7 @@ if _WX_AVAILABLE:
             """Scroll the conversation to its newest entry."""
             try:
                 if self._use_webview and self._shell_loaded:
-                    self._dispatch_render("_jumpToLatest()", label="jump_latest")
+                    self._dispatch_render("_jumpToLatest()", label=_SCRIPT_LABEL_JUMP_LATEST)
                 elif not self._use_webview:
                     self._conv_view.Scroll(0, self._conv_view.GetScrollRange(wx.VERTICAL))
             except Exception as e:
@@ -2317,15 +2354,14 @@ if _WX_AVAILABLE:
             # the draft, then a full conversation render for new entries.
             if draft_changed:
                 if self._use_webview:
-                    if self._shell_loaded and not self._stream_wrapper_visible:
-                        self._show_stream_wrapper()
+                    # _updateStream displays the stream wrapper itself.  A
+                    # separate display script would hold the render lock and
+                    # force the update it precedes to defer, escalating every
+                    # flush into a full rebuild (issue #342 review).
                     if not self._incremental_stream_update():
-                        # Deferred (lock busy / shell not loaded) or update
-                        # failed: _dispatch_render already recorded _render_pending,
-                        # so a full rebuild will replay (and the next flush
-                        # re-shows stream text).
-                        log.warning(
-                            "chat: stream flush deferred render (pending=%d chars)",
+                        log.debug(
+                            "chat: stream flush skipped incremental update "
+                            "(superseded / shell not loaded, pending=%d chars)",
                             len(self._pending_ai_text),
                         )
                 else:
@@ -2369,9 +2405,11 @@ if _WX_AVAILABLE:
             """Update streaming AI text via _updateStream JS call.
 
             The #pending-ai-text div always exists in the shell HTML, so this
-            should always succeed when the shell is loaded.  Runs under the
-            render protocol via _dispatch_render; on deferral or failure the
-            pending full-rebuild replay covers the missed incremental update.
+            should always succeed when the shell is loaded.  It is dispatched
+            as a supersedable script: each call carries the entire draft, so
+            when the render lock is busy this update is dropped and the next
+            flush re-sends it — no full rebuild is scheduled for it.  A
+            genuine script failure still records the pending rebuild.
             """
             if not self._use_webview:
                 return False
@@ -2383,12 +2421,19 @@ if _WX_AVAILABLE:
             scroll_arg = '"follow"' if follow else '"none"'
             js = f"_updateStream({_json.dumps(body_html)}, {scroll_arg})"
 
-            return self._dispatch_render(
+            dispatched = self._dispatch_render(
                 js,
                 follow=follow,
                 retry_on_failure=True,
-                label="stream_update",
+                label=_SCRIPT_LABEL_STREAM_UPDATE,
+                supersedable=True,
             )
+            if dispatched:
+                # _updateStream shows the wrapper and writes the draft in one
+                # script; claim the flag now so _hide_stream_wrapper at turn
+                # end still runs when the reply is still in flight.
+                self._stream_wrapper_visible = True
+            return dispatched
 
         def _on_page_watchdog(self, event) -> None:
             """Safety net: detect shell load timeout.
@@ -3228,7 +3273,11 @@ if _WX_AVAILABLE:
                 rtt_ms,
                 request.js_len,
             )
-            self._complete_script(request, ok, payload.get("result"), payload.get("error"))
+            # A reply without a ``result`` key (older wrapper, or a script
+            # that returned undefined) is a success with no value, not an
+            # error: only ``ok`` decides.
+            result = payload.get("result")
+            self._complete_script(request, ok, result, payload.get("error"))
 
         def _log_ui_state(self, reason: str) -> None:
             """Asynchronously report the live page state for diagnostics.
@@ -3252,7 +3301,12 @@ if _WX_AVAILABLE:
                 "marks: document.querySelectorAll('mark.search-match').length"
                 "};})()"
             )
-            if not self._dispatch_render(js, kind=_SCRIPT_KIND_PROBE, label=_SCRIPT_LABEL_DIAG):
+            if not self._dispatch_render(
+                js,
+                kind=_SCRIPT_KIND_PROBE,
+                label=_SCRIPT_LABEL_DIAG,
+                expression=True,
+            ):
                 log.debug("diag: probe deferred (reason=%s)", reason)
 
         def _maybe_log_ui_state(self, reason: str) -> None:
@@ -4247,6 +4301,7 @@ if _WX_AVAILABLE:
             if event.GetEventObject() is self:
                 self._stop_modal_render_replay()
                 self._abort_script_requests()
+                self._cancel_shell_probe()
                 self._search_timer.Stop()
                 if self._update_cancel_event is not None:
                     self._update_cancel_event.set()
@@ -4501,6 +4556,16 @@ if _WX_AVAILABLE:
                 return False
             return True
 
+        def _log_script_channel(self, *, retried: bool) -> None:
+            """Log the script-message channel state (initial attempt vs retry)."""
+            log.info(
+                "script: channel async_ok=%s run_script_async=%s script_messages=%s retried=%s",
+                self._script_channel_ok,
+                hasattr(self._conv_view, "RunScriptAsync"),
+                getattr(_wx_html2, "EVT_WEBVIEW_SCRIPT_MESSAGE_RECEIVED", None) is not None,
+                retried,
+            )
+
         def _retry_script_channel(self) -> None:
             """Register the script message channel again once the page loaded.
 
@@ -4513,13 +4578,7 @@ if _WX_AVAILABLE:
             if self._script_channel_ok or not self._use_webview:
                 return
             self._script_channel_ok = self._setup_script_channel()
-            log.info(
-                "script: channel async_ok=%s run_script_async=%s script_messages=%s retried=%s",
-                self._script_channel_ok,
-                hasattr(self._conv_view, "RunScriptAsync"),
-                getattr(_wx_html2, "EVT_WEBVIEW_SCRIPT_MESSAGE_RECEIVED", None) is not None,
-                True,
-            )
+            self._log_script_channel(retried=True)
 
         def _on_webview_loaded(self, event) -> None:
             """Called when the shell HTML has finished loading.
@@ -4540,10 +4599,13 @@ if _WX_AVAILABLE:
 
             # The view exists now: retry a channel registration that failed
             # while the panel was still being built (GTK needs the native
-            # view), then ask the shell once, asynchronously, whether its JS
-            # ran.
+            # view), then arm the readiness probe.  The probe retries on its
+            # own from here (see _schedule_shell_probe); this event is not
+            # raised on every WebView2 version.
             self._retry_script_channel()
-            wx.CallLater(1000, self._request_shell_probe)
+            self._shell_probe_attempts = 0
+            self._shell_probe_timeouts = 0
+            self._schedule_shell_probe(_SHELL_PROBE_FIRST_DELAY_MS)
 
         def _on_webview_error(self, event) -> None:
             """Handle WebView errors by reloading the shell.
@@ -4560,6 +4622,9 @@ if _WX_AVAILABLE:
             self._page_loading = False
             self._set_shell_loaded(False, "webview-error")
             self._abort_script_requests()
+            self._cancel_shell_probe()
+            self._shell_probe_attempts = 0
+            self._shell_probe_timeouts = 0
             self._stream_wrapper_visible = False
             self._page_watchdog.Stop()
             self._append_entry(
@@ -4572,40 +4637,137 @@ if _WX_AVAILABLE:
             self._render_pending = False
             wx.CallAfter(self._load_shell, "webview-error-reload")
 
-        def _request_shell_probe(self) -> None:
-            """Ask the shell once, asynchronously, whether its JS API is ready.
+        def _schedule_shell_probe(self, delay_ms: int | None = None) -> None:
+            """Arm the next readiness probe (idempotent, bounded).
 
-            Called 1 second after EVT_WEBVIEW_LOADED to give scripts time to
-            execute.  This is the only readiness probe: EVT_WEBVIEW_LOADED
-            plus this asynchronous reply decide ``_shell_loaded`` (the old
-            synchronous probe chain is gone, issue #342).  The probe is
-            read-only — it must never mutate the conversation.
+            Called from EVT_WEBVIEW_LOADED, from every probe timeout and from
+            a render that found the shell not loaded.  The retries stop at
+            ``_SHELL_PROBE_MAX_ATTEMPTS``; the last timeout logs one error so
+            a dead channel is visible instead of a silently blank panel.
             """
-            if not self._use_webview:
+            if not self._use_webview or self._shell_loaded:
                 return
-            # The CallLater can fire while a KiCad dialog owns the event
-            # loop; issue no JS at all in that case and replay later.
+            if self._shell_probe_attempts >= _SHELL_PROBE_MAX_ATTEMPTS:
+                log.debug(
+                    "render: shell probe budget exhausted (%d/%d attempts)",
+                    self._shell_probe_attempts,
+                    _SHELL_PROBE_MAX_ATTEMPTS,
+                )
+                return
+            if delay_ms is None:
+                # Back off with the attempt count, whether the previous probe
+                # timed out or answered "not ready yet".
+                index = max(0, min(self._shell_probe_attempts - 1, len(_SHELL_PROBE_RETRY_MS) - 1))
+                delay_ms = _SHELL_PROBE_RETRY_MS[index]
+            timer = self._shell_probe_timer
+            if timer is not None and not timer.IsRunning():
+                timer.Start(delay_ms, oneShot=True)
+
+        def _cancel_shell_probe(self) -> None:
+            """Disarm a pending readiness probe (shell confirmed or reloading)."""
+            timer = self._shell_probe_timer
+            if timer is not None:
+                timer.Stop()
+
+        def _on_shell_probe_tick(self, event=None) -> None:
+            """Fire the armed readiness probe."""
+            if self._shell_loaded:
+                self._cancel_shell_probe()
+                return
+            self._request_shell_probe()
+
+        def _request_shell_probe(self) -> None:
+            """Ask the shell, asynchronously, whether its JS API is ready.
+
+            This is the only readiness probe: EVT_WEBVIEW_LOADED plus its
+            reply decide ``_shell_loaded`` (the old synchronous probe chain is
+            gone, issue #342).  The script is read-only and returns a JSON
+            string, so the async and sync-fallback paths carry the same
+            information.
+            """
+            if not self._use_webview or self._shell_loaded:
+                return
+            if self._shell_probe_attempts >= _SHELL_PROBE_MAX_ATTEMPTS:
+                # Budget spent: do not probe on every modal tick.  Only a new
+                # page generation (EVT_WEBVIEW_LOADED / reload) resets it.
+                log.debug(
+                    "render: shell probe skipped — attempt budget exhausted (%d/%d)",
+                    self._shell_probe_attempts,
+                    _SHELL_PROBE_MAX_ATTEMPTS,
+                )
+                self._render_pending = True
+                return
+            # A dialog owning the loop forbids the synchronous fallback.
             if self._blocking_dialog() is not None:
                 self._render_pending = True
                 self._schedule_modal_render_replay()
                 log.info("render: shell probe deferred — modal dialog open")
                 return
             js = (
-                "({conv: !!document.getElementById('conversation'), "
+                "JSON.stringify({conv: !!document.getElementById('conversation'), "
                 "js: typeof _updateConversation === 'function', "
                 "font: getComputedStyle(document.body).fontFamily})"
             )
-            if not self._dispatch_render(js, kind=_SCRIPT_KIND_PROBE, label=_SCRIPT_LABEL_SHELL):
-                log.debug("render: shell probe not dispatched — replay scheduled")
+            if not self._dispatch_render(
+                js,
+                kind=_SCRIPT_KIND_PROBE,
+                label=_SCRIPT_LABEL_SHELL,
+                expression=True,
+            ):
+                log.debug("render: shell probe not dispatched — retry scheduled")
                 self._render_pending = True
-                self._schedule_modal_render_replay()
+                self._schedule_shell_probe()
+                return
+            self._shell_probe_attempts += 1
+            log.debug(
+                "render: shell probe dispatched (attempt %d/%d)",
+                self._shell_probe_attempts,
+                _SHELL_PROBE_MAX_ATTEMPTS,
+            )
 
-        def _on_shell_probe_reply(self, ok: bool, result: object, error: object) -> None:
-            """Decide shell readiness from the async probe, then render."""
-            state = result if isinstance(result, dict) else {}
-            if ok and state.get("conv") and state.get("js"):
+        @staticmethod
+        def _probe_state(result: object) -> dict | None:
+            """Interpret a probe result from either dispatch path.
+
+            The async path delivers the JSON string produced by the probe
+            script; the synchronous fallback delivers ``RunScript``'s string.
+            Older pages answered with a bare ``loaded``/``ok`` token.
+            """
+            if isinstance(result, dict):
+                return result
+            if not isinstance(result, str):
+                return None
+            text = result.strip()
+            try:
+                parsed = json.loads(text)
+            except Exception:
+                parsed = None
+            if isinstance(parsed, dict):
+                return parsed
+            if text in ("loaded", "ok"):
+                return {"conv": True, "js": True, "font": None}
+            return None
+
+        def _on_shell_probe_reply(
+            self, request: _PendingScript, ok: bool, result: object, error: object
+        ) -> None:
+            """Decide shell readiness from a probe reply, then render."""
+            if request.generation != self._page_generation:
+                log.debug(
+                    "render: stale shell probe reply dropped (gen=%d current=%d, seq=%d)",
+                    request.generation,
+                    self._page_generation,
+                    request.seq,
+                )
+                return
+            # Any answer means the channel is alive: only unanswered probes
+            # count as consecutive timeouts.
+            self._shell_probe_timeouts = 0
+            state = self._probe_state(result) if ok else None
+            if state is not None and state.get("conv") and state.get("js"):
                 self._set_shell_loaded(True, "probe-ok")
                 self._page_loading = False
+                self._shell_probe_attempts = 0
                 log.info("render: shell probe ok (font=%r)", state.get("font"))
             else:
                 log.warning(
@@ -4614,6 +4776,9 @@ if _WX_AVAILABLE:
                     result,
                     error,
                 )
+                # The page may still be executing its scripts: retry within
+                # the same bounded budget instead of stalling for good.
+                self._schedule_shell_probe()
 
             # Trigger render if there is content or pending
             if self._render_pending or self._conv_entries:
@@ -4723,6 +4888,8 @@ if _WX_AVAILABLE:
                 len(js),
             )
 
+            # Expression mode: the shell returns 'ok:<n>' / 'error:<why>' and
+            # _on_render_reply inspects it (error logging, find re-apply).
             if not self._dispatch_render(
                 js,
                 force_scroll_to_bottom=force_scroll_to_bottom,
@@ -4730,6 +4897,7 @@ if _WX_AVAILABLE:
                 follow=follow,
                 label=_SCRIPT_LABEL_REBUILD,
                 restore_search=True,
+                expression=True,
             ):
                 log.debug("_updateConversation deferred (pending rebuild scheduled)")
 
@@ -4882,6 +5050,8 @@ if _WX_AVAILABLE:
             kind: str = _SCRIPT_KIND_RENDER,
             label: str = "",
             restore_search: bool = False,
+            expression: bool = False,
+            supersedable: bool = False,
         ) -> bool:
             """Dispatch one render/probe script; the only render dispatch point.
 
@@ -4892,12 +5062,20 @@ if _WX_AVAILABLE:
             own render flags included) and hands the wrapped script to
             RunScriptAsync; the lock stays held until the reply or timeout.
 
+            ``expression=True`` evaluates ``js`` as an expression so the reply
+            carries its value; without it the script runs as a statement
+            block and the reply carries ``result: null``.
+
             A deferred render sets _render_pending and stores its own flags
-            for the replay.  A deferred probe is dropped without side effects:
-            probes are observations and must never schedule a rebuild, take
-            the render lock or overwrite a deferred render's flags.  Probes
-            still honour the dialog gate, which is what keeps the sync
-            fallback from pumping a nested loop (issue #339).
+            for the replay.  ``supersedable=True`` marks a script whose next
+            dispatch carries the same (complete) content — the incremental
+            stream update: when the lock is busy it is skipped silently
+            instead of scheduling a full rebuild.  A deferred probe is
+            dropped without side effects: probes are observations and must
+            never schedule a rebuild, take the render lock or overwrite a
+            deferred render's flags.  Probes still honour the dialog gate,
+            which is what keeps the sync fallback from pumping a nested loop
+            (issue #339).
 
             Sync fallback: without the script-message channel nothing would
             deliver a reply, so the script runs once through RunScript and
@@ -4909,12 +5087,29 @@ if _WX_AVAILABLE:
                 if self._blocking_dialog() is not None:
                     log.debug("script: probe deferred — modal dialog open (label=%s)", label)
                     return False
+                if self._js_running and not self._script_channel_available():
+                    # The sync fallback would run RunScript while a render is
+                    # in flight, pumping the loop mid-render (issue #339).
+                    log.debug(
+                        "script: probe deferred — sync fallback during an in-flight render "
+                        "(label=%s)",
+                        label,
+                    )
+                    return False
             else:
                 if not self._shell_loaded:
                     self._render_pending = True
+                    # Never leave the replay armed with nothing to unblock it:
+                    # the probe is what confirms the shell.
+                    self._schedule_shell_probe()
                     log.debug("render: deferred — shell not loaded (label=%s)", label)
                     return False
-                if not self._try_acquire_render_lock():
+                if not self._try_acquire_render_lock(defer_on_busy=not supersedable):
+                    if supersedable:
+                        log.debug(
+                            "render: superseded while a script is in flight (label=%s)", label
+                        )
+                        return False
                     # The deferred request owns these flags; capture them now.
                     self._pending_force_scroll_to_bottom = force_scroll_to_bottom
                     self._pending_replace = replace
@@ -4933,12 +5128,13 @@ if _WX_AVAILABLE:
                 replace=replace,
                 follow=follow,
                 restore_search=restore_search,
+                generation=self._page_generation,
             )
             self._script_requests[seq] = request
 
             if self._script_channel_available():
                 try:
-                    self._conv_view.RunScriptAsync(_wrap_script(seq, js))
+                    self._conv_view.RunScriptAsync(_wrap_script(seq, js, expression=expression))
                 except Exception as e:
                     log.warning(
                         "script: RunScriptAsync failed (label=%s, seq=%d, len=%d): %s",
@@ -4983,6 +5179,8 @@ if _WX_AVAILABLE:
             if request.kind == _SCRIPT_KIND_PROBE:
                 # A probe never held the lock, so it cannot free a pending
                 # render either; it must not touch render bookkeeping.
+                # A missing ``result`` (older wrapper/page) is None, not an
+                # error: only ``ok`` decides.
                 self._on_probe_reply(request, ok, result, error)
                 return
             # Release before applying: a reply may dispatch the next script
@@ -5004,9 +5202,12 @@ if _WX_AVAILABLE:
                     request.js_len,
                     error if error is not None else result,
                 )
-                if request.label == _SCRIPT_LABEL_WRAPPER_SHOW:
-                    # The wrapper never became visible; let the next stream
-                    # flush retry the display call.
+                if request.label in (
+                    _SCRIPT_LABEL_STREAM_UPDATE,
+                    _SCRIPT_LABEL_WRAPPER_HIDE,
+                ):
+                    # The display never happened / the wrapper may still be
+                    # visible: let the next stream flush re-assert it.
                     self._stream_wrapper_visible = False
                 if request.retry_on_failure:
                     self._render_pending = True
@@ -5015,6 +5216,10 @@ if _WX_AVAILABLE:
 
             if request.label in (_SCRIPT_LABEL_REBUILD, _SCRIPT_LABEL_APPEND):
                 self._stream_wrapper_visible = False
+            elif request.label == _SCRIPT_LABEL_STREAM_UPDATE:
+                # _updateStream displays the wrapper as part of the same
+                # script, so the display is now handled.
+                self._stream_wrapper_visible = True
             result_str = "" if result is None else str(result)
             if result_str.startswith("error:"):
                 log.error(
@@ -5040,7 +5245,7 @@ if _WX_AVAILABLE:
         ) -> None:
             """Apply a probe result; probes never touch render bookkeeping."""
             if request.label == _SCRIPT_LABEL_SHELL:
-                self._on_shell_probe_reply(ok, result, error)
+                self._on_shell_probe_reply(request, ok, result, error)
                 return
             if not ok:
                 log.debug("diag: probe failed (label=%s): %s", request.label, error)
@@ -5083,21 +5288,66 @@ if _WX_AVAILABLE:
                 request for request in self._script_requests.values() if request.deadline <= now
             ]
             for request in expired:
+                self._script_requests.pop(request.seq, None)
+                if request.kind != _SCRIPT_KIND_RENDER:
+                    # A probe owns no lock and no replay flags, but a lost
+                    # readiness probe must not stall the panel.
+                    self._on_probe_timeout(request)
+                    continue
                 log.warning(
                     "render: async script timeout after %d ms (seq=%d, len=%d)",
                     _SCRIPT_TIMEOUT_MS,
                     request.seq,
                     request.js_len,
                 )
-                self._script_requests.pop(request.seq, None)
-                if request.kind != _SCRIPT_KIND_RENDER:
-                    continue  # a probe owns no lock and no replay flags
                 self._js_running = False
                 self._render_pending = True
                 self._apply_pending_flags(request)
                 self._process_pending_render()
             if not self._script_requests:
                 self._stop_script_sweep()
+
+        def _on_probe_timeout(self, request: _PendingScript) -> None:
+            """Handle a probe the channel never answered.
+
+            The shell probe retries with backoff inside a bounded budget and
+            reports an unresponsive channel once; no automatic switch to the
+            synchronous path happens (that would resurrect the issue #339
+            abort).
+            """
+            if request.label != _SCRIPT_LABEL_SHELL:
+                log.warning(
+                    "probe: script timeout after %d ms (label=%s, seq=%d, len=%d)",
+                    _SCRIPT_TIMEOUT_MS,
+                    request.label,
+                    request.seq,
+                    request.js_len,
+                )
+                return
+            if request.generation != self._page_generation:
+                log.debug(
+                    "render: stale shell probe timeout dropped (gen=%d current=%d)",
+                    request.generation,
+                    self._page_generation,
+                )
+                return
+            self._shell_probe_timeouts += 1
+            log.warning(
+                "probe: script timeout after %d ms (attempt %d/%d, seq=%d, len=%d)",
+                _SCRIPT_TIMEOUT_MS,
+                self._shell_probe_attempts,
+                _SHELL_PROBE_MAX_ATTEMPTS,
+                request.seq,
+                request.js_len,
+            )
+            if self._shell_probe_timeouts == _SHELL_PROBE_ERROR_AFTER:
+                log.error(
+                    "render: script channel unresponsive — %d consecutive shell probe "
+                    "timeouts; renders stay deferred until a probe answers",
+                    self._shell_probe_timeouts,
+                )
+            self._render_pending = True
+            self._schedule_shell_probe()
 
         def _abort_script_requests(self) -> None:
             """Drop every in-flight request, stop the sweep and free the lock."""
@@ -5110,17 +5360,26 @@ if _WX_AVAILABLE:
         # ------------------------------------------------------------------ #
         # Render lock helpers: encapsulate sync state management
         # ------------------------------------------------------------------ #
-        def _try_acquire_render_lock(self) -> bool:
+        def _try_acquire_render_lock(self, defer_on_busy: bool = True) -> bool:
             """Try to acquire the render lock. Returns True if acquired.
 
             If acquisition fails (another script in flight, or a modal dialog
             owning the event loop) sets _render_pending so the render is
-            replayed later.  Shell readiness is the caller's gate: only
-            renders wait for _shell_loaded, never the shell probe (which runs
-            before the shell is confirmed).  The lock is released by the exec
-            reply or the timeout sweep, never right after dispatch.
+            replayed later; ``defer_on_busy=False`` marks a supersedable
+            request, whose next dispatch carries the same content, so a busy
+            lock drops it instead of scheduling a rebuild.  Shell readiness is
+            the caller's gate: only renders wait for _shell_loaded, never the
+            shell probe (which runs before the shell is confirmed).  The lock
+            is released by the exec reply or the timeout sweep, never right
+            after dispatch.
             """
             if self._js_running:
+                if not defer_on_busy:
+                    log.debug(
+                        "render: supersedable script skipped — script in flight (running=%s)",
+                        self._js_running,
+                    )
+                    return False
                 self._render_pending = True
                 log.debug(
                     "render: deferred — script in flight (running=%s pending=%s)",
@@ -5172,6 +5431,7 @@ if _WX_AVAILABLE:
                 scroll,
             )
 
+            # Expression mode: _appendEntry returns 'ok:<type>' / 'error:<why>'.
             if not self._dispatch_render(
                 js,
                 force_scroll_to_bottom=force_scroll_to_bottom,
@@ -5179,6 +5439,7 @@ if _WX_AVAILABLE:
                 follow=follow,
                 label=_SCRIPT_LABEL_APPEND,
                 restore_search=True,
+                expression=True,
             ):
                 # Deferred (lock busy / shell not loaded): the acquire already
                 # recorded a pending full rebuild that will replay this entry.
@@ -5187,19 +5448,6 @@ if _WX_AVAILABLE:
                     entry.get("type"),
                     len(text),
                 )
-
-        def _show_stream_wrapper(self) -> None:
-            """Make the stream-wrapper table visible (first streaming chunk)."""
-            if not self._shell_loaded or self._stream_wrapper_visible:
-                return  # No-op
-
-            # Claim the flag at dispatch so repeated stream flushes do not
-            # re-send the display call; a failed reply releases it again.
-            if self._dispatch_render(
-                "document.getElementById('stream-wrapper').style.display=''",
-                label=_SCRIPT_LABEL_WRAPPER_SHOW,
-            ):
-                self._stream_wrapper_visible = True
 
         def _hide_stream_wrapper(self) -> None:
             """Hide the stream-wrapper table and clear pending text."""
@@ -5210,7 +5458,7 @@ if _WX_AVAILABLE:
                 "var w=document.getElementById('stream-wrapper');"
                 "if(w)w.style.display='none';"
                 "document.getElementById('pending-ai-text').innerHTML='';",
-                label="hide_stream_wrapper",
+                label=_SCRIPT_LABEL_WRAPPER_HIDE,
             ):
                 self._stream_wrapper_visible = False
 

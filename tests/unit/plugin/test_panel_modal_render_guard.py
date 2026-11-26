@@ -15,6 +15,7 @@ instance of the real class, imported with a permissive fake ``wx`` module
 from __future__ import annotations
 
 import ast
+import collections
 import importlib
 import json
 from pathlib import Path
@@ -240,7 +241,7 @@ class _FakeTimer:
         self.starts: list[int] = []
         self.stops = 0
 
-    def Start(self, milliseconds: int) -> None:
+    def Start(self, milliseconds: int, oneShot: bool = False) -> None:
         self.running = True
         self.starts.append(milliseconds)
 
@@ -326,9 +327,17 @@ _USER_JS_END = "})();}catch(x)"
 
 
 def _user_js(script: str) -> str:
-    """Return the USER_JS expression wrapped by _dispatch_render."""
+    """Return the USER_JS body wrapped by _dispatch_render (either mode)."""
     start = script.index(_USER_JS_START) + len(_USER_JS_START)
-    return script[start : script.index(_USER_JS_END, start)]
+    return script[start : script.index(_USER_JS_END, start)].strip()
+
+
+def _expression_js(script: str) -> str:
+    """Return the user expression of an expression-mode wrapper."""
+    body = _user_js(script)
+    prefix, suffix = "return (", ");"
+    assert body.startswith(prefix) and body.endswith(suffix), body
+    return body[len(prefix) : -len(suffix)].strip()
 
 
 def _seq_of(script: str) -> int:
@@ -364,6 +373,14 @@ def _make_panel(panel, timer: _FakeTimer, view: _FakeView) -> object:
     obj._script_seq = 0
     obj._script_requests = {}
     obj._script_timeout_timer = _FakeTimer()
+    obj._shell_probe_timer = _FakeTimer()
+    obj._shell_probe_attempts = 0
+    obj._shell_probe_timeouts = 0
+    obj._page_generation = 0
+    obj._page_watchdog = _FakeTimer()
+    obj._event_gen = 0
+    obj._stream_delta_chars = 0
+    obj._stream_events = collections.deque()
     obj._conv_version = 0
     obj._search_script_running = False
     obj._last_diag_ts = 0.0
@@ -425,7 +442,7 @@ def test_modal_dialog_defers_render_and_replays_after_close(panel_mod) -> None:
 
     assert view.scripts == [], "renders never use the synchronous RunScript"
     assert len(view.async_scripts) == 1
-    js = _user_js(view.async_scripts[0])
+    js = _expression_js(view.async_scripts[0])
     assert js.startswith("_updateConversation(")
     assert '"bottom"' in js
     assert js.endswith(", true)")
@@ -478,6 +495,7 @@ def test_shell_probe_defers_while_modal_open(panel_mod) -> None:
     timer = _FakeTimer()
     view = _FakeView()
     obj = _make_panel(panel, timer, view)
+    obj._shell_loaded = False
 
     with (
         mock.patch.object(obj, "_blocking_dialog", return_value=object()) as blocking,
@@ -505,10 +523,11 @@ def test_shell_probe_is_async_and_non_destructive(panel_mod) -> None:
 
     assert view.scripts == [], "the probe must never run synchronously"
     assert len(view.async_scripts) == 1
-    probe = _user_js(view.async_scripts[0])
+    probe = _expression_js(view.async_scripts[0])
     assert "_updateConversation('[]'" not in probe
     assert "document.getElementById('conversation')" in probe
     assert "_updateConversation" in probe
+    assert probe.startswith("JSON.stringify("), "the probe reports a JSON string"
     assert obj._js_running is False, "probes never take the render lock"
 
     seq = _seq_of(view.async_scripts[0])
@@ -1042,7 +1061,7 @@ def test_render_reapplies_active_search(panel_mod) -> None:
     assert view.scripts == [], "renders never use the synchronous RunScript"
     assert len(view.async_scripts) == 1
     render = view.async_scripts[0]
-    assert _user_js(render).startswith("_updateConversation(")
+    assert _expression_js(render).startswith("_updateConversation(")
 
     # The find re-apply rides on the render reply, not the dispatch.
     _reply(obj, _seq_of(render))
@@ -1064,7 +1083,7 @@ def test_append_reapplies_active_search(panel_mod) -> None:
 
     assert len(view.async_scripts) == 1
     append = view.async_scripts[0]
-    assert _user_js(append).startswith("_appendEntry(")
+    assert _expression_js(append).startswith("_appendEntry(")
 
     _reply(obj, _seq_of(append))
 
@@ -1400,3 +1419,236 @@ def test_render_dispatch_enforces_the_structural_single_dispatch_point() -> None
     assert hits == {"RunScript": 2, "RunScriptAsync": 2}, (
         "exactly one sync and one async call per dispatcher"
     )
+
+
+# --------------------------------------------------------------------------- #
+# Probe recovery: retries, legacy replies, stale generations (issue #342 review)
+# --------------------------------------------------------------------------- #
+
+
+def _settle(obj, view) -> None:
+    """Deliver an ok reply for every script still awaiting one."""
+    for script in list(view.async_scripts):
+        seq = _seq_of(script)
+        if seq in obj._script_requests:
+            _reply(obj, seq, result=None)
+
+
+def test_sync_probe_reply_confirms_the_shell(panel_mod) -> None:
+    """The WebKit1 path answers with a JSON string; it must still confirm."""
+    panel, _windows = panel_mod
+    timer = _FakeTimer()
+
+    class _JsonProbeView(_SyncOnlyView):
+        def RunScript(self, js: str):
+            self.scripts.append(js)
+            return True, json.dumps({"conv": True, "js": True, "font": "Arial"})
+
+    view = _JsonProbeView()
+    obj = _make_panel(panel, timer, _FakeView())
+    obj._conv_view = view
+    obj._script_channel_ok = False
+    obj._shell_loaded = False
+    obj._render_pending = True
+    obj._conv_entries = [{"type": "status", "text": "hi", "color_hex": "#000000"}]
+
+    obj._request_shell_probe()
+
+    assert len(view.scripts) == 2, "probe plus the render it releases, both sync"
+    assert "JSON.stringify" in view.scripts[0]
+    assert obj._shell_loaded is True
+    assert obj._render_pending is False
+    assert view.scripts[1].startswith("_updateConversation(")
+
+
+def test_probe_state_accepts_legacy_tokens(panel_mod) -> None:
+    panel, _windows = panel_mod
+    obj = _make_panel(panel, _FakeTimer(), _FakeView())
+
+    assert obj._probe_state({"conv": True}) == {"conv": True}
+    assert obj._probe_state('{"conv": true, "js": true}') == {"conv": True, "js": True}
+    assert obj._probe_state("loaded") == {"conv": True, "js": True, "font": None}
+    assert obj._probe_state(" ok ") == {"conv": True, "js": True, "font": None}
+    assert obj._probe_state("garbage") is None
+    assert obj._probe_state(None) is None
+    assert obj._probe_state(3) is None
+
+
+def test_lost_shell_probe_retries_then_recovers(panel_mod) -> None:
+    """A lost probe arms a retry; exhaustion logs one error; a later reply renders."""
+    panel, _windows = panel_mod
+    timer = _FakeTimer()
+    view = _FakeView()
+    obj = _make_panel(panel, timer, view)
+    obj._shell_loaded = False
+    obj._render_pending = True
+    replayed: list[tuple] = []
+    obj._update_conversation = lambda *args: replayed.append(args)
+
+    obj._request_shell_probe()
+    assert obj._shell_probe_attempts == 1
+    seq = next(iter(obj._script_requests))
+
+    # The reply never arrives: the sweep fails it and arms the next attempt.
+    obj._script_requests[seq].deadline = time.monotonic() - 0.001
+    with mock.patch.object(panel.log, "warning") as warning:
+        obj._on_script_sweep(None)
+
+    assert [call.args[0] for call in warning.call_args_list] == [
+        "probe: script timeout after %d ms (attempt %d/%d, seq=%d, len=%d)"
+    ], "probe timeouts are logged as probes, never as render timeouts"
+    assert obj._shell_probe_timer.running is True
+    assert obj._shell_probe_timer.starts[-1] == _panel_module._SHELL_PROBE_RETRY_MS[0]
+    assert obj._render_pending is True
+
+    # Burn the rest of the budget: every timeout retries until it is spent.
+    with (
+        mock.patch.object(panel.log, "warning"),
+        mock.patch.object(panel.log, "error") as error,
+    ):
+        while obj._shell_probe_attempts < _panel_module._SHELL_PROBE_MAX_ATTEMPTS:
+            obj._on_shell_probe_tick(None)  # the armed retry fires
+            seq = next(iter(obj._script_requests))
+            obj._script_requests[seq].deadline = time.monotonic() - 0.001
+            obj._on_script_sweep(None)  # expire it -> arms the next retry
+            obj._shell_probe_timer.Stop()
+
+        assert obj._shell_probe_attempts == _panel_module._SHELL_PROBE_MAX_ATTEMPTS
+        assert obj._shell_probe_timer.running is False, "no retry past the budget"
+        error.assert_called_once(), "one error makes the dead channel visible"
+
+    # A new generation resets the budget; the pending render then runs.
+    obj._shell_probe_attempts = 0
+    obj._request_shell_probe()
+    seq = next(iter(obj._script_requests))
+    _reply(obj, seq, result=json.dumps({"conv": True, "js": True, "font": "Arial"}))
+
+    assert obj._shell_loaded is True
+    assert replayed == [(True,)], "the pending render is released"
+
+
+def test_render_deferred_for_shell_arms_a_probe(panel_mod) -> None:
+    """Shell-not-loaded must not leave _render_pending with nothing armed."""
+    panel, _windows = panel_mod
+    timer = _FakeTimer()
+    obj = _make_panel(panel, timer, _FakeView())
+    obj._shell_loaded = False
+
+    obj._update_conversation()
+
+    assert obj._render_pending is True
+    assert obj._shell_probe_timer.running is True
+
+
+def test_probe_does_not_pump_during_an_in_flight_render(panel_mod) -> None:
+    """Without a channel the probe would run RunScript: defer it instead."""
+    panel, _windows = panel_mod
+    timer = _FakeTimer()
+    view = _FakeView()
+    obj = _make_panel(panel, timer, view)
+    obj._script_channel_ok = False
+    obj._shell_loaded = False
+    obj._js_running = True
+
+    obj._request_shell_probe()
+
+    assert view.scripts == [], "no RunScript while a render is in flight"
+    assert obj._script_requests == {}
+    assert obj._shell_probe_timer.running is True, "the probe is retried later"
+
+
+def test_stale_probe_reply_cannot_confirm_a_reloaded_page(panel_mod) -> None:
+    panel, _windows = panel_mod
+    timer = _FakeTimer()
+    view = _FakeView()
+    obj = _make_panel(panel, timer, view)
+    obj._shell_loaded = False
+
+    obj._request_shell_probe()
+    seq = next(iter(obj._script_requests))
+
+    obj._page_generation += 1  # a reload started after the probe was sent
+    _reply(obj, seq, result=json.dumps({"conv": True, "js": True}))
+
+    assert obj._shell_loaded is False
+
+
+# --------------------------------------------------------------------------- #
+# Real script results: shell-side errors and streaming throughput
+# --------------------------------------------------------------------------- #
+
+
+def test_rebuild_error_result_is_logged_and_skips_find_restore(panel_mod) -> None:
+    panel, _windows = panel_mod
+    timer = _FakeTimer()
+    view = _FakeView()
+    obj = _make_panel(panel, timer, view)
+    obj._search_query = "hello"
+    obj._dispatch_render(
+        "_updateConversation('[]', \"none\", true)",
+        label=_panel_module._SCRIPT_LABEL_REBUILD,
+        restore_search=True,
+        expression=True,
+    )
+    seq = next(iter(obj._script_requests))
+
+    with mock.patch.object(panel.log, "error") as error:
+        _reply(obj, seq, result="error:no conversation div")
+
+    error.assert_called_once()
+    assert "error:no conversation div" in str(error.call_args)
+    assert obj._script_requests == {}
+    assert obj._js_running is False
+    assert view.async_scripts[1:] == [], "a failed rebuild must not re-apply the find"
+
+
+def test_superseded_stream_update_does_not_schedule_a_rebuild(panel_mod) -> None:
+    """A busy lock drops the draft update; the next flush re-sends it."""
+    panel, _windows = panel_mod
+    timer = _FakeTimer()
+    view = _FakeView()
+    obj = _make_panel(panel, timer, view)
+    obj._pending_ai_text = "draft"
+    obj._follow_output_to_bottom = False
+
+    obj._dispatch_render(
+        "_updateConversation('[]', \"none\", true)",
+        label=_panel_module._SCRIPT_LABEL_REBUILD,
+        expression=True,
+    )
+    assert obj._js_running is True
+
+    assert obj._incremental_stream_update() is False, "superseded, not queued"
+    assert obj._render_pending is False, "no rebuild may be scheduled for a draft update"
+    assert obj._stream_wrapper_visible is False
+
+
+def test_stream_flushes_stay_incremental(panel_mod) -> None:
+    """One flush interval of reply latency must not escalate to rebuilds."""
+    panel, _windows = panel_mod
+    timer = _FakeTimer()
+    view = _FakeView()
+    obj = _make_panel(panel, timer, view)
+    obj._busy = True
+    obj._cancel_event = None
+    obj._tool_calls_made = False
+    obj._turn_had_text = False
+    obj._follow_output_to_bottom = False
+    obj._stream_timer = _FakeTimer()
+    obj._pending_ai_text = ""
+    obj._hide_stream_wrapper = lambda: None
+    obj._render_conversation = lambda *args, **kwargs: None
+
+    for _ in range(10):
+        obj._stream_events.append({"type": "text_chunk", "content": "x", "_gen": 0})
+        obj._on_stream_flush(None)
+        _settle(obj, view)  # the reply lands before the next flush
+
+    scripts = [_user_js(script) for script in view.async_scripts]
+    rebuilds = [js for js in scripts if js.startswith("_updateConversation(")]
+    updates = [js for js in scripts if js.startswith("_updateStream(")]
+
+    assert rebuilds == [], "streaming must never escalate to a full rebuild"
+    assert len(updates) >= 9, "every flush after the first carries the draft"
+    assert obj._stream_wrapper_visible is True
+    assert obj._script_requests == {}
