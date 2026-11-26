@@ -12,11 +12,13 @@ Layout:
 from __future__ import annotations
 
 import collections
+from collections.abc import Callable, Iterable
 import datetime
 import json
 import logging
 import os
 import threading
+import time
 from typing import Any
 
 from .. import project_state as _pstate
@@ -31,6 +33,23 @@ log = logging.getLogger(__name__)
 # or removed sub-sheet within five ticks.
 _PROJECT_TICK_MS = 1000
 _PROJECT_SCAN_TICKS = 5
+
+# Replay poll for a conversation render deferred behind a modal or
+# quasi-modal dialog (issue #339).  Slow enough to be invisible, fast enough
+# that the conversation catches up as soon as the dialog closes.
+_MODAL_RENDER_POLL_MS = 200
+
+# Find-as-you-type debounce.  EVT_TEXT must not run JS: RunScript pumps the
+# GTK loop and resets GtkEntry's caret (issue #341), and RunScriptAsync avoids
+# both the pump and the modal-dialog abort (#339).  750 ms waits for the user
+# to stop typing before a search is issued.
+_SEARCH_DEBOUNCE_MS = 750
+
+# Result modes of _execute_find(), the single find-script dispatcher.
+_SEARCH_SENT_ASYNC = "async"  # handed to RunScriptAsync; reply via message
+_SEARCH_RAN_SYNC = "sync"  # synchronous RunScript; label updated in place
+_SEARCH_DEFERRED = "deferred"  # modal dialog owns the loop; nothing ran
+_SEARCH_FAILED = "failed"  # re-entrant sync call or execution error
 
 
 def _same_project_content(left: dict, right: dict) -> bool:
@@ -253,6 +272,95 @@ def _jump_chevron_geometry(
     raise ValueError(f"unknown jump chevron direction: {direction!r}")
 
 
+def _is_dialog_window(window: Any) -> bool:
+    """True for a ``wx.Dialog``-like object, without importing wx.
+
+    ``wx.Frame`` has no ``IsModal``/``ShowModal``; only dialog windows do.
+    Duck typing keeps this decision testable with plain fakes.
+    """
+    return hasattr(window, "IsModal") and hasattr(window, "ShowModal")
+
+
+def _dialog_owns_event_loop(window: Any) -> bool:
+    """True when a shown window is a dialog with a nested modal event loop.
+
+    Two dialog flavours own such a loop:
+
+    * ``wx.Dialog::ShowModal()`` -- ``IsModal()`` is true;
+    * KiCad's ``DIALOG_SHIM::ShowQuasiModal()`` -- ``IsModal()`` is false
+      (the dialog is merely ``Show()``-ed) but its parent is disabled by
+      ``WINDOW_DISABLER(parent)`` right before the nested
+      ``wxGUIEventLoop::Run()``.
+
+    ``WINDOW_DISABLER`` disables only the dialog's parent -- not every
+    top-level window as ``wxWindowDisabler`` would -- so the plugin's own
+    frame stays enabled.  The disabled parent is therefore the reliable
+    footprint of a KiCad quasi-modal.
+
+    A non-modal dialog with no parent is not blocking: without a disabled
+    parent there is no observable evidence of a nested loop, and a plain
+    floating dialog must not stall the conversation indefinitely.  A parent
+    that is a child of a disabled window reports ``IsEnabled()`` false too,
+    so inspecting the immediate parent is sufficient.
+    """
+    if not _is_dialog_window(window):
+        return False
+    if window.IsModal():
+        return True
+    parent = window.GetParent()
+    return parent is not None and not parent.IsEnabled()
+
+
+def _window_blocks_render(window: Any, is_plugin_window: Callable[[Any], bool]) -> bool:
+    """True when this window owns a nested loop that forbids ``RunScript``.
+
+    Windows that vanish between enumeration and probing raise from the
+    duck-typed calls; such a window is ignored rather than aborting the scan.
+    """
+    try:
+        if not window.IsShown():
+            return False
+        if is_plugin_window(window):
+            return not window.IsEnabled()
+        return _dialog_owns_event_loop(window)
+    except Exception:
+        return False
+
+
+def _render_blocking_window(
+    windows: Iterable[Any], is_plugin_window: Callable[[Any], bool]
+) -> Any | None:
+    """Return the top-level window whose event loop forbids ``RunScript``.
+
+    ``windows`` is any iterable of window-like objects and only
+    ``IsShown()``/``IsModal()``/``IsEnabled()``/``GetParent()`` are read, so
+    this is pure enough to unit-test without a wx instance.
+
+    Calling ``RunScript`` while an application-modal or quasi-modal dialog
+    owns a nested wx event loop pumps that loop (``YieldFor``) while WebKit
+    creates a JS context; on GTK this aborts the process (issue #339).
+
+    Blocking signals (any one suffices):
+
+    * a shown modal dialog (``IsModal()`` true);
+    * a shown non-modal dialog whose parent is disabled -- the
+      ``DIALOG_SHIM::ShowQuasiModal()`` footprint.  Checking only whether
+      our own window is disabled is not enough: quasi-modal disables the
+      dialog's parent (the PCB editor), not every top-level window, so the
+      plugin frame remains enabled;
+    * one of our own visible top-level windows disabled by a true
+      application-modal dialog.
+
+    Hidden windows, plain (non-dialog) top-level windows and our own enabled
+    windows do not block.  Windows that vanish between enumeration and
+    probing are ignored.
+    """
+    for window in windows:
+        if _window_blocks_render(window, is_plugin_window):
+            return window
+    return None
+
+
 if _WX_AVAILABLE:
 
     class _FileDropTarget(wx.FileDropTarget):
@@ -331,7 +439,7 @@ if _WX_AVAILABLE:
             self._page_loading: bool = False
             # True once the shell HTML (CSS + JS framework + empty containers)
             # has been successfully loaded into the WebView.
-            self._shell_loaded: bool = False
+            self._set_shell_loaded(False, "init")
             # True while any WebView script is in-flight.  On Windows WebView2,
             # RunScript pumps the message loop; re-entrant RunScript calls are
             # guarded by _run_script, the only place that writes this flag.
@@ -359,6 +467,35 @@ if _WX_AVAILABLE:
             # glitch on Windows), reset _page_loading so renders are not
             # permanently blocked.
             self._page_watchdog = wx.Timer(self)
+            # Replay poll for renders deferred while an application-modal or
+            # KiCad quasi-modal dialog owns a nested wx event loop (issue
+            # #339).  Created stopped; started only while a deferred render
+            # waits for that dialog to close.
+            self._modal_render_timer = wx.Timer(self)
+            # Find/search runs off RunScriptAsync: EVT_TEXT only stores the
+            # query and restarts this debounce; results arrive through the
+            # "kcaa" script message handler and carry a sequence number so a
+            # stale result cannot overwrite a newer one.
+            self._search_timer = wx.Timer(self)
+            self._search_query: str = ""
+            self._search_seq: int = 0
+            self._search_async_ok: bool = False
+            # True while the synchronous find fallback's RunScript is in
+            # flight.  RunScript pumps the loop, so EVT_TEXT can re-enter
+            # _execute_find; a second call would reset WebView's single
+            # sync-result slot and could spin forever.
+            self._search_script_running: bool = False
+            # Monotonic timestamp of the last read-only page probe; the
+            # per-tick diagnostic is throttled to at most once per second.
+            self._last_diag_ts: float = 0.0
+            # Send timestamps by search sequence number, used to log the
+            # async round-trip time.  Bounded: at most 10 outstanding seqs.
+            self._search_sent_at: dict[int, float] = {}
+            # A find action deferred while a modal dialog owns the event
+            # loop.  The shared 200 ms replay timer executes it once the
+            # dialog closes; kind is search/next/prev/clear.
+            self._search_pending: bool = False
+            self._search_pending_kind: str = ""
             # Project-scoped session watch: tracks the open KiCad project so
             # switching projects can re-offer that project's saved sessions
             # (same flow as startup auto-restore). Started by _init_llm_client.
@@ -482,17 +619,23 @@ if _WX_AVAILABLE:
                 "</body></html>"
             )
 
-        def _load_shell(self) -> None:
+        def _set_shell_loaded(self, value: bool, reason: str) -> None:
+            """Assign _shell_loaded and log the transition with its reason."""
+            self._shell_loaded = value
+            log.info("render: shell_loaded -> %s (reason=%s)", value, reason)
+
+        def _load_shell(self, reason: str) -> None:
             """Load the static shell HTML into the WebView.
 
             Called once at startup and on WebView error recovery.  After this,
             all UI updates go through RunScript — SetPage is never called again
             (unless the shell needs to be reloaded).
             """
+            log.info("render: load_shell called (reason=%s)", reason)
             shell_html = self._build_shell_html()
             log.debug("Loading shell HTML: %d bytes", len(shell_html))
             self._page_loading = True
-            self._shell_loaded = False
+            self._set_shell_loaded(False, "page-load-start")
             self._stream_wrapper_visible = False
             self._page_watchdog.Start(5000, oneShot=True)
             self._conv_view.SetPage(shell_html, "")
@@ -542,9 +685,19 @@ if _WX_AVAILABLE:
                         _on_navigating,
                         self._conv_view,
                     )
+                    # Async find results.  Needs AddScriptMessageHandler
+                    # (wxWidgets 3.1.5+) and RunScriptAsync (3.1.6+); older
+                    # webkit1 backends use the synchronous fallback.
+                    self._search_async_ok = self._setup_search_async()
+                    log.info(
+                        "search: channel async_ok=%s run_script_async=%s script_messages=%s",
+                        self._search_async_ok,
+                        hasattr(self._conv_view, "RunScriptAsync"),
+                        getattr(_wx_html2, "EVT_WEBVIEW_SCRIPT_MESSAGE_RECEIVED", None) is not None,
+                    )
                     # Load the static shell (CSS + JS + empty containers).
                     # After this, all UI updates go through RunScript.
-                    self._load_shell()
+                    self._load_shell("startup")
                 except Exception as e:
                     log.warning("WebView init failed, falling back to HtmlWindow: %s", e)
                     self._use_webview = False
@@ -783,6 +936,8 @@ if _WX_AVAILABLE:
             # glitch on Windows), reset _page_loading so renders are not
             # permanently blocked.
             self.Bind(wx.EVT_TIMER, self._on_page_watchdog, self._page_watchdog)
+            self.Bind(wx.EVT_TIMER, self._on_modal_render_tick, self._modal_render_timer)
+            self.Bind(wx.EVT_TIMER, self._on_search_tick, self._search_timer)
             self.Bind(wx.EVT_TIMER, self._on_project_watch_tick, self._project_watch_timer)
             self.Bind(wx.EVT_SHOW, self._on_panel_show)
 
@@ -2171,7 +2326,7 @@ if _WX_AVAILABLE:
             self._shell_retry_count += 1
             self._page_loading = False
             self._js_running = False
-            self._shell_loaded = False
+            self._set_shell_loaded(False, "watchdog")
             self._stream_wrapper_visible = False
             self._render_pending = False
 
@@ -2205,7 +2360,7 @@ if _WX_AVAILABLE:
                     "color_hex": self._C_WARN_HEX,
                 }
             )
-            wx.CallAfter(self._load_shell)
+            wx.CallAfter(self._load_shell, "watchdog-retry")
 
         def _mark_tool_dirty(self, name: str) -> None:
             """Track whether a tool call modified the PCB/schematic on disk."""
@@ -2796,9 +2951,211 @@ if _WX_AVAILABLE:
             )
 
         # ---- Search / Find handlers ----
+        # Find never uses synchronous RunScript while async support is
+        # available: RunScriptAsync posts its result through the "kcaa"
+        # script message handler, so EVT_TEXT never pumps the GTK loop
+        # (#341) and a modal dialog's nested loop is never entered (#339).
+        # Older webkit1 backends fall back to synchronous RunScript guarded
+        # by _blocking_dialog().
+
+        def _next_search_seq(self) -> int:
+            """Issue the next find sequence number; stale results carry lower."""
+            self._search_seq += 1
+            return self._search_seq
+
+        def _note_search_sent(self, seq: int) -> None:
+            """Remember when an async find was sent so the reply can be timed."""
+            self._search_sent_at[seq] = time.monotonic()
+            while len(self._search_sent_at) > 10:
+                self._search_sent_at.pop(next(iter(self._search_sent_at)), None)
+
+        def _search_async_available(self) -> bool:
+            """True when find can use RunScriptAsync + script messages."""
+            return self._search_async_ok and hasattr(self._conv_view, "RunScriptAsync")
+
+        def _execute_find(self, js: str, seq: int) -> str:
+            """Dispatch one find script; the only place find JS is executed.
+
+            Async first (RunScriptAsync + "kcaa" reply), then the synchronous,
+            modal-guarded fallback.  Returns one of _SEARCH_SENT_ASYNC /
+            _SEARCH_RAN_SYNC / _SEARCH_DEFERRED / _SEARCH_FAILED.
+            """
+            if self._search_async_available():
+                try:
+                    self._conv_view.RunScriptAsync(js)
+                    self._note_search_sent(seq)
+                    log.debug("search: exec seq=%d mode=async", seq)
+                    return _SEARCH_SENT_ASYNC
+                except Exception as e:
+                    log.warning("search: RunScriptAsync failed (%s) — falling back to sync", e)
+                    # Fall through to the single synchronous attempt below.
+
+            if self._search_script_running:
+                log.debug("search: exec seq=%d mode=failed (sync already running)", seq)
+                return _SEARCH_FAILED
+            if self._blocking_dialog() is not None:
+                log.debug("search: exec seq=%d mode=deferred (modal dialog open)", seq)
+                return _SEARCH_DEFERRED
+
+            self._search_script_running = True
+            try:
+                found = self._conv_view.RunScript(js)
+            except Exception as e:
+                log.warning("search: RunScript failed (%s) — find skipped", e)
+                log.debug("search: exec seq=%d mode=failed (sync exception)", seq)
+                return _SEARCH_FAILED
+            finally:
+                self._search_script_running = False
+            self._apply_search_result(found)
+            log.debug("search: exec seq=%d mode=sync", seq)
+            return _SEARCH_RAN_SYNC
+
+        def _apply_search_result(self, found) -> None:
+            """Write a synchronous find result to the count label.
+
+            Only _execute_find calls this; callers never inspect the tuple.
+            """
+            if found is None:
+                return
+            ok, result = found
+            if ok and result:
+                self._search_count_label.SetLabel(str(result))
+
+        def _restore_search_after_render(self) -> None:
+            """Re-apply the active find after the conversation DOM changed.
+
+            A full rebuild replaces ``#conversation``'s children (and an
+            append adds nodes), invalidating the shell's match list and
+            highlight nodes.  ``_findTextAndJump`` first clears any stale
+            find state, then re-highlights the live query and posts a fresh
+            count with the newest sequence number.
+            """
+            if not self._use_webview or not self._search_query:
+                return
+            seq = self._next_search_seq()
+            js = f"_findTextAndJump({json.dumps(self._search_query)}, {seq})"
+            if self._execute_find(js, seq) == _SEARCH_DEFERRED:
+                self._defer_search("search")
+
+        def _on_search_message(self, event) -> None:
+            """Apply an async find result; stale or malformed messages are ignored.
+
+            The payload is ``{kind:"find", seq, count, query, index}``.  A
+            result whose ``seq`` is older than the latest issued search is
+            dropped, so fast typing cannot let a slow result win.  Diagnostic
+            payloads (``kind:"diag"``) are logged instead.
+            """
+            try:
+                payload = json.loads(event.GetString())
+            except Exception as e:
+                log.debug("search: message dropped — bad payload: %s", e)
+                return
+            if not isinstance(payload, dict):
+                log.debug("search: message dropped — bad payload (not an object)")
+                return
+            kind = payload.get("kind")
+            if kind == "diag":
+                if payload.get("level") == "warning":
+                    log.warning("%s", payload.get("message", "diagnostic"))
+                else:
+                    log.info("diag: ui state %s", payload)
+                return
+            if kind != "find":
+                log.debug("search: message dropped — bad payload (kind=%r)", kind)
+                return
+            seq = payload.get("seq")
+            if not isinstance(seq, int):
+                log.debug("search: message dropped — bad payload (seq=%r)", seq)
+                return
+            sent_at = self._search_sent_at.pop(seq, None)
+            if seq < self._search_seq:
+                log.debug(
+                    "search: message dropped — stale seq=%d current=%d",
+                    seq,
+                    self._search_seq,
+                )
+                return
+            count = payload.get("count")
+            if not isinstance(count, int) or count < 0:
+                log.debug("search: message dropped — bad payload (count=%r)", count)
+                return
+            index = payload.get("index")
+            log_index = index if isinstance(index, int) else 0
+            marked = payload.get("marked")
+            if not isinstance(marked, int) or marked < 0:
+                marked = 0
+            if sent_at is None:
+                log.debug(
+                    "search: result seq=%d count=%d index=%d marked=%d rtt_ms=unknown",
+                    seq,
+                    count,
+                    log_index,
+                    marked,
+                )
+            else:
+                rtt_ms = (time.monotonic() - sent_at) * 1000.0
+                log.debug(
+                    "search: result seq=%d count=%d index=%d marked=%d rtt_ms=%.1f",
+                    seq,
+                    count,
+                    log_index,
+                    marked,
+                    rtt_ms,
+                )
+            if count == 0:
+                self._search_count_label.SetLabel("0/0")
+                return
+            if isinstance(index, int) and 1 <= index <= count:
+                self._search_count_label.SetLabel(f"{index}/{count}")
+            else:
+                self._search_count_label.SetLabel(f"1/{count}")
+
+        def _log_ui_state(self, reason: str) -> None:
+            """Asynchronously report the live page state for diagnostics.
+
+            Read-only probe: it only issues ``RunScriptAsync`` and never
+            blocks, retries or falls back to synchronous ``RunScript``.  The
+            payload comes back through the existing ``kcaa`` channel and is
+            logged by _on_search_message's diag branch.
+            """
+            if not self._search_async_ok:
+                log.warning("diag: async unavailable, cannot probe page")
+                return
+            js = (
+                "try {"
+                "var c = document.getElementById('conversation');"
+                "window.kcaa && window.kcaa.postMessage(JSON.stringify({"
+                "kind: 'diag',"
+                f"reason: {json.dumps(reason)},"
+                "conversationChildren: c ? c.childElementCount : -1,"
+                "bodyChildren: document.body ? document.body.childElementCount : -1,"
+                "href: String(location.href),"
+                "findMatches: (window.__findMatches || []).length,"
+                "marks: document.querySelectorAll('mark.search-match').length"
+                "}));"
+                "} catch (e) {}"
+            )
+            try:
+                self._conv_view.RunScriptAsync(js)
+            except Exception as e:
+                log.debug("diag: probe failed: %s", e)
+
+        def _maybe_log_ui_state(self, reason: str) -> None:
+            """Probe the page at most once per second (used after each tick)."""
+            now = time.monotonic()
+            if now - self._last_diag_ts < 1.0:
+                return
+            self._last_diag_ts = now
+            self._log_ui_state(reason)
 
         def _on_find(self, event) -> None:
             """Show the search bar (Ctrl+F or Tools→Find)."""
+            log.debug(
+                "search: find seq=%d query_len=%d async_ok=%s",
+                self._search_seq,
+                len(self._search_query),
+                self._search_async_ok,
+            )
             self._search_ctrl.Show(True)
             self._search_prev_btn.Show(True)
             self._search_next_btn.Show(True)
@@ -2806,14 +3163,21 @@ if _WX_AVAILABLE:
             self._search_close_btn.Show(True)
             self._search_ctrl.SetFocus()
             self._ui_panel.Layout()
-            # Clear previous search
+            # Clear previous search.  SetValue can fire EVT_TEXT; drop the
+            # debounce it arms so no stale query runs later.
             self._search_ctrl.SetValue("")
-            self._search_count_label.SetLabel("0/0")
+            self._search_timer.Stop()
+            self._search_query = ""
             if self._use_webview:
-                self._conv_view.RunScript("_clearFind()")
+                seq = self._next_search_seq()
+                if self._execute_find(f"_clearFind({seq})", seq) == _SEARCH_DEFERRED:
+                    self._defer_search("clear")
+            self._log_ui_state("find")
 
         def _on_search_close(self, event=None) -> None:
             """Hide search bar and clear highlights."""
+            self._search_timer.Stop()
+            self._search_query = ""
             self._search_ctrl.Show(False)
             self._search_prev_btn.Show(False)
             self._search_next_btn.Show(False)
@@ -2821,8 +3185,11 @@ if _WX_AVAILABLE:
             self._search_close_btn.Show(False)
             self._ui_panel.Layout()
             if self._use_webview:
-                self._conv_view.RunScript("_clearFind()")
+                seq = self._next_search_seq()
+                if self._execute_find(f"_clearFind({seq})", seq) == _SEARCH_DEFERRED:
+                    self._defer_search("clear")
             self._conv_view.SetFocus()
+            self._log_ui_state("search_close")
 
         def _on_search_key(self, event) -> None:
             """Handle keyboard shortcuts in search bar."""
@@ -2833,16 +3200,44 @@ if _WX_AVAILABLE:
             event.Skip()
 
         def _on_search_text(self, event) -> None:
-            """Search on every keystroke."""
-            query = self._search_ctrl.GetValue().strip()
-            if self._use_webview:
-                if query:
-                    ok, result = self._conv_view.RunScript(f"_findTextAndJump({json.dumps(query)})")
-                    if ok and result:
-                        self._search_count_label.SetLabel(str(result))
-                else:
-                    self._conv_view.RunScript("_clearFind()")
-                    self._search_count_label.SetLabel("0/0")
+            """Record the query and restart the debounce; never run JS here.
+
+            RunScript pumps the GTK main loop (wxYield) while the key event is
+            still being dispatched, which resets GtkEntry's caret/input-method
+            state: typing "hello" landed as "olleh" (issue #341).  Execution
+            happens in _on_search_tick, asynchronously.
+            """
+            self._search_query = self._search_ctrl.GetValue().strip()
+            self._search_timer.Start(_SEARCH_DEBOUNCE_MS)
+
+        def _on_search_tick(self, event=None) -> None:
+            """Run the debounced find off RunScriptAsync.
+
+            No modal gate and no replay queue: RunScriptAsync does not pump the
+            dialog's nested loop, so it is safe while a dialog is open.  Match
+            counts arrive later through _on_search_message.
+            """
+            self._search_timer.Stop()
+            log.debug(
+                "search: tick seq=%d query_len=%d async_ok=%s",
+                self._search_seq,
+                len(self._search_query),
+                self._search_async_ok,
+            )
+            if not self._use_webview:
+                self._maybe_log_ui_state("search_tick")
+                return
+            if not self._search_query:
+                seq = self._next_search_seq()
+                if self._execute_find(f"_clearFind({seq})", seq) == _SEARCH_DEFERRED:
+                    self._defer_search("clear")
+                self._maybe_log_ui_state("search_tick")
+                return
+            seq = self._next_search_seq()
+            js = f"_findTextAndJump({json.dumps(self._search_query)}, {seq})"
+            if self._execute_find(js, seq) == _SEARCH_DEFERRED:
+                self._defer_search("search")
+            self._maybe_log_ui_state("search_tick")
 
         def _on_search(self, event) -> None:
             """Search button clicked."""
@@ -2850,17 +3245,31 @@ if _WX_AVAILABLE:
 
         def _on_search_next(self, event=None) -> None:
             """Jump to next match."""
-            if self._use_webview:
-                ok, result = self._conv_view.RunScript("_findNext()")
-                if ok and result:
-                    self._search_count_label.SetLabel(str(result))
+            log.debug(
+                "search: next seq=%d query_len=%d async_ok=%s",
+                self._search_seq,
+                len(self._search_query),
+                self._search_async_ok,
+            )
+            if not self._use_webview:
+                return
+            seq = self._next_search_seq()
+            if self._execute_find(f"_findNext({seq})", seq) == _SEARCH_DEFERRED:
+                self._defer_search("next")
 
         def _on_search_prev(self, event=None) -> None:
             """Jump to previous match."""
-            if self._use_webview:
-                ok, result = self._conv_view.RunScript("_findPrev()")
-                if ok and result:
-                    self._search_count_label.SetLabel(str(result))
+            log.debug(
+                "search: prev seq=%d query_len=%d async_ok=%s",
+                self._search_seq,
+                len(self._search_query),
+                self._search_async_ok,
+            )
+            if not self._use_webview:
+                return
+            seq = self._next_search_seq()
+            if self._execute_find(f"_findPrev({seq})", seq) == _SEARCH_DEFERRED:
+                self._defer_search("prev")
 
         def _on_autoroute(self, event) -> None:
             """Menu handler: Tools → Auto Route…
@@ -3687,6 +4096,7 @@ if _WX_AVAILABLE:
             watchdog ensures the hidden frame never outlives KiCad.  Only
             the force-close path (KiCad itself already gone) tears down.
             """
+            self._stop_modal_render_replay()
             if event.CanVeto():
                 event.Veto()
                 self.Hide()
@@ -3720,6 +4130,8 @@ if _WX_AVAILABLE:
         def _on_destroy(self, event) -> None:
             """Called when the wx window is actually destroyed (e.g. KiCad shutdown)."""
             if event.GetEventObject() is self:
+                self._stop_modal_render_replay()
+                self._search_timer.Stop()
                 if self._update_cancel_event is not None:
                     self._update_cancel_event.set()
                 if self._update_progress_timer is not None:
@@ -3948,6 +4360,31 @@ if _WX_AVAILABLE:
 
             return "".join(out)
 
+        def _setup_search_async(self) -> bool:
+            """Register the ``kcaa`` script message handler for find results.
+
+            ``AddScriptMessageHandler`` needs wxWidgets 3.1.5 and
+            ``RunScriptAsync`` 3.1.6; the old webkit1 backend has neither.
+            Returns False so search falls back to synchronous, modal-guarded
+            ``RunScript``.
+            """
+            event_type = getattr(_wx_html2, "EVT_WEBVIEW_SCRIPT_MESSAGE_RECEIVED", None)
+            add_handler = getattr(self._conv_view, "AddScriptMessageHandler", None)
+            if event_type is None or add_handler is None:
+                log.warning("search: script message handler unavailable; using sync fallback")
+                return False
+            try:
+                if not add_handler("kcaa"):
+                    log.warning(
+                        "search: AddScriptMessageHandler('kcaa') rejected; using sync fallback"
+                    )
+                    return False
+                self.Bind(event_type, self._on_search_message, self._conv_view)
+            except Exception as e:
+                log.warning("search: async setup failed, using sync fallback: %s", e)
+                return False
+            return True
+
         def _on_webview_loaded(self, event) -> None:
             """Called when the shell HTML has finished loading.
 
@@ -3955,6 +4392,7 @@ if _WX_AVAILABLE:
             reload on WebView error recovery).  It transitions the shell
             state and triggers the first conversation render.
             """
+            log.info("render: webview loaded event")
             log.debug(
                 "_on_webview_loaded: shell ready (render_pending=%s, entries=%d)",
                 self._render_pending,
@@ -3981,7 +4419,7 @@ if _WX_AVAILABLE:
                 log.debug("WebView error description not available: %s", e)
             log.warning("WebView error: %s — reloading shell", description)
             self._page_loading = False
-            self._shell_loaded = False
+            self._set_shell_loaded(False, "webview-error")
             self._js_running = False
             self._stream_wrapper_visible = False
             self._page_watchdog.Stop()
@@ -3993,13 +4431,20 @@ if _WX_AVAILABLE:
                 }
             )
             self._render_pending = False
-            wx.CallAfter(self._load_shell)
+            wx.CallAfter(self._load_shell, "webview-error-reload")
 
         def _verify_shell_and_render(self) -> None:
             """Verify JS is working and trigger render if needed.
 
             Called 1 second after EVT_WEBVIEW_LOADED to give scripts time to execute.
             """
+            # The CallLater can fire while a KiCad dialog owns the event
+            # loop; issue no JS at all in that case and replay later.
+            if self._blocking_dialog() is not None:
+                self._render_pending = True
+                self._schedule_modal_render_replay()
+                log.info("render: shell verification deferred — modal dialog open")
+                return
             log.debug("_verify_shell_and_render: starting verification")
             js_works = False
 
@@ -4007,7 +4452,7 @@ if _WX_AVAILABLE:
             # _run_script(probe=True): before _shell_loaded is confirmed the
             # normal acquire would defer instead of probing, so probe=True
             # skips the shell-loaded gate while still excluding re-entrant
-            # renders from the probe windows.
+            # renders (and dialog-blocked probes) from the probe windows.
             try:
                 # Check font
                 _, result = self._run_script(
@@ -4027,34 +4472,35 @@ if _WX_AVAILABLE:
                     "document.scripts.length + ',' + (document.scripts[0] ? document.scripts[0].src : 'inline') + ',' + (document.scripts[0] ? document.scripts[0].innerHTML.length : 0)",
                     probe=True,
                 )
-                log.info("_verify_shell_and_render: scripts info=%r", result)
+                log.debug("_verify_shell_and_render: scripts info=%r", result)
 
                 # Check for JS errors in the console
                 _, result = self._run_script(
                     "try { eval('1+1'); 'no_error'; } catch(e) { e.message; }", probe=True
                 )
-                log.info("_verify_shell_and_render: eval test=%r", result)
+                log.debug("_verify_shell_and_render: eval test=%r", result)
 
                 # Try to check for syntax errors in the script
                 _, result = self._run_script(
                     "try { new Function(document.scripts[0].innerHTML); 'syntax_ok'; } catch(e) { 'error:' + e.message; }",
                     probe=True,
                 )
-                log.info("_verify_shell_and_render: script syntax check=%r", result)
+                log.debug("_verify_shell_and_render: script syntax check=%r", result)
 
-                # Try to call JS function
+                # Check the shell's JS API without mutating the conversation.
                 ok, result = self._run_script(
-                    "try { _updateConversation('[]', 'none'); 'ok'; } catch(e) { e.message; }",
+                    "typeof _updateConversation === 'function' ? 'ok' : 'missing'",
                     probe=True,
                 )
-                log.info("_verify_shell_and_render: JS call result=%r", result)
-                if ok and result and ("ok" in str(result) or "error" in str(result).lower()):
+                log.info("_verify_shell_and_render: JS availability=%r", result)
+                text = str(result) if result else ""
+                if ok and "ok" in text and "missing" not in text:
                     js_works = True
             except Exception as e:
                 log.error("_verify_shell_and_render: exception: %s", e)
 
             if js_works:
-                self._shell_loaded = True
+                self._set_shell_loaded(True, "probe-ok")
                 log.info("_verify_shell_and_render: JS verified, _shell_loaded=True")
             else:
                 log.warning("_verify_shell_and_render: JS not working yet")
@@ -4182,7 +4628,12 @@ if _WX_AVAILABLE:
                     len(js_entries),
                 )
             else:
-                log.debug("_updateConversation JS result: %s", result_str)
+                log.debug(
+                    "render: conversation rebuilt -> %s (entries=%d)",
+                    result_str,
+                    len(js_entries),
+                )
+                self._restore_search_after_render()
 
         def _process_pending_render(self) -> None:
             """Process any pending render after _js_running is reset.
@@ -4190,14 +4641,116 @@ if _WX_AVAILABLE:
             The flags stored when the request was deferred are replayed;
             the call that releases the lock does not own them.
             """
-            if self._render_pending:
-                self._render_pending = False
-                wx.CallAfter(
-                    self._update_conversation,
-                    self._pending_force_scroll_to_bottom,
-                    self._pending_replace,
-                    self._pending_follow,
+            if not self._render_pending:
+                # A successful render supersedes anything deferred behind a
+                # modal dialog, so the replay poll has nothing left to do --
+                # unless a search replay is still waiting on the same timer.
+                log.debug(
+                    "render: replay skipped — nothing pending (running=%s pending=%s)",
+                    self._js_running,
+                    self._render_pending,
                 )
+                if not self._search_pending:
+                    self._stop_modal_render_replay()
+                return
+            log.debug(
+                "render: replaying pending render (running=%s pending=%s force=%s replace=%s follow=%s)",
+                self._js_running,
+                self._render_pending,
+                self._pending_force_scroll_to_bottom,
+                self._pending_replace,
+                self._pending_follow,
+            )
+            self._render_pending = False
+            wx.CallAfter(
+                self._update_conversation,
+                self._pending_force_scroll_to_bottom,
+                self._pending_replace,
+                self._pending_follow,
+            )
+
+        # ------------------------------------------------------------------ #
+        # Modal-dialog render guard (issue #339)
+        # ------------------------------------------------------------------ #
+        # RunScript pumps the wx event loop (YieldFor).  While a KiCad modal
+        # or quasi-modal dialog owns a nested loop, that pump runs inside the
+        # dialog's loop and WebKit's JS-context creation aborts GTK.  The
+        # wx.CallAfter replay above would land in the same nested loop, so a
+        # render deferred for this reason waits on a low-frequency timer that
+        # checks the dialog has closed before replaying through the normal
+        # render path.
+
+        def _blocking_dialog(self) -> Any | None:
+            """Top-level window whose nested modal loop forbids RunScript."""
+            return _render_blocking_window(
+                wx.GetTopLevelWindows(),
+                lambda window: isinstance(window, AssistantPanel),
+            )
+
+        def _schedule_modal_render_replay(self) -> None:
+            """Arm the replay poll (idempotent)."""
+            timer = self._modal_render_timer
+            if timer is not None and not timer.IsRunning():
+                timer.Start(_MODAL_RENDER_POLL_MS)
+
+        def _stop_modal_render_replay(self) -> None:
+            """Stop the replay poll; harmless when it is already stopped."""
+            timer = self._modal_render_timer
+            if timer is not None:
+                timer.Stop()
+
+        def _defer_search(self, kind: str) -> None:
+            """Defer a find action until the modal dialog closes (no JS now)."""
+            self._search_pending = True
+            self._search_pending_kind = kind
+            self._schedule_modal_render_replay()
+            log.debug(
+                "search: deferred while modal dialog open (kind=%s, query_len=%d)",
+                kind,
+                len(self._search_query),
+            )
+
+        def _replay_pending_search(self) -> None:
+            """Execute the deferred find action exactly once after the dialog closes."""
+            if not self._search_pending or self._blocking_dialog() is not None:
+                return
+            kind = self._search_pending_kind or "search"
+            log.debug(
+                "search: replay after dialog (kind=%s, query_len=%d)",
+                kind,
+                len(self._search_query),
+            )
+            if not self._use_webview:
+                self._search_pending = False
+                self._search_pending_kind = ""
+                return
+            seq = self._next_search_seq()
+            if kind == "next":
+                js = f"_findNext({seq})"
+            elif kind == "prev":
+                js = f"_findPrev({seq})"
+            elif kind == "clear" or not self._search_query:
+                js = f"_clearFind({seq})"
+            else:
+                js = f"_findTextAndJump({json.dumps(self._search_query)}, {seq})"
+            if self._execute_find(js, seq) == _SEARCH_DEFERRED:
+                # Still blocked: keep the intent for the next timer tick.
+                self._schedule_modal_render_replay()
+                return
+            self._search_pending = False
+            self._search_pending_kind = ""
+
+        def _on_modal_render_tick(self, event) -> None:
+            """Replay deferred render and search work once the dialog closes."""
+            if self._blocking_dialog() is not None:
+                return  # Still blocked; check again on the next tick.
+            self._stop_modal_render_replay()
+            if self._render_pending:
+                log.info("chat: render replayed after modal closed")
+                self._process_pending_render()
+            self._replay_pending_search()
+            if not self._render_pending and not self._search_pending:
+                self._stop_modal_render_replay()
 
         # ------------------------------------------------------------------ #
         # Render protocol: single RunScript funnel
@@ -4221,20 +4774,31 @@ if _WX_AVAILABLE:
             """Run a WebView script under the render protocol.
 
             Acquires the render lock (deferring -- _render_pending set -- when
-            another script is in flight or the shell is not confirmed loaded),
-            runs the script, then releases; the release flushes any deferral
-            as a wx.CallAfter full-conversation rebuild once the current
-            event stack has unwound.
+            another script is in flight, a modal dialog owns the event loop,
+            or the shell is not confirmed loaded), runs the script, then
+            releases; the release flushes any deferral as a wx.CallAfter
+            full-conversation rebuild once the current event stack has
+            unwound.
 
             probe=True runs before the shell is confirmed loaded (shell
             verification): takes the lock flag to keep re-entrant renders out,
-            but skips the shell-loaded gate.
+            but skips ONLY the shell-loaded gate.  The modal-dialog gate still
+            applies, so a probe never pumps a dialog's nested event loop.
 
             retry_on_failure=True records a pending rebuild when the script
             itself fails, so a full rebuild replays the missed update.
             """
             if not self._use_webview:
                 return False, None
+            started = time.monotonic()
+            log.debug(
+                "render: script start (running=%s pending=%s shell=%s loading=%s) len=%d",
+                self._js_running,
+                self._render_pending,
+                self._shell_loaded,
+                self._page_loading,
+                len(js),
+            )
             if not self._try_acquire_render_lock(probe=probe):
                 # The deferred request owns these flags; capture them now.
                 self._pending_force_scroll_to_bottom = force_scroll_to_bottom
@@ -4243,16 +4807,27 @@ if _WX_AVAILABLE:
                 return False, None  # deferred: _render_pending already set
             try:
                 ok, result = self._conv_view.RunScript(js)
+                elapsed_ms = (time.monotonic() - started) * 1000.0
                 if not ok:
-                    log.warning("_run_script: RunScript failed: %r", result)
+                    log.warning(
+                        "render: script failed in %.1f ms len=%d result=%r",
+                        elapsed_ms,
+                        len(js),
+                        result,
+                    )
                     if retry_on_failure:
                         self._render_pending = True
                         self._pending_force_scroll_to_bottom = force_scroll_to_bottom
                         self._pending_replace = replace
                         self._pending_follow = follow
+                else:
+                    log.debug("render: script done in %.1f ms len=%d", elapsed_ms, len(js))
                 return ok, result
             except Exception as e:
-                log.warning("_run_script exception: %s", e)
+                elapsed_ms = (time.monotonic() - started) * 1000.0
+                log.warning(
+                    "render: script exception in %.1f ms len=%d: %s", elapsed_ms, len(js), e
+                )
                 if retry_on_failure:
                     self._render_pending = True
                     self._pending_force_scroll_to_bottom = force_scroll_to_bottom
@@ -4268,15 +4843,37 @@ if _WX_AVAILABLE:
         def _try_acquire_render_lock(self, probe: bool = False) -> bool:
             """Try to acquire the render lock. Returns True if acquired.
 
-            If acquisition fails (shell not loaded or another render in
-            progress), sets _render_pending so the render will be retried
-            later.  With probe=True the shell-loaded gate is skipped (shell
-            verification runs before _shell_loaded is confirmed).
+            If acquisition fails (another render in progress, a modal dialog
+            owns the event loop, or the shell is not loaded), sets
+            _render_pending so the render will be retried later.  probe=True
+            skips ONLY the shell-loaded gate: shell verification runs before
+            _shell_loaded is confirmed and would otherwise self-lock.  The
+            modal-dialog gate applies to probes too; a probe must not pump a
+            dialog's nested event loop.
             """
             self._render_pending = False  # Reset first to allow recursion
 
             if self._js_running:
                 self._render_pending = True
+                log.debug(
+                    "render: deferred — script in flight (running=%s pending=%s)",
+                    self._js_running,
+                    self._render_pending,
+                )
+                return False
+
+            if self._blocking_dialog() is not None:
+                # RunScript would pump the dialog's nested event loop and
+                # abort GTK/WebKit (issue #339).  Defer; the replay timer
+                # re-runs the normal render path once the dialog is gone.
+                # This includes probe=True calls.
+                self._render_pending = True
+                self._schedule_modal_render_replay()
+                log.debug(
+                    "render: deferred — modal dialog open (running=%s pending=%s)",
+                    self._js_running,
+                    self._render_pending,
+                )
                 return False
 
             # Claim first: shell detection (below) runs raw RunScript probes,
@@ -4304,26 +4901,33 @@ if _WX_AVAILABLE:
                     ok, result = self._conv_view.RunScript(
                         "document.getElementById('conversation') ? 'loaded' : 'not_loaded'"
                     )
-                    if ok and result and "loaded" in str(result):
-                        # Also verify JS functions exist by trying to call one
-                        ok2, result2 = self._conv_view.RunScript(
-                            "try { _updateConversation('[]', 'none'); 'ok'; } catch(e) { e.message; }"
-                        )
-                        log.info("JS test attempt %d: %r", attempt + 1, result2)
-                        if (
-                            ok2
-                            and result2
-                            and ("ok" in str(result2) or "error" in str(result2).lower())
-                        ):
-                            log.info("Detected shell and JS working (attempt %d)", attempt + 1)
-                            self._shell_loaded = True
-                            self._page_loading = False
-                            return True
-                        log.warning("Shell loaded but JS not working (attempt %d)", attempt + 1)
-                    else:
+                    if not (ok and result and "loaded" in str(result)):
                         break
+                    # Verify the shell's JS API without mutating the page.
+                    ok2, result2 = self._conv_view.RunScript(
+                        "typeof _updateConversation === 'function' ? 'ok' : 'missing'"
+                    )
+                    text = str(result2) if result2 else ""
+                    if ok2 and "ok" in text and "missing" not in text:
+                        log.info(
+                            "render: shell probe ok (attempt %d, shell_loaded=%s, "
+                            "page_loading=%s, running=%s)",
+                            attempt + 1,
+                            self._shell_loaded,
+                            self._page_loading,
+                            self._js_running,
+                        )
+                        self._set_shell_loaded(True, "probe-ok")
+                        self._page_loading = False
+                        return True
+                    log.warning(
+                        "render: shell probe failed (attempt %d, ok=%s, result=%r)",
+                        attempt + 1,
+                        ok2,
+                        result2,
+                    )
                 except Exception as e:
-                    log.warning("Failed to detect shell state (attempt %d): %s", attempt + 1, e)
+                    log.warning("render: shell probe failed (attempt %d): %s", attempt + 1, e)
                     break
             log.warning("Shell loaded but JS not working after 3 attempts, allowing retry")
             return False
@@ -4386,6 +4990,7 @@ if _WX_AVAILABLE:
                 )
             else:
                 log.debug("_appendEntry JS result: %s", result_str)
+                self._restore_search_after_render()
 
         def _show_stream_wrapper(self) -> None:
             """Make the stream-wrapper table visible (first streaming chunk)."""
