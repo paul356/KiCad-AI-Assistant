@@ -4438,6 +4438,13 @@ if _WX_AVAILABLE:
 
             Called 1 second after EVT_WEBVIEW_LOADED to give scripts time to execute.
             """
+            # The CallLater can fire while a KiCad dialog owns the event
+            # loop; issue no JS at all in that case and replay later.
+            if self._blocking_dialog() is not None:
+                self._render_pending = True
+                self._schedule_modal_render_replay()
+                log.info("render: shell verification deferred — modal dialog open")
+                return
             log.debug("_verify_shell_and_render: starting verification")
             js_works = False
 
@@ -4445,7 +4452,7 @@ if _WX_AVAILABLE:
             # _run_script(probe=True): before _shell_loaded is confirmed the
             # normal acquire would defer instead of probing, so probe=True
             # skips the shell-loaded gate while still excluding re-entrant
-            # renders from the probe windows.
+            # renders (and dialog-blocked probes) from the probe windows.
             try:
                 # Check font
                 _, result = self._run_script(
@@ -4465,28 +4472,29 @@ if _WX_AVAILABLE:
                     "document.scripts.length + ',' + (document.scripts[0] ? document.scripts[0].src : 'inline') + ',' + (document.scripts[0] ? document.scripts[0].innerHTML.length : 0)",
                     probe=True,
                 )
-                log.info("_verify_shell_and_render: scripts info=%r", result)
+                log.debug("_verify_shell_and_render: scripts info=%r", result)
 
                 # Check for JS errors in the console
                 _, result = self._run_script(
                     "try { eval('1+1'); 'no_error'; } catch(e) { e.message; }", probe=True
                 )
-                log.info("_verify_shell_and_render: eval test=%r", result)
+                log.debug("_verify_shell_and_render: eval test=%r", result)
 
                 # Try to check for syntax errors in the script
                 _, result = self._run_script(
                     "try { new Function(document.scripts[0].innerHTML); 'syntax_ok'; } catch(e) { 'error:' + e.message; }",
                     probe=True,
                 )
-                log.info("_verify_shell_and_render: script syntax check=%r", result)
+                log.debug("_verify_shell_and_render: script syntax check=%r", result)
 
-                # Try to call JS function
+                # Check the shell's JS API without mutating the conversation.
                 ok, result = self._run_script(
-                    "try { _updateConversation('[]', 'none'); 'ok'; } catch(e) { e.message; }",
+                    "typeof _updateConversation === 'function' ? 'ok' : 'missing'",
                     probe=True,
                 )
-                log.info("_verify_shell_and_render: JS call result=%r", result)
-                if ok and result and ("ok" in str(result) or "error" in str(result).lower()):
+                log.info("_verify_shell_and_render: JS availability=%r", result)
+                text = str(result) if result else ""
+                if ok and "ok" in text and "missing" not in text:
                     js_works = True
             except Exception as e:
                 log.error("_verify_shell_and_render: exception: %s", e)
@@ -4774,7 +4782,8 @@ if _WX_AVAILABLE:
 
             probe=True runs before the shell is confirmed loaded (shell
             verification): takes the lock flag to keep re-entrant renders out,
-            but skips the shell-loaded and modal gates.
+            but skips ONLY the shell-loaded gate.  The modal-dialog gate still
+            applies, so a probe never pumps a dialog's nested event loop.
 
             retry_on_failure=True records a pending rebuild when the script
             itself fails, so a full rebuild replays the missed update.
@@ -4836,10 +4845,11 @@ if _WX_AVAILABLE:
 
             If acquisition fails (another render in progress, a modal dialog
             owns the event loop, or the shell is not loaded), sets
-            _render_pending so the render will be retried later.  With
-            probe=True the shell-loaded and modal gates are skipped (shell
-            verification runs before _shell_loaded is confirmed and must not
-            stall behind a dialog).
+            _render_pending so the render will be retried later.  probe=True
+            skips ONLY the shell-loaded gate: shell verification runs before
+            _shell_loaded is confirmed and would otherwise self-lock.  The
+            modal-dialog gate applies to probes too; a probe must not pump a
+            dialog's nested event loop.
             """
             self._render_pending = False  # Reset first to allow recursion
 
@@ -4852,10 +4862,11 @@ if _WX_AVAILABLE:
                 )
                 return False
 
-            if not probe and self._blocking_dialog() is not None:
+            if self._blocking_dialog() is not None:
                 # RunScript would pump the dialog's nested event loop and
                 # abort GTK/WebKit (issue #339).  Defer; the replay timer
                 # re-runs the normal render path once the dialog is gone.
+                # This includes probe=True calls.
                 self._render_pending = True
                 self._schedule_modal_render_replay()
                 log.debug(
@@ -4886,62 +4897,37 @@ if _WX_AVAILABLE:
             held (_js_running=True).
             """
             for attempt in range(3):
-                cleared = False
                 try:
                     ok, result = self._conv_view.RunScript(
                         "document.getElementById('conversation') ? 'loaded' : 'not_loaded'"
                     )
-                    if ok and result and "loaded" in str(result):
-                        # Also verify JS functions exist by trying to call one.
-                        # This probe calls _updateConversation('[]'), which
-                        # really clears #conversation — log it before and after.
+                    if not (ok and result and "loaded" in str(result)):
+                        break
+                    # Verify the shell's JS API without mutating the page.
+                    ok2, result2 = self._conv_view.RunScript(
+                        "typeof _updateConversation === 'function' ? 'ok' : 'missing'"
+                    )
+                    text = str(result2) if result2 else ""
+                    if ok2 and "ok" in text and "missing" not in text:
                         log.info(
-                            "render: shell probe will clear conversation "
-                            "(attempt %d, shell_loaded=%s, page_loading=%s, running=%s)",
+                            "render: shell probe ok (attempt %d, shell_loaded=%s, "
+                            "page_loading=%s, running=%s)",
                             attempt + 1,
                             self._shell_loaded,
                             self._page_loading,
                             self._js_running,
                         )
-                        cleared = True
-                        ok2, result2 = self._conv_view.RunScript(
-                            "try { _updateConversation('[]', 'none'); 'ok'; } catch(e) { e.message; }"
-                        )
-                        log.info(
-                            "render: shell probe result ok=%s result=%r (attempt %d)",
-                            ok2,
-                            result2,
-                            attempt + 1,
-                        )
-                        log.info("JS test attempt %d: %r", attempt + 1, result2)
-                        if (
-                            ok2
-                            and result2
-                            and ("ok" in str(result2) or "error" in str(result2).lower())
-                        ):
-                            log.info("Detected shell and JS working (attempt %d)", attempt + 1)
-                            self._set_shell_loaded(True, "probe-ok")
-                            self._page_loading = False
-                            return True
-                        log.warning("Shell loaded but JS not working (attempt %d)", attempt + 1)
-                        log.warning(
-                            "render: shell probe failed after clearing conversation "
-                            "(attempt %d, ok=%s, result=%r)",
-                            attempt + 1,
-                            ok2,
-                            result2,
-                        )
-                    else:
-                        break
+                        self._set_shell_loaded(True, "probe-ok")
+                        self._page_loading = False
+                        return True
+                    log.warning(
+                        "render: shell probe failed (attempt %d, ok=%s, result=%r)",
+                        attempt + 1,
+                        ok2,
+                        result2,
+                    )
                 except Exception as e:
-                    if cleared:
-                        log.warning(
-                            "render: shell probe failed after clearing conversation "
-                            "(attempt %d): %s",
-                            attempt + 1,
-                            e,
-                        )
-                    log.warning("Failed to detect shell state (attempt %d): %s", attempt + 1, e)
+                    log.warning("render: shell probe failed (attempt %d): %s", attempt + 1, e)
                     break
             log.warning("Shell loaded but JS not working after 3 attempts, allowing retry")
             return False

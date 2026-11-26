@@ -426,8 +426,8 @@ def test_quasi_modal_defers_render_with_enabled_plugin_window(panel_mod) -> None
     assert timer.running is True
 
 
-def test_probe_is_not_gated_by_modal_dialog(panel_mod) -> None:
-    """Shell verification probes must run even while a dialog is open."""
+def test_probe_script_still_respects_modal_gate(panel_mod) -> None:
+    """probe=True only skips the shell-loaded gate, never the dialog gate."""
     panel, windows = panel_mod
     timer = _FakeTimer()
     view = _FakeView()
@@ -436,11 +436,64 @@ def test_probe_is_not_gated_by_modal_dialog(panel_mod) -> None:
 
     ok, result = obj._run_script("1 + 1", probe=True)
 
-    assert ok is True
-    assert result == "ok"
-    assert view.scripts == ["1 + 1"]
-    assert obj._render_pending is False
-    assert timer.running is False
+    assert (ok, result) == (False, None)
+    assert view.scripts == [], "RunScript must not run inside the dialog loop"
+    assert obj._render_pending is True
+    assert timer.running is True
+
+
+def test_shell_verification_defers_while_modal_open(panel_mod) -> None:
+    panel, _windows = panel_mod
+    timer = _FakeTimer()
+    view = _FakeView()
+    obj = _make_panel(panel, timer, view)
+
+    with (
+        mock.patch.object(obj, "_blocking_dialog", return_value=object()) as blocking,
+        mock.patch.object(obj, "_schedule_modal_render_replay") as schedule,
+    ):
+        obj._verify_shell_and_render()
+
+    assert blocking.called
+    assert view.scripts == [], "no synchronous probe may run behind a dialog"
+    assert view.async_scripts == []
+    assert obj._render_pending is True
+    schedule.assert_called_once()
+
+
+def test_shell_verification_does_not_clear_conversation(panel_mod) -> None:
+    panel, _windows = panel_mod
+    timer = _FakeTimer()
+    view = _FakeView()
+    obj = _make_panel(panel, timer, view)
+    obj._shell_loaded = True
+    obj._conv_entries = []
+    obj._render_pending = False
+
+    obj._verify_shell_and_render()
+
+    assert view.scripts, "verification should still issue its probes"
+    assert all("_updateConversation('[]'" not in js for js in view.scripts)
+
+
+def test_detect_shell_loaded_probe_is_non_destructive(panel_mod) -> None:
+    panel, _windows = panel_mod
+    timer = _FakeTimer()
+
+    class _ShellProbeView(_FakeView):
+        def RunScript(self, js: str) -> tuple[bool, str]:
+            self.scripts.append(js)
+            if "getElementById('conversation')" in js:
+                return True, "loaded"
+            return True, "ok"
+
+    view = _ShellProbeView()
+    obj = _make_panel(panel, timer, view)
+    obj._shell_loaded = False
+
+    assert obj._detect_shell_loaded() is True
+    assert obj._shell_loaded is True
+    assert all("_updateConversation('[]'" not in js for js in view.scripts)
 
 
 def test_replay_timer_stops_when_nothing_is_pending(panel_mod) -> None:
