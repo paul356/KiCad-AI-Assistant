@@ -381,11 +381,11 @@ class _FakePanel:
         self.scripts: list[str] = []
         self._script_error = script_error
 
-    def _run_script(self, script: str) -> tuple[bool, None]:
+    def _dispatch_render(self, script: str, **_kwargs) -> bool:
         self.scripts.append(script)
         if self._script_error:
             raise RuntimeError("backend down")
-        return True, None
+        return True
 
 
 def _handler(name: str):
